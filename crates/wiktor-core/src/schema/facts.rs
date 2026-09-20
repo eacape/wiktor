@@ -1,24 +1,8 @@
-//! 事实平面查询辅助（source_revision CAS + 过滤下推翻译）。
-//! DDL 见 `migrations::MIGRATION_0001`。
+//! 事实平面查询辅助（source_revision CAS 语义 + 过滤下推翻译）。
+//! DDL 见 `migrations/0001_create_core/up.sql`。
 
+use crate::types::error::Result;
 use crate::types::{FactValue, FilterCondition, Filters};
-use rusqlite::types::Value;
-use rusqlite::Connection;
-
-/// 单语句 CAS：`excluded.source_revision > facts.source_revision` 时才覆盖。
-pub const SQL_UPSERT_FACT: &str = r#"
-INSERT INTO facts (entity_id, field_name, field_type, value_numeric, value_text, value_boolean, value_timestamp, source_revision, updated_at)
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-ON CONFLICT(entity_id, field_name) DO UPDATE SET
-    field_type      = excluded.field_type,
-    value_numeric   = excluded.value_numeric,
-    value_text      = excluded.value_text,
-    value_boolean   = excluded.value_boolean,
-    value_timestamp = excluded.value_timestamp,
-    source_revision = excluded.source_revision,
-    updated_at      = excluded.updated_at
-WHERE excluded.source_revision > facts.source_revision
-"#;
 
 /// 把 FactValue 展开为 (field_type, numeric, text, boolean, timestamp) 参数。
 pub fn fact_columns(
@@ -39,13 +23,17 @@ pub fn fact_columns(
     }
 }
 
-/// 把 Filters 翻译成 `(WHERE 片段, 参数)`；空条件返回 None（调用方按全量处理）。
-pub fn translate_filters(
-    conn: &Connection,
-    filters: &Filters,
-) -> rusqlite::Result<(String, Vec<Value>)> {
+/// 把 Filters 翻译成纯 WHERE 片段 `(条件 AND 条件...)` + 文本参数。
+///
+/// 返回 `None` 表示无过滤（调用方按全量处理）；`Some((fragment, params))`
+/// 中参数按 fragment 内 `?` 出现的顺序排列，**全部字符串化**——SQLite 的
+/// 类型亲和会把 `'20'` 这类文本在 `value_numeric`（REAL 列）比较时自动转
+/// 数值，因此 diesel `bind::<Text>` 即可覆盖数值/文本/reflist 三类条件。
+///
+/// 该片段可直接嵌入其它查询的 `WHERE` 子句或子查询（事实平面过滤下推复用）。
+pub fn filter_where(filters: &Filters) -> Result<Option<(String, Vec<String>)>> {
     let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Value> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
 
     for cond in &filters.conditions {
         match cond {
@@ -66,88 +54,101 @@ pub fn translate_filters(
                     .collect::<Vec<_>>()
                     .join(" AND ")
                 ));
-                params.push(Value::Text(field.clone()));
+                params.push(field.clone());
                 if let Some(m) = min {
-                    params.push(Value::Real(*m));
+                    params.push(m.to_string());
                 }
                 if let Some(m) = max {
-                    params.push(Value::Real(*m));
+                    params.push(m.to_string());
                 }
             }
             FilterCondition::TextEquals { field, value } => {
                 clauses.push("(field_name = ? AND value_text = ?)".to_string());
-                params.push(Value::Text(field.clone()));
-                params.push(Value::Text(value.clone()));
+                params.push(field.clone());
+                params.push(value.clone());
             }
             FilterCondition::RefContains { field, refs } => {
                 let marks = refs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 clauses.push(format!(
                     "EXISTS (SELECT 1 FROM fact_refs r WHERE r.entity_id = facts.entity_id AND r.field_name = ? AND r.ref_value IN ({marks}))"
                 ));
-                params.push(Value::Text(field.clone()));
-                for r in refs {
-                    params.push(Value::Text(r.clone()));
-                }
+                params.push(field.clone());
+                params.extend(refs.iter().cloned());
             }
             FilterCondition::RefExcludes { field, refs } => {
                 let marks = refs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 clauses.push(format!(
                     "NOT EXISTS (SELECT 1 FROM fact_refs r WHERE r.entity_id = facts.entity_id AND r.field_name = ? AND r.ref_value IN ({marks}))"
                 ));
-                params.push(Value::Text(field.clone()));
-                for r in refs {
-                    params.push(Value::Text(r.clone()));
-                }
+                params.push(field.clone());
+                params.extend(refs.iter().cloned());
             }
         }
     }
 
     if clauses.is_empty() {
-        return Ok((String::new(), params));
+        return Ok(None);
     }
 
-    let sql = format!(
-        "SELECT DISTINCT entity_id FROM facts WHERE {} LIMIT 10000",
-        clauses.join(" AND ")
-    );
-    let _ = conn; // 保留 conn 参数：SQL 复用点（如后续走 prepare）在此扩展
-    Ok((sql, params))
+    Ok(Some((format!("({})", clauses.join(" AND ")), params)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::migrations::migrate;
 
     #[test]
-    fn translates_numeric_range() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
+    fn filter_where_numeric_range() {
         let filters = Filters {
             conditions: vec![FilterCondition::NumericRange {
-                field: "sugar_level".into(),
-                min: Some(0.0),
-                max: Some(30.0),
+                field: "price".into(),
+                min: Some(10.0),
+                max: Some(20.0),
             }],
         };
-        let (sql, params) = translate_filters(&conn, &filters).unwrap();
-        assert!(sql.contains("value_numeric >= ?"));
-        assert!(sql.contains("value_numeric <= ?"));
-        assert_eq!(params.len(), 3); // min, max, field_name
+        let (fragment, params) = filter_where(&filters).unwrap().unwrap();
+        assert!(fragment.contains("value_numeric >= ?"));
+        assert!(fragment.contains("value_numeric <= ?"));
+        // 参数顺序：field_name, min, max
+        assert_eq!(params, vec!["price", "10", "20"]);
     }
 
     #[test]
-    fn translates_ref_contains() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate(&mut conn).unwrap();
+    fn filter_where_ref_contains_and_excludes() {
         let filters = Filters {
-            conditions: vec![FilterCondition::RefContains {
-                field: "ingredient_ids".into(),
-                refs: vec!["pearl".into()],
+            conditions: vec![
+                FilterCondition::RefContains {
+                    field: "ingredient_ids".into(),
+                    refs: vec!["pearl".into(), "taro".into()],
+                },
+                FilterCondition::RefExcludes {
+                    field: "ingredient_ids".into(),
+                    refs: vec!["jelly".into()],
+                },
+            ],
+        };
+        let (fragment, params) = filter_where(&filters).unwrap().unwrap();
+        assert!(fragment.contains("fact_refs"));
+        assert!(fragment.contains("NOT EXISTS"));
+        // contains: field + 2 refs；excludes: field + 1 ref
+        assert_eq!(params.len(), 5);
+    }
+
+    #[test]
+    fn filter_where_empty_returns_none() {
+        assert!(filter_where(&Filters::empty()).unwrap().is_none());
+    }
+
+    #[test]
+    fn filter_where_ignores_open_range() {
+        // min/max 都缺省的 NumericRange 视为无约束，跳过
+        let filters = Filters {
+            conditions: vec![FilterCondition::NumericRange {
+                field: "price".into(),
+                min: None,
+                max: None,
             }],
         };
-        let (sql, params) = translate_filters(&conn, &filters).unwrap();
-        assert!(sql.contains("fact_refs"));
-        assert_eq!(params.len(), 2); // field_name, ref_value
+        assert!(filter_where(&filters).unwrap().is_none());
     }
 }

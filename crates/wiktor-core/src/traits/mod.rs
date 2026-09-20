@@ -1,3 +1,11 @@
+//! 核心抽象 trait 模块。
+//!
+//! 定义解耦引擎与实现的接口，仅依赖 `types`：数据源适配
+//! （`DataSource`）、实体存储（`EntityStore`）、编译器（`Compiler`）、
+//! QUG（`QueryUnderstandingGraph` / `QugBuilder`）、重排（`Reranker`）、
+//! 领域包（`DomainPack`）、反馈分析（`FeedbackAnalyzer`）与可插拔向量后端
+//! （`VectorStore`）。
+
 mod compiler;
 mod data_source;
 mod domain_pack;

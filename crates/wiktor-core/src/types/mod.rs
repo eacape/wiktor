@@ -1,3 +1,10 @@
+//! 领域类型模块。
+//!
+//! 承载两平面模型与查询/反馈路径所需的公共数据类型，无外部依赖：
+//! 实体（`entity`）、页面（`page`）、查询（`query`）、QUG（`qug`）与
+//! 错误（`error`）。模块内同时聚合部分与事实平面过滤下推相关的载荷
+//! 类型（`FactValue` / `Facts` / `Filters` / `FilterCondition`）。
+
 mod entity;
 pub mod error;
 mod page;
@@ -96,6 +103,8 @@ pub enum FieldType {
     Numeric,
     Text,
     Boolean,
+    /// 事实表 CHECK 约束用 'reflist'，故 serde 显式 rename（rename_all 会产出 ref_list）。
+    #[serde(rename = "reflist")]
     RefList,
     Timestamp,
 }

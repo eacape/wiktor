@@ -1,5 +1,5 @@
 //! 知识平面查询辅助（页面发布状态机相关）。
-//! DDL 见 `migrations::MIGRATION_0001`。
+//! DDL 见 `migrations/0001_create_core/up.sql`。
 
 /// 将发布状态写入 pages.status 的 SQL 常量（供 kernel 复用）。
 /// 注：发布状态机属后续步骤，当前阶段允许 dead_code。

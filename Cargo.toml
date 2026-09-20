@@ -17,9 +17,17 @@ repository = "https://github.com/wiktor-rs/wiktor"
 tokio = { version = "1.40", features = ["full"] }
 
 # 存储与序列化
-rusqlite = { version = "0.32", features = ["bundled"] }
+diesel = { version = "2.2", features = ["sqlite"] }
+diesel_migrations = { version = "2.2", features = ["sqlite"] }
+# bundled SQLite：diesel 无 sqlite-bundled feature，需显式带 libsqlite3-sys bundled
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml_ng = "0.10"
+
+# 解析（不重复造轮子：frontmatter / Markdown）
+gray_matter = "0.2"
+pulldown-cmark = "0.12"
 
 # 向量检索（qdrant 外部服务，optional dependency in wiktor-core）
 qdrant-client = { version = "1.19", default-features = false }

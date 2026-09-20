@@ -1,5 +1,5 @@
 //! 编译任务队列辅助（状态机查询）。
-//! DDL 见 `migrations::MIGRATION_0001`。
+//! DDL 见 `migrations/0001_create_core/up.sql`。
 
 /// 领取一个 pending 任务（幂等去重由 UNIQUE(entity_id, source_revision, domain_pack_version) 保证）。
 /// 注：编译管线在后续步骤使用，当前阶段允许 dead_code。

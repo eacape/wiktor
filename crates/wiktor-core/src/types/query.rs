@@ -25,6 +25,8 @@ pub struct SearchHit {
     pub page_id: String,
     pub entity_id: EntityId,
     pub score: f32,
+    /// 页面标题（CLI 展示用）。
+    pub title: String,
 }
 
 /// 查询日志（反馈层输入）。

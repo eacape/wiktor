@@ -15,3 +15,4 @@ wiktor-core = { path = "../wiktor-core", features = ["vector-qdrant"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde_yaml_ng = { workspace = true }

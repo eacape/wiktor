@@ -1,22 +1,66 @@
+use crate::db_schema::{
+    fact_refs as fact_refs_t, facts as facts_t, page_quality as page_quality_t,
+    page_sections as page_sections_t, pages as pages_t,
+};
 use crate::schema::{self, facts};
 use crate::traits::EntityStore;
 use crate::types::error::{Error, Result};
-use crate::types::{EntityId, FactValue, Facts, FilterCondition, Filters};
+#[cfg(test)]
+use crate::types::FilterCondition;
+use crate::types::{
+    EntityId, FactValue, Facts, Filters, PublishStatus, Query, SearchHit, WikiPage,
+};
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use diesel::connection::Connection;
+use diesel::prelude::*;
+use diesel::sqlite::SqliteConnection;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
 /// SQLite 内核：两平面 + FTS5 + 任务队列 + 查询日志，单连接（MVP 单写者）。
+///
+/// 存储层使用 diesel（SQLite bundled）：pages/facts 等 CRUD 走 ORM 的类型安全
+/// DSL；FTS5 trigram MATCH、bm25、过滤下推这类核心检索 SQL 走 `diesel::sql_query`
+/// raw SQL 逃生（见 `kernel/sqlite.rs::search`）。
 pub struct SqliteKernel {
-    conn: Mutex<Connection>,
+    conn: Mutex<SqliteConnection>,
+}
+
+/// search 返回行（`QueryableByName` 供 `diesel::sql_query` 映射）。
+#[derive(QueryableByName)]
+struct SearchRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    page_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    title: String,
+    #[diesel(sql_type = diesel::sql_types::Float)]
+    score: f32,
+}
+
+/// 单列文本行（filter 全量 / 过滤下推用）。
+#[derive(QueryableByName)]
+struct TextRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    value: String,
+}
+
+/// COUNT(*) 行（row_counts / schema 版本用）。
+#[derive(QueryableByName)]
+struct CountRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    n: i64,
 }
 
 impl SqliteKernel {
     /// 打开（不存在则创建）并应用迁移。
     pub fn open(path: &Path) -> Result<Self> {
-        let mut conn = Connection::open(path)?;
+        let path_str = path.to_str().ok_or_else(|| {
+            Error::InvalidConfig(format!("db path is not valid UTF-8: {}", path.display()))
+        })?;
+        let mut conn = establish(path_str)?;
         schema::migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -24,27 +68,22 @@ impl SqliteKernel {
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let mut conn = Connection::open_in_memory()?;
+        let mut conn = establish(":memory:")?;
         schema::migrate(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    /// 当前 schema 版本（MAX(schema_migrations.version)）。
+    /// 当前 schema 版本（已应用迁移数）。
     pub fn schema_version(&self) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        let v: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(v)
+        let mut conn = self.conn.lock().unwrap();
+        schema::schema_version(&mut conn)
     }
 
     /// 各核心表的行数。
     pub fn row_counts(&self) -> Result<BTreeMap<String, i64>> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let tables = [
             "pages",
             "page_quality",
@@ -57,19 +96,266 @@ impl SqliteKernel {
         ];
         let mut out = BTreeMap::new();
         for t in tables {
-            let sql = format!("SELECT COUNT(*) FROM {t}");
-            let n: i64 = conn.query_row(&sql, [], |r| r.get(0))?;
-            out.insert(t.to_string(), n);
+            let sql = format!("SELECT COUNT(*) AS n FROM {t}");
+            let r: CountRow = diesel::sql_query(sql).get_result(&mut *conn)?;
+            out.insert(t.to_string(), r.n);
         }
         Ok(out)
     }
 
     /// 直接执行（供 CLI/工具使用）。
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch(sql)?;
+        let mut conn = self.conn.lock().unwrap();
+        diesel::connection::SimpleConnection::batch_execute(&mut *conn, sql)?;
         Ok(())
     }
+
+    /// 写入/覆盖一页知识平面（seed 场景：手工编译产物，评分默认满分，幂等）。
+    ///
+    /// 重复导入同一 page_id：diesel `on_conflict(page_id).do_update()` 覆盖页面，
+    /// 章节先删后插，不产生重复行；FTS 由触发器同步。
+    pub fn seed_pages(&self, page: &WikiPage, domain: &str, status: PublishStatus) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let now = unix_now();
+        let content_hash = blake3::hash(format!("{}\0{}", page.title, page.content).as_bytes())
+            .to_hex()
+            .to_string();
+        let status_str = match status {
+            PublishStatus::Candidate => "candidate",
+            PublishStatus::Accepted => "accepted",
+            PublishStatus::Quarantined => "quarantined",
+        };
+        let entity_key = page.entity_id.to_key();
+        let entity_type = page.entity_id.entity_type.clone();
+
+        conn.transaction(|tx| -> Result<()> {
+            // 页面 upsert（等价 INSERT OR REPLACE）
+            diesel::insert_into(pages_t::table)
+                .values((
+                    pages_t::page_id.eq(&page.page_id),
+                    pages_t::entity_id.eq(&entity_key),
+                    pages_t::domain.eq(domain),
+                    pages_t::entity_type.eq(&entity_type),
+                    pages_t::title.eq(&page.title),
+                    pages_t::content.eq(&page.content),
+                    pages_t::content_hash.eq(&content_hash),
+                    pages_t::generation.eq(1_i64),
+                    pages_t::status.eq(status_str),
+                    pages_t::domain_pack_version.eq(&page.metadata.domain_pack_version),
+                    pages_t::compiled_at.eq(page.metadata.compiled_at),
+                    pages_t::model_version.eq(&page.metadata.model_version),
+                    pages_t::embedding_model.eq(&page.metadata.embedding_model),
+                    pages_t::created_at.eq(now),
+                    pages_t::updated_at.eq(now),
+                ))
+                .on_conflict(pages_t::page_id)
+                .do_update()
+                .set((
+                    pages_t::entity_id.eq(&entity_key),
+                    pages_t::domain.eq(domain),
+                    pages_t::entity_type.eq(&entity_type),
+                    pages_t::title.eq(&page.title),
+                    pages_t::content.eq(&page.content),
+                    pages_t::content_hash.eq(&content_hash),
+                    pages_t::generation.eq(1_i64),
+                    pages_t::status.eq(status_str),
+                    pages_t::domain_pack_version.eq(&page.metadata.domain_pack_version),
+                    pages_t::compiled_at.eq(page.metadata.compiled_at),
+                    pages_t::model_version.eq(&page.metadata.model_version),
+                    pages_t::embedding_model.eq(&page.metadata.embedding_model),
+                    pages_t::updated_at.eq(now),
+                ))
+                .execute(tx)?;
+
+            // 章节重写（先删后插，幂等）
+            diesel::delete(
+                page_sections_t::table.filter(page_sections_t::page_id.eq(&page.page_id)),
+            )
+            .execute(tx)?;
+            for (i, s) in page.sections.iter().enumerate() {
+                diesel::insert_into(page_sections_t::table)
+                    .values((
+                        page_sections_t::section_id.eq(format!("{}#{}", page.page_id, i)),
+                        page_sections_t::page_id.eq(&page.page_id),
+                        page_sections_t::heading.eq(&s.heading),
+                        page_sections_t::content.eq(&s.content),
+                        page_sections_t::section_index.eq(i as i64),
+                    ))
+                    .execute(tx)?;
+            }
+
+            // 手工 seed 页面默认质量满分（四规则维度 1.0，一致性留空）
+            diesel::insert_into(page_quality_t::table)
+                .values((
+                    page_quality_t::page_id.eq(&page.page_id),
+                    page_quality_t::coverage.eq(1.0_f64),
+                    page_quality_t::citation.eq(1.0_f64),
+                    page_quality_t::schema_compliance.eq(1.0_f64),
+                    page_quality_t::density.eq(1.0_f64),
+                    page_quality_t::consistency.eq(Option::<f64>::None),
+                    page_quality_t::overall.eq(1.0_f64),
+                ))
+                .on_conflict(page_quality_t::page_id)
+                .do_update()
+                .set((
+                    page_quality_t::coverage.eq(1.0_f64),
+                    page_quality_t::citation.eq(1.0_f64),
+                    page_quality_t::schema_compliance.eq(1.0_f64),
+                    page_quality_t::density.eq(1.0_f64),
+                    page_quality_t::consistency.eq(Option::<f64>::None),
+                    page_quality_t::overall.eq(1.0_f64),
+                ))
+                .execute(tx)?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    /// 最小查询闭环：FTS5（长查询 MATCH / 短查询 LIKE）检索知识平面，
+    /// 可选事实平面过滤下推（category 关联锚点），写查询日志。
+    ///
+    /// 过滤下推语义：FTS 命中页 → 事实平面过滤出满足条件的 SKU → 取其
+    /// `category` 值集合（= 知识页 entity_id）→ `pages.entity_id IN (...)`。
+    pub fn search(
+        &self,
+        text: &str,
+        filters: &Filters,
+        top_k: usize,
+        domain: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut conn = self.conn.lock().unwrap();
+        let started = std::time::Instant::now();
+        let top_k = top_k.max(1);
+
+        // 长查询（≥3 字符）走 FTS5 trigram MATCH；短查询（<3 字符，如"珍珠"）走 LIKE 兜底。
+        let is_long = text.chars().count() >= 3;
+
+        let mut sql = String::new();
+
+        if is_long {
+            // FTS5 短语查询：双引号包裹，内部双引号加倍转义
+            let match_expr = sq(&format!("\"{}\"", text.replace('"', "\"\"")));
+            sql.push_str(&format!(
+                "SELECT p.page_id, p.entity_id, p.title, -bm25(pages_fts) AS score
+                 FROM pages_fts f
+                 JOIN pages p ON p.page_id = f.page_id
+                 WHERE f.pages_fts MATCH {match_expr} AND p.status = 'accepted'"
+            ));
+        } else {
+            let like = sq(&format!("%{text}%"));
+            sql.push_str(&format!(
+                "SELECT p.page_id, p.entity_id, p.title, 1.0 AS score
+                 FROM pages p
+                 WHERE (p.title LIKE {like} OR p.content LIKE {like}) AND p.status = 'accepted'"
+            ));
+        }
+
+        if let Some(d) = domain {
+            sql.push_str(&format!(" AND p.domain = {}", sq(d)));
+        }
+
+        // 事实平面过滤下推：SKU 满足条件 → category 值集合 → 页 IN
+        if let Some((fragment, fparams)) = facts::filter_where(filters)? {
+            let fragment = inline_params(&fragment, &fparams);
+            sql.push_str(&format!(
+                " AND p.entity_id IN (
+                    SELECT DISTINCT cat.value_text
+                    FROM facts cat
+                    JOIN (SELECT DISTINCT entity_id FROM facts WHERE {fragment}) ft
+                        ON ft.entity_id = cat.entity_id
+                    WHERE cat.field_name = 'category' AND cat.field_type = 'text'
+                )"
+            ));
+        }
+
+        // top_k 来自本进程整数（CLI 解析 usize），内联安全
+        sql.push_str(if is_long {
+            " ORDER BY score DESC"
+        } else {
+            " ORDER BY p.page_id"
+        });
+        sql.push_str(&format!(" LIMIT {top_k}"));
+
+        let query_json = serde_json::to_string(&Query {
+            text: text.to_string(),
+            filters: filters.clone(),
+            top_k,
+            domain: domain.map(str::to_string),
+        })?;
+
+        // 执行；失败也写日志（hit_count=0）再返回错误
+        let run = diesel::sql_query(&sql)
+            .load::<SearchRow>(&mut *conn)
+            .map_err(Error::Database);
+
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let mut log = |hit_count: i64| {
+            diesel::sql_query(
+                "INSERT INTO query_logs (query_text, query_json, rewritten_json, rewrite_failure, hit_count, latency_ms, timestamp)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            )
+            .bind::<diesel::sql_types::Text, _>(text)
+            .bind::<diesel::sql_types::Text, _>(&query_json)
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(Option::<String>::None)
+            .bind::<diesel::sql_types::Integer, _>(0_i32)
+            .bind::<diesel::sql_types::BigInt, _>(hit_count)
+            .bind::<diesel::sql_types::BigInt, _>(latency_ms)
+            .bind::<diesel::sql_types::BigInt, _>(unix_now())
+            .execute(&mut *conn)
+        };
+
+        match run {
+            Ok(rows) => {
+                let hits: Vec<SearchHit> = rows
+                    .into_iter()
+                    .map(|r| {
+                        Ok(SearchHit {
+                            page_id: r.page_id,
+                            entity_id: EntityId::from_key(&r.entity_id)?,
+                            score: r.score,
+                            title: r.title,
+                        })
+                    })
+                    .collect::<Result<_>>()?;
+                let _ = log(hits.len() as i64);
+                Ok(hits)
+            }
+            Err(e) => {
+                let _ = log(0);
+                Err(e)
+            }
+        }
+    }
+}
+
+fn establish(url: &str) -> Result<SqliteConnection> {
+    SqliteConnection::establish(url).map_err(|e| {
+        Error::Database(diesel::result::Error::QueryBuilderError(
+            format!("connection error: {e}").into(),
+        ))
+    })
+}
+
+/// SQL 字符串字面量（单引号转义防注入）。用于 raw SQL 逃生路径的参数内联。
+fn sq(v: &str) -> String {
+    format!("'{}'", v.replace('\'', "''"))
+}
+
+/// 把 `fragment` 中按序出现的 `?` 占位符替换为内联字符串字面量。
+fn inline_params(fragment: &str, params: &[String]) -> String {
+    let mut out = String::with_capacity(fragment.len() + params.len() * 8);
+    let mut iter = params.iter();
+    for (i, chunk) in fragment.split('?').enumerate() {
+        if i > 0 {
+            if let Some(p) = iter.next() {
+                out.push_str(&sq(p));
+            } else {
+                out.push('?');
+            }
+        }
+        out.push_str(chunk);
+    }
+    out
 }
 
 fn unix_now() -> i64 {
@@ -89,112 +375,133 @@ impl EntityStore for SqliteKernel {
                 facts.entity_id.to_key()
             )));
         }
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let now = unix_now();
-        let tx = conn.unchecked_transaction()?;
+        conn.transaction(|tx| -> Result<()> {
+            for (field_name, value) in &facts.fields {
+                let (field_type, numeric, text, boolean, timestamp) = facts::fact_columns(value);
+                // CAS 生效判断：仅当本 revision 真正覆盖/新插入 facts 行（影响行数==1）时，
+                // 才允许重写派生行 fact_refs——否则旧 revision 会绕过 CAS 污染 reflist。
+                // 注：CAS 是核心语义（excluded.source_revision > facts.source_revision），
+                // 走 raw SQL 逃生（diesel on_conflict do_update 的 WHERE 表达力不足）。
+                // 本 SQL 是 CAS 唯一真相（原 schema::facts::SQL_UPSERT_FACT 参考常量已删）。
+                let applied = diesel::sql_query(
+                    "INSERT INTO facts (entity_id, field_name, field_type, value_numeric, value_text, value_boolean, value_timestamp, source_revision, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                     ON CONFLICT(entity_id, field_name) DO UPDATE SET
+                         field_type      = excluded.field_type,
+                         value_numeric   = excluded.value_numeric,
+                         value_text      = excluded.value_text,
+                         value_boolean   = excluded.value_boolean,
+                         value_timestamp = excluded.value_timestamp,
+                         source_revision = excluded.source_revision,
+                         updated_at      = excluded.updated_at
+                     WHERE excluded.source_revision > facts.source_revision",
+                )
+                .bind::<diesel::sql_types::Text, _>(id.to_key())
+                .bind::<diesel::sql_types::Text, _>(field_name)
+                .bind::<diesel::sql_types::Text, _>(&field_type)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(numeric)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(text)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(boolean)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(timestamp)
+                .bind::<diesel::sql_types::BigInt, _>(source_revision as i64)
+                .bind::<diesel::sql_types::BigInt, _>(now)
+                .execute(tx)?
+                    == 1;
 
-        for (field_name, value) in &facts.fields {
-            let (field_type, numeric, text, boolean, timestamp) = facts::fact_columns(value);
-            // CAS 生效判断：仅当本 revision 真正覆盖/新插入 facts 行（changes()==1）时，
-            // 才允许重写派生行 fact_refs——否则旧 revision 会绕过 CAS 污染 reflist。
-            let applied = tx.execute(
-                facts::SQL_UPSERT_FACT,
-                params![
-                    id.to_key(),
-                    field_name,
-                    field_type,
-                    numeric,
-                    text,
-                    boolean,
-                    timestamp,
-                    source_revision as i64,
-                    now
-                ],
-            )? == 1;
-
-            // reflist 拆行到 fact_refs（同一事务，先删后插；仅 CAS 生效时执行）
-            if applied {
-                if let FactValue::RefList(refs) = value {
-                    tx.execute(
-                        "DELETE FROM fact_refs WHERE entity_id = ?1 AND field_name = ?2",
-                        params![id.to_key(), field_name],
-                    )?;
-                    for r in refs {
-                        tx.execute(
-                            "INSERT OR IGNORE INTO fact_refs (entity_id, field_name, ref_value) VALUES (?1, ?2, ?3)",
-                            params![id.to_key(), field_name, r],
-                        )?;
+                // reflist 拆行到 fact_refs（同一事务，先删后插；仅 CAS 生效时执行）
+                if applied {
+                    if let FactValue::RefList(refs) = value {
+                        diesel::delete(
+                            fact_refs_t::table
+                                .filter(fact_refs_t::entity_id.eq(id.to_key()))
+                                .filter(fact_refs_t::field_name.eq(field_name)),
+                        )
+                        .execute(tx)?;
+                        for r in refs {
+                            diesel::insert_into(fact_refs_t::table)
+                                .values((
+                                    fact_refs_t::entity_id.eq(id.to_key()),
+                                    fact_refs_t::field_name.eq(field_name),
+                                    fact_refs_t::ref_value.eq(r),
+                                ))
+                                .execute(tx)?;
+                        }
                     }
                 }
             }
-        }
-        tx.commit()?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     async fn filter(&self, filters: &Filters) -> Result<Vec<EntityId>> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         if filters.is_empty() {
             // 空条件：返回全量（上限保护）
-            let mut stmt = conn.prepare("SELECT DISTINCT entity_id FROM facts LIMIT 10000")?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            let mut out = Vec::new();
-            for r in rows {
-                out.push(EntityId::from_key(&r?)?);
-            }
-            return Ok(out);
+            let rows: Vec<TextRow> =
+                diesel::sql_query("SELECT DISTINCT entity_id AS value FROM facts LIMIT 10000")
+                    .load(&mut *conn)?;
+            return rows.iter().map(|r| EntityId::from_key(&r.value)).collect();
         }
-        let (sql, params) = facts::translate_filters(&conn, filters)?;
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |r| {
-            r.get::<_, String>(0)
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(EntityId::from_key(&r?)?);
-        }
-        Ok(out)
+        let (fragment, params) = facts::filter_where(filters)?
+            .ok_or_else(|| Error::Internal("non-empty filters produced no where clause".into()))?;
+        let fragment = inline_params(&fragment, &params);
+        let sql =
+            format!("SELECT DISTINCT entity_id AS value FROM facts WHERE {fragment} LIMIT 10000");
+        let rows: Vec<TextRow> = diesel::sql_query(&sql).load(&mut *conn)?;
+        rows.iter().map(|r| EntityId::from_key(&r.value)).collect()
     }
 
     async fn delete_facts(&self, id: &EntityId) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let tx = conn.unchecked_transaction()?;
-        tx.execute(
-            "DELETE FROM fact_refs WHERE entity_id = ?1",
-            params![id.to_key()],
-        )?;
-        tx.execute(
-            "DELETE FROM facts WHERE entity_id = ?1",
-            params![id.to_key()],
-        )?;
-        tx.commit()?;
+        let mut conn = self.conn.lock().unwrap();
+        conn.transaction(|tx| -> Result<()> {
+            diesel::delete(fact_refs_t::table.filter(fact_refs_t::entity_id.eq(id.to_key())))
+                .execute(tx)?;
+            diesel::delete(facts_t::table.filter(facts_t::entity_id.eq(id.to_key())))
+                .execute(tx)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
     async fn get_facts(&self, id: &EntityId) -> Result<Option<Facts>> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let key = id.to_key();
-        let mut stmt = conn.prepare(
-            "SELECT field_name, field_type, value_numeric, value_text, value_boolean, value_timestamp, source_revision
-             FROM facts WHERE entity_id = ?1",
-        )?;
-        let rows = stmt.query_map(params![key], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<f64>>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<i64>>(4)?,
-                r.get::<_, Option<i64>>(5)?,
-                r.get::<_, i64>(6)?,
+        let rows: Vec<(
+            String,
+            String,
+            Option<f64>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+        )> = facts_t::table
+            .filter(facts_t::entity_id.eq(&key))
+            .select((
+                facts_t::field_name,
+                facts_t::field_type,
+                facts_t::value_numeric,
+                facts_t::value_text,
+                facts_t::value_boolean,
+                facts_t::value_timestamp,
+                facts_t::source_revision,
             ))
-        })?;
+            .load::<(
+                String,
+                String,
+                Option<f64>,
+                Option<String>,
+                Option<i64>,
+                Option<i64>,
+                i64,
+            )>(&mut *conn)?;
 
         let mut fields = BTreeMap::new();
         let mut revision = 0u64;
         let mut found = false;
-        for r in rows {
-            let (name, ftype, numeric, text, boolean, timestamp, rev) = r?;
+        for (name, ftype, numeric, text, boolean, timestamp, rev) in rows {
             found = true;
             revision = rev as u64;
             let value = match ftype.as_str() {
@@ -204,14 +511,12 @@ impl EntityStore for SqliteKernel {
                 "timestamp" => FactValue::Timestamp(timestamp.unwrap_or(0)),
                 "reflist" => {
                     // reflist 值从 fact_refs 读
-                    let mut rstmt = conn.prepare(
-                        "SELECT ref_value FROM fact_refs WHERE entity_id = ?1 AND field_name = ?2 ORDER BY ref_value",
-                    )?;
-                    let rrows = rstmt.query_map(params![key, name], |r| r.get::<_, String>(0))?;
-                    let mut refs = Vec::new();
-                    for rr in rrows {
-                        refs.push(rr?);
-                    }
+                    let refs: Vec<String> = fact_refs_t::table
+                        .filter(fact_refs_t::entity_id.eq(&key))
+                        .filter(fact_refs_t::field_name.eq(&name))
+                        .select(fact_refs_t::ref_value)
+                        .order(fact_refs_t::ref_value.asc())
+                        .load(&mut *conn)?;
                     FactValue::RefList(refs)
                 }
                 other => {
@@ -233,13 +538,18 @@ impl EntityStore for SqliteKernel {
     }
 }
 
-// 保留 import：FilterCondition 供后续过滤扩展与 trait 方法签名使用。
-#[allow(unused_imports)]
-use FilterCondition as _FilterConditionAlias;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_page(entity_key: &str, title: &str, body: &str) -> WikiPage {
+        crate::seed::parse_page(
+            &format!(
+                "---\npage_id: {entity_key}\nentity_id: {entity_key}\ntitle: {title}\nentity_type: drink\n---\n\n{body}"
+            ),
+        )
+        .unwrap()
+    }
 
     #[tokio::test]
     async fn upsert_facts_cas_old_revision_does_not_override() {
@@ -319,5 +629,137 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(excludes, vec![id_b.clone()]);
+    }
+
+    #[test]
+    fn seed_pages_then_search_chinese() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let page = sample_page(
+            "milk-tea:drink:boba",
+            "波霸奶茶",
+            "波霸奶茶是以红茶为基底加入波霸珍珠的经典奶茶。\n\n## 成分\n\n- 红茶\n- 波霸珍珠\n- 鲜奶",
+        );
+        kernel
+            .seed_pages(&page, "milk-tea", PublishStatus::Accepted)
+            .unwrap();
+
+        // 长查询（≥3 字符）走 trigram MATCH
+        let hits = kernel
+            .search("波霸奶茶", &Filters::empty(), 5, None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].page_id, "milk-tea:drink:boba");
+        assert!(hits[0].score > 0.0, "bm25 score must be positive");
+
+        // 幂等：重复导入不产生重复页
+        kernel
+            .seed_pages(&page, "milk-tea", PublishStatus::Accepted)
+            .unwrap();
+        let counts = kernel.row_counts().unwrap();
+        assert_eq!(counts["pages"], 1);
+        // 页面 = 导语（概述）+ 成分，共 2 节；重复导入不翻倍
+        assert_eq!(counts["page_sections"], 2);
+    }
+
+    #[test]
+    fn short_query_uses_like() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let page = sample_page(
+            "milk-tea:drink:boba",
+            "波霸奶茶",
+            "珍珠软糯，茶味浓郁。\n\n## 成分\n\n- 波霸珍珠",
+        );
+        kernel
+            .seed_pages(&page, "milk-tea", PublishStatus::Accepted)
+            .unwrap();
+
+        // 短查询（<3 字符）走 LIKE，score 固定 1.0
+        let hits = kernel.search("珍珠", &Filters::empty(), 5, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].score, 1.0);
+    }
+
+    #[test]
+    fn search_writes_query_logs() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let page = sample_page(
+            "milk-tea:drink:boba",
+            "波霸奶茶",
+            "波霸奶茶是以红茶为基底加入波霸珍珠的经典奶茶。",
+        );
+        kernel
+            .seed_pages(&page, "milk-tea", PublishStatus::Accepted)
+            .unwrap();
+        let _ = kernel
+            .search("波霸奶茶", &Filters::empty(), 5, None)
+            .unwrap();
+        let counts = kernel.row_counts().unwrap();
+        assert_eq!(counts["query_logs"], 1);
+    }
+
+    #[test]
+    fn search_with_category_filter_pushdown() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        kernel
+            .seed_pages(
+                &sample_page(
+                    "milk-tea:drink:boba",
+                    "波霸奶茶",
+                    "波霸奶茶是以红茶为基底加入波霸珍珠的经典奶茶。",
+                ),
+                "milk-tea",
+                PublishStatus::Accepted,
+            )
+            .unwrap();
+        kernel
+            .seed_pages(
+                &sample_page(
+                    "milk-tea:drink:lemon",
+                    "柠檬茶",
+                    "柠檬茶是清新酸甜的果茶，带柠檬香气。",
+                ),
+                "milk-tea",
+                PublishStatus::Accepted,
+            )
+            .unwrap();
+
+        // 两个 SKU：boba 页 category 低价 18 元；lemon 页 category 高价 25 元
+        let sku = |id: &str, category: &str, price: f64| -> Facts {
+            let mut f = Facts {
+                entity_id: EntityId::new("milk-tea", "product", id).unwrap(),
+                fields: BTreeMap::new(),
+                source_revision: 1,
+            };
+            f.fields
+                .insert("category".into(), FactValue::Text(category.into()));
+            f.fields.insert("price".into(), FactValue::Numeric(price));
+            f
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let a = sku("a", "milk-tea:drink:boba", 18.0);
+            kernel.upsert_facts(&a.entity_id, &a, 1).await.unwrap();
+            let b = sku("b", "milk-tea:drink:lemon", 25.0);
+            kernel.upsert_facts(&b.entity_id, &b, 1).await.unwrap();
+        });
+
+        // "茶"（短查询 LIKE）→ 两页都命中；过滤 price<=20 → 只保留 boba 页
+        let hits = kernel
+            .search(
+                "茶",
+                &Filters {
+                    conditions: vec![FilterCondition::NumericRange {
+                        field: "price".into(),
+                        min: None,
+                        max: Some(20.0),
+                    }],
+                },
+                5,
+                None,
+            )
+            .unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.page_id.as_str()).collect();
+        assert!(ids.contains(&"milk-tea:drink:boba"));
+        assert!(!ids.contains(&"milk-tea:drink:lemon"));
     }
 }
