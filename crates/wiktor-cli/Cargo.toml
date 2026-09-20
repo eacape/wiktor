@@ -1,0 +1,17 @@
+[package]
+name = "wiktor-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "wiktor"
+path = "src/main.rs"
+
+[dependencies]
+wiktor-core = { path = "../wiktor-core", features = ["vector-qdrant"] }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

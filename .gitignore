@@ -1,0 +1,12 @@
+/target
+**/*.db
+*.db-wal
+*.db-shm
+.DS_Store
+.env
+*.key
+
+# 本地工具/IDE/缓存，不进 git
+.idea/
+.zcode/
+.qdrant-initialized

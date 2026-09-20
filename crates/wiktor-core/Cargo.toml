@@ -1,0 +1,25 @@
+[package]
+name = "wiktor-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+async-trait = "0.1"
+qdrant-client = { workspace = true, optional = true }
+
+[features]
+default = ["vector-qdrant"]
+vector-qdrant = ["dep:qdrant-client"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,101 @@
+mod entity;
+pub mod error;
+mod page;
+mod query;
+mod qug;
+
+pub use entity::{EntityId, RawEntity};
+pub use error::{Error, Result};
+pub use page::{
+    CompileContext, CompiledPage, PageMetadata, PublishStatus, QualityScore, Section, WikiPage,
+};
+pub use query::{Cursor, Query, QueryLog, RewrittenQuery, SearchHit};
+pub use qug::{QugEdge, QugPath};
+
+/// 反馈层建议的补充编译任务（进人工审核队列）。
+#[derive(Debug, Clone)]
+pub struct CompileTask {
+    pub entity_id: EntityId,
+    pub source_revision: u64,
+    pub domain_pack_version: String,
+}
+
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+
+/// 事实平面中某个 field 的值（filterable 字段）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum FactValue {
+    Numeric(f64),
+    Text(String),
+    Boolean(bool),
+    RefList(Vec<String>),
+    Timestamp(i64),
+}
+
+/// 实体事实（事实平面写入载荷）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Facts {
+    pub entity_id: EntityId,
+    pub fields: BTreeMap<String, FactValue>,
+    pub source_revision: u64,
+}
+
+/// 过滤条件（事实平面下推 + 向量候选域共用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Filters {
+    pub conditions: Vec<FilterCondition>,
+}
+
+impl Filters {
+    pub fn empty() -> Self {
+        Self {
+            conditions: Vec::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.conditions.is_empty()
+    }
+}
+
+/// 单条过滤条件。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FilterCondition {
+    NumericRange {
+        field: String,
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+    TextEquals {
+        field: String,
+        value: String,
+    },
+    RefContains {
+        field: String,
+        refs: Vec<String>,
+    },
+    RefExcludes {
+        field: String,
+        refs: Vec<String>,
+    },
+}
+
+/// 源数据字段定义（DataSource::schema 返回）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldDefinition {
+    pub name: String,
+    pub field_type: FieldType,
+    pub filterable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FieldType {
+    Numeric,
+    Text,
+    Boolean,
+    RefList,
+    Timestamp,
+}
