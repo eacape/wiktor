@@ -23,7 +23,10 @@ mod vector_store;
 
 pub use compiler::Compiler;
 pub use data_source::{DataSource, EntitySchema};
-pub use domain_pack::{DomainConfig, DomainPack, EntityConfig};
+pub use domain_pack::{
+    AttributeRule, DomainConfig, DomainPack, EntityConfig, IntentConfig, IntentEntry, NegationRule,
+    QugConfig, TemplateExpansion,
+};
 pub use entity_store::EntityStore;
 pub use feedback::{FeedbackAnalyzer, FeedbackReport};
 pub use qug::{QueryUnderstandingGraph, QugBuilder};

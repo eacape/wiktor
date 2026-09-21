@@ -5,10 +5,6 @@
 //! 实体（`entity`）、页面（`page`）、查询（`query`）、QUG（`qug`）与
 //! 错误（`error`）。模块内同时聚合部分与事实平面过滤下推相关的载荷
 //! 类型（`FactValue` / `Facts` / `Filters` / `FilterCondition`）。
-//! Holds the shared, dependency-free data types for the two-plane model and query/feedback paths:
-//! entities (`entity`), pages (`page`), queries (`query`), QUG (`qug`) and errors (`error`).
-//! It also aggregates fact-plane filter-pushdown payload types (`FactValue` / `Facts` /
-//! `Filters` / `FilterCondition`).
 //! Holds the shared data types for the two-plane model and the query/feedback paths,
 //! with no external dependencies: entity (`entity`), page (`page`), query (`query`),
 //! QUG (`qug`) and error (`error`). It also aggregates payload types related to
@@ -63,7 +59,7 @@ pub struct Facts {
 
 /// 过滤条件（事实平面下推 + 向量候选域共用）。
 /// Filter conditions (shared by fact-plane pushdown and the vector candidate scope).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Filters {
     pub conditions: Vec<FilterCondition>,
 }
@@ -82,7 +78,7 @@ impl Filters {
 
 /// 单条过滤条件。
 /// A single filter condition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum FilterCondition {
     NumericRange {
         field: String,

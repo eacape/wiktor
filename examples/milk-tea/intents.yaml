@@ -1,0 +1,24 @@
+# Intent templates for the milk-tea reference dataset (Step 3 §4).
+# 奶茶参考数据集的意图模板（Step 3 §4）。
+#
+# Each entry has phrases plus exactly one rule:
+# 每个条目由短语 + 恰好一个规则组成：
+#   expansion  -> IntentTemplate edge (appends terms/filters)
+#   attribute  -> AttributePropagation edge (structured filter on the fact plane)
+#   negation   -> Negation edge (RefExcludes on a reflist field)
+version: "0.1.0"
+intents:
+  - id: cold_drink
+    phrases: ["冰的", "冷饮"]
+    expansion:
+      text: "冰饮"
+  - id: low_sugar
+    phrases: ["不甜的", "少糖", "低糖"]
+    attribute:
+      field: sugar_level
+      max: 30
+  - id: no_pearl
+    phrases: ["不要珍珠", "不加珍珠"]
+    negation:
+      field: ingredient_ids
+      refs: ["milk-tea:ingredient:pearl"]

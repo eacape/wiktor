@@ -27,3 +27,8 @@
 {"query":"柠檬茶","expected_hits":["milk-tea:drink:lemon-tea"],"filters":{"exclude_ingredients":["milk-tea:ingredient:pearl"]}}
 {"query":"柠檬茶","expected_hits":["milk-tea:drink:lemon-tea"],"filters":{"price_max":20}}
 {"query":"奶茶","expected_hits":["milk-tea:drink:tapioca-milk-tea"],"filters":{"sugar_max":50,"size":"大杯"}}
+{"query":"少糖奶茶","expected_hits":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"filters":{}}
+{"query":"不甜的奶茶","expected_hits":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"filters":{}}
+{"query":"低糖波霸","expected_hits":["milk-tea:drink:boba-milk-tea"],"filters":{}}
+{"query":"冷饮","expected_hits":["milk-tea:drink:matcha-latte"],"filters":{}}
+{"query":"啵啵","expected_hits":["milk-tea:drink:boba-milk-tea"],"filters":{}}

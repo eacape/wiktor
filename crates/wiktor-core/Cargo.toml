@@ -20,6 +20,8 @@ blake3 = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
+petgraph = { workspace = true }
+tracing = { workspace = true }
 qdrant-client = { workspace = true, optional = true }
 
 [features]

@@ -232,6 +232,183 @@ impl SqliteKernel {
         Ok(())
     }
 
+    /// 事实平面过滤 → 知识页候选集合（Step 3 QueryEngine 用）。
+    /// Fact-plane filter → knowledge-page candidate set (used by the Step 3 QueryEngine).
+    ///
+    /// 语义：SKU 满足过滤条件 → 取其 `category` 值集合（= 知识页 entity_id）。
+    /// 与 `search` 内联的过滤下推一致；独立暴露供引擎层先预筛、再把候选域同时
+    /// 传给 FTS 与向量路径（避免 top-k 后过滤漏召回）。
+    /// Semantics: SKUs matching the conditions → collect their `category` values
+    /// (= knowledge-page entity_id). Same as the inline filter pushdown in `search`,
+    /// exposed separately so the engine can prefilter first and pass the candidate
+    /// scope to both the FTS and vector paths (avoiding post-top-k filtering misses).
+    pub fn filter_page_candidates(&self, filters: &Filters) -> Result<Vec<EntityId>> {
+        if filters.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let Some((fragment, fparams)) = facts::filter_where(filters)? else {
+            return Ok(Vec::new());
+        };
+        let fragment = inline_params(&fragment, &fparams);
+        let sql = format!(
+            "SELECT DISTINCT cat.value_text AS value
+             FROM facts cat
+             JOIN (SELECT DISTINCT entity_id FROM facts WHERE {fragment}) ft
+                 ON ft.entity_id = cat.entity_id
+             WHERE cat.field_name = 'category' AND cat.field_type = 'text'"
+        );
+        let rows: Vec<TextRow> = diesel::sql_query(&sql).load(&mut *conn)?;
+        rows.into_iter()
+            .map(|r| EntityId::from_key(&r.value))
+            .collect()
+    }
+
+    /// 候选检索（Step 3）：对每个 term 独立执行 FTS5/LIKE，按页面取最高 BM25 分；
+    /// 支持事实平面过滤下推与候选实体域白名单，**不写查询日志**（由 QueryEngine
+    /// 统一写，避免一条查询产生两条日志）。
+    /// Candidate retrieval (Step 3): runs FTS5/LIKE per term and keeps the best
+    /// BM25 score per page; supports fact-plane filter pushdown and a candidate
+    /// entity-scope whitelist, and does **not** write a query log (the QueryEngine
+    /// writes one log, avoiding double logging for a single query).
+    ///
+    /// `candidate_ids`：
+    ///   - `None` = 无候选域限制（仅受 filters 下推约束）；
+    ///   - `Some(非空)` = 严格白名单，`pages.entity_id` 必须属于该集合；
+    ///   - `Some(空)` = 空候选域，直接返回空结果。
+    ///
+    /// `candidate_ids`:
+    ///   - `None` = unrestricted (only the filter pushdown applies);
+    ///   - `Some(non-empty)` = strict whitelist; `pages.entity_id` must be in the set;
+    ///   - `Some(empty)` = empty scope, returns no results.
+    pub fn search_candidates(
+        &self,
+        terms: &[String],
+        filters: &Filters,
+        top_k: usize,
+        domain: Option<&str>,
+        candidate_ids: Option<&[EntityId]>,
+    ) -> Result<Vec<SearchHit>> {
+        let mut conn = self.conn.lock().unwrap();
+        let top_k = top_k.max(1);
+
+        // 空候选域：直接空结果（避免构造 UNION 空集）
+        // Empty candidate scope: return no results (avoids building an empty UNION set)
+        if let Some(ids) = candidate_ids {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+
+        let terms: Vec<&str> = {
+            let mut t: Vec<&str> = terms.iter().map(String::as_str).collect();
+            if t.is_empty() {
+                vec![""]
+            } else {
+                t.dedup();
+                t
+            }
+        };
+
+        // 每 term 一段 SELECT；子查询只带 LIMIT（各段去重上限），ORDER BY 在外层
+        // UNION ALL 之后统一执行（SQLite 语法：UNION 内不能有 ORDER BY）。
+        // One SELECT per term; subqueries only carry LIMIT (per-segment cap);
+        // ORDER BY is applied once after the outer UNION ALL (SQLite forbids
+        // ORDER BY inside a UNION).
+        let mut selects: Vec<String> = Vec::with_capacity(terms.len());
+        for term in terms {
+            let is_long = term.chars().count() >= 3;
+            let mut sql = String::new();
+            if is_long {
+                let match_expr = sq(&format!("\"{}\"", term.replace('"', "\"\"")));
+                sql.push_str(&format!(
+                    "SELECT p.page_id, p.entity_id, p.title, -bm25(pages_fts) AS score
+                     FROM pages_fts f
+                     JOIN pages p ON p.page_id = f.page_id
+                     WHERE f.pages_fts MATCH {match_expr} AND p.status = 'accepted'"
+                ));
+            } else {
+                let like = sq(&format!("%{term}%"));
+                sql.push_str(&format!(
+                    "SELECT p.page_id, p.entity_id, p.title, 1.0 AS score
+                     FROM pages p
+                     WHERE (p.title LIKE {like} OR p.content LIKE {like}) AND p.status = 'accepted'"
+                ));
+            }
+            if let Some(d) = domain {
+                sql.push_str(&format!(" AND p.domain = {}", sq(d)));
+            }
+            // 候选实体域白名单（引擎已预筛；这里不再重复查事实表）
+            // Candidate entity-scope whitelist (already prefiltered by the engine;
+            // no need to query the fact table again here)
+            if let Some(ids) = candidate_ids {
+                let keyed: Vec<String> = ids.iter().map(EntityId::to_key).collect();
+                sql.push_str(" AND p.entity_id IN (");
+                for (i, k) in keyed.iter().enumerate() {
+                    if i > 0 {
+                        sql.push(',');
+                    }
+                    sql.push_str(&sq(k));
+                }
+                sql.push(')');
+            }
+            // 事实平面过滤下推（category 锚点 join）
+            // Fact-plane filter pushdown (category-anchor join)
+            if let Some((fragment, fparams)) = facts::filter_where(filters)? {
+                let fragment = inline_params(&fragment, &fparams);
+                sql.push_str(&format!(
+                    " AND p.entity_id IN (
+                        SELECT DISTINCT cat.value_text
+                        FROM facts cat
+                        JOIN (SELECT DISTINCT entity_id FROM facts WHERE {fragment}) ft
+                            ON ft.entity_id = cat.entity_id
+                        WHERE cat.field_name = 'category' AND cat.field_type = 'text'
+                    )"
+                ));
+            }
+            // 无 ORDER BY 也无 LIMIT：UNION ALL 的子查询不能带 LIMIT（SQLite
+            // 语法约束），排序与截断统一在外层完成。
+            // No ORDER BY and no LIMIT here: UNION ALL subqueries cannot carry
+            // LIMIT (SQLite constraint); sorting and truncation happen outside.
+            selects.push(sql);
+        }
+
+        let sql = format!(
+            "SELECT page_id, entity_id, title, score FROM ({}) ORDER BY score DESC LIMIT {top_k}",
+            selects.join(" UNION ALL ")
+        );
+        let rows = diesel::sql_query(&sql).load::<SearchRow>(&mut *conn)?;
+
+        // 按 page_id 取最高分（BM25 分数；LIKE 恒 1.0 不影响取 max 语义）
+        // Keep the best score per page_id (BM25 scores; LIKE is always 1.0, so
+        // multi-term max semantics are unaffected)
+        let mut best: std::collections::HashMap<String, SearchHit> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let hit = SearchHit {
+                page_id: r.page_id,
+                entity_id: EntityId::from_key(&r.entity_id)?,
+                score: r.score,
+                title: r.title,
+            };
+            match best.get(&hit.page_id) {
+                Some(prev) if prev.score >= hit.score => {}
+                _ => {
+                    best.insert(hit.page_id.clone(), hit);
+                }
+            }
+        }
+        let mut hits: Vec<SearchHit> = best.into_values().collect();
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.page_id.cmp(&b.page_id))
+        });
+        hits.truncate(top_k);
+        Ok(hits)
+    }
+
     /// 最小查询闭环：FTS5（长查询 MATCH / 短查询 LIKE）检索知识平面，
     /// 可选事实平面过滤下推（category 关联锚点），写查询日志。
     /// Minimal query loop: FTS5 (MATCH for long queries / LIKE for short ones)
@@ -250,63 +427,8 @@ impl SqliteKernel {
         top_k: usize,
         domain: Option<&str>,
     ) -> Result<Vec<SearchHit>> {
-        let mut conn = self.conn.lock().unwrap();
         let started = std::time::Instant::now();
         let top_k = top_k.max(1);
-
-        // 长查询（≥3 字符）走 FTS5 trigram MATCH；短查询（<3 字符，如"珍珠"）走 LIKE 兜底。
-        // Long queries (≥3 chars) use FTS5 trigram MATCH; short queries (<3 chars,
-        // e.g. "珍珠") fall back to LIKE.
-        let is_long = text.chars().count() >= 3;
-
-        let mut sql = String::new();
-
-        if is_long {
-            // FTS5 短语查询：双引号包裹，内部双引号加倍转义
-            // FTS5 phrase query: wrapped in double quotes, inner quotes escaped by doubling
-            let match_expr = sq(&format!("\"{}\"", text.replace('"', "\"\"")));
-            sql.push_str(&format!(
-                "SELECT p.page_id, p.entity_id, p.title, -bm25(pages_fts) AS score
-                 FROM pages_fts f
-                 JOIN pages p ON p.page_id = f.page_id
-                 WHERE f.pages_fts MATCH {match_expr} AND p.status = 'accepted'"
-            ));
-        } else {
-            let like = sq(&format!("%{text}%"));
-            sql.push_str(&format!(
-                "SELECT p.page_id, p.entity_id, p.title, 1.0 AS score
-                 FROM pages p
-                 WHERE (p.title LIKE {like} OR p.content LIKE {like}) AND p.status = 'accepted'"
-            ));
-        }
-
-        if let Some(d) = domain {
-            sql.push_str(&format!(" AND p.domain = {}", sq(d)));
-        }
-
-        // 事实平面过滤下推：SKU 满足条件 → category 值集合 → 页 IN
-        // Fact-plane filter pushdown: SKUs matching conditions → category value set → page IN
-        if let Some((fragment, fparams)) = facts::filter_where(filters)? {
-            let fragment = inline_params(&fragment, &fparams);
-            sql.push_str(&format!(
-                " AND p.entity_id IN (
-                    SELECT DISTINCT cat.value_text
-                    FROM facts cat
-                    JOIN (SELECT DISTINCT entity_id FROM facts WHERE {fragment}) ft
-                        ON ft.entity_id = cat.entity_id
-                    WHERE cat.field_name = 'category' AND cat.field_type = 'text'
-                )"
-            ));
-        }
-
-        // top_k 来自本进程整数（CLI 解析 usize），内联安全
-        // top_k originates from an in-process integer (CLI parses usize), safe to inline
-        sql.push_str(if is_long {
-            " ORDER BY score DESC"
-        } else {
-            " ORDER BY p.page_id"
-        });
-        sql.push_str(&format!(" LIMIT {top_k}"));
 
         let query_json = serde_json::to_string(&Query {
             text: text.to_string(),
@@ -315,14 +437,17 @@ impl SqliteKernel {
             domain: domain.map(str::to_string),
         })?;
 
-        // 执行；失败也写日志（hit_count=0）再返回错误
-        // Execute; on failure, still write the log (hit_count=0) before returning the error
-        let run = diesel::sql_query(&sql)
-            .load::<SearchRow>(&mut *conn)
-            .map_err(Error::Database);
+        // 复用候选检索（内部锁 conn，不写日志）；随后单独锁 conn 写旧格式日志。
+        // 注意不能在持有 conn 锁时再调 search_candidates——Mutex 非重入，会自锁死。
+        // Reuse candidate retrieval (it locks the connection internally and writes no
+        // log); then lock the connection separately to write the legacy-format log.
+        // Never call search_candidates while holding the conn lock — Mutex is not
+        // reentrant and would self-deadlock.
+        let run = self.search_candidates(&[text.to_string()], filters, top_k, domain, None);
 
         let latency_ms = started.elapsed().as_millis() as i64;
-        let mut log = |hit_count: i64| {
+        let log = |hit_count: i64| -> Result<()> {
+            let mut conn = self.conn.lock().unwrap();
             diesel::sql_query(
                 "INSERT INTO query_logs (query_text, query_json, rewritten_json, rewrite_failure, hit_count, latency_ms, timestamp)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -335,21 +460,12 @@ impl SqliteKernel {
             .bind::<diesel::sql_types::BigInt, _>(latency_ms)
             .bind::<diesel::sql_types::BigInt, _>(unix_now())
             .execute(&mut *conn)
+            .map(|_| ())
+            .map_err(Error::Database)
         };
 
         match run {
-            Ok(rows) => {
-                let hits: Vec<SearchHit> = rows
-                    .into_iter()
-                    .map(|r| {
-                        Ok(SearchHit {
-                            page_id: r.page_id,
-                            entity_id: EntityId::from_key(&r.entity_id)?,
-                            score: r.score,
-                            title: r.title,
-                        })
-                    })
-                    .collect::<Result<_>>()?;
+            Ok(hits) => {
                 let _ = log(hits.len() as i64);
                 Ok(hits)
             }

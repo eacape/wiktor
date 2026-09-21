@@ -3,7 +3,7 @@ page_id: milk-tea:drink:boba-milk-tea
 entity_id: milk-tea:drink:boba-milk-tea
 title: 波霸奶茶
 entity_type: drink
-aliases: [珍珠奶茶, 波霸]
+aliases: [珍珠奶茶, 波霸, 啵啵]
 tags: [奶茶, 经典]
 ---
 

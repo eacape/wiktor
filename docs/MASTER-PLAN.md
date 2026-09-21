@@ -511,7 +511,7 @@ wiktor/                          # Cargo workspace 单仓
 
 1. `wiktor-core` trait 定义 + 两平面 SQLite schema + qdrant 向量适配层
 2. 20 个手工种子 Wiki + JSONL 事实平面 + SQLite 内核（FTS5）+ qdrant 向量基线
-3. 最小查询闭环：索引 → QUG/fallback → 过滤下推 → CLI 展示
+3. 最小查询闭环：索引 → QUG/fallback → 过滤下推 → CLI 展示 ✅（Step 3 已交付，2026-09-21；含 petgraph QUG 图、QueryEngine 编排、RRF 融合、`--json`/`--no-vector` CLI；QUG 退出条件可执行——golden 三档 A 纯FTS 85% / B 混合 100% / C QUG 100%，B 相对 A +15pp，QUG 相对 B 无额外增益 → 按退出条件默认关闭）
 4. LLM 编译管线 + require_source_refs 契约 + 四规则质量评分 + 重编译刹车 + 全依赖内容哈希
 5. QUG 五类边构建 + golden-queries 评测（纯向量 vs 混合 vs QUG，含退出条件判定）
 6. 反馈分析器 + `POST /feedback`（认证 / 限流 / 幂等）

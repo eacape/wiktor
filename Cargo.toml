@@ -40,6 +40,14 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 thiserror = "1.0"
 anyhow = "1.0"
 
+# 图（QUG 查询理解图用 petgraph DiGraph；不手写邻接表）
+# Graph (petgraph DiGraph for the QUG query-understanding graph; no hand-rolled adjacency lists)
+petgraph = "0.6"
+
+# 日志（QueryEngine 统一写查询日志，日志写入失败用 tracing 报错）
+# Logging (QueryEngine writes query logs centrally; tracing reports log-write failures)
+tracing = "0.1"
+
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
 

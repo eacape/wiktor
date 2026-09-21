@@ -79,6 +79,10 @@ pub fn parse_page(content: &str) -> Result<WikiPage> {
             model_version: "seed-manual".into(),
             embedding_model: "none".into(),
         },
+        // aliases/tags 保留在页面上，供 QUG 边提取（Step 3 §3.2）
+        // aliases/tags stay on the page for QUG edge extraction (Step 3 §3.2)
+        aliases: frontmatter.aliases,
+        tags: frontmatter.tags,
     })
 }
 

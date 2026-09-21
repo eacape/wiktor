@@ -28,6 +28,14 @@ pub struct WikiPage {
     /// Sections (for section-level vector indexing).
     pub sections: Vec<Section>,
     pub metadata: PageMetadata,
+    /// 同义词别名（frontmatter `aliases`；Step 3 QUG 同义边的来源）。
+    /// Synonym aliases (frontmatter `aliases`; source of Step 3 QUG synonym edges).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// 分类标签（frontmatter `tags`；Step 3 QUG 上下位边的来源）。
+    /// Category tags (frontmatter `tags`; source of Step 3 QUG hyponym edges).
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

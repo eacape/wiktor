@@ -25,3 +25,9 @@ compile:
 
 query:
   filters: [price, sugar_level, size, ingredient_ids, category]
+
+qug:
+  enabled: true
+  max_depth: 2
+  candidate_multiplier: 5
+  intent_templates: intents.yaml

@@ -49,19 +49,22 @@ pub fn filter_where(filters: &Filters) -> Result<Option<(String, Vec<String>)>> 
     for cond in &filters.conditions {
         match cond {
             FilterCondition::NumericRange { field, min, max } => {
-                // SQL 片段形如 `(field_name = ? AND value_numeric >= ? ...)`，
-                // 参数必须按出现顺序入栈：field_name 在前，min/max 在后。
-                // SQL fragment looks like `(field_name = ? AND value_numeric >= ? ...)`;
-                // params must be pushed in occurrence order: field_name first,
-                // min/max after.
+                // 实体级 EXISTS：facts 是宽表（每字段一行），同一实体的不同字段
+                // 落在不同行，行级 AND 会让多条件组合恒空。每个条件独立
+                // EXISTS（外层表名约定为 `facts`），WHERE = EXISTS(c1) AND EXISTS(c2)。
+                // Entity-level EXISTS: facts is a wide table (one row per field), so
+                // different fields of the same entity live in different rows and a
+                // row-level AND would make multi-condition filters always empty.
+                // Each condition becomes its own EXISTS (outer table is `facts`).
                 if min.is_none() && max.is_none() {
                     continue;
                 }
                 clauses.push(format!(
-                    "(field_name = ? AND {})",
+                    "EXISTS (SELECT 1 FROM facts f WHERE f.entity_id = facts.entity_id \
+                     AND f.field_name = ? AND {})",
                     [
-                        min.map(|_| "value_numeric >= ?"),
-                        max.map(|_| "value_numeric <= ?")
+                        min.map(|_| "f.value_numeric >= ?"),
+                        max.map(|_| "f.value_numeric <= ?")
                     ]
                     .into_iter()
                     .flatten()
@@ -77,22 +80,40 @@ pub fn filter_where(filters: &Filters) -> Result<Option<(String, Vec<String>)>> 
                 }
             }
             FilterCondition::TextEquals { field, value } => {
-                clauses.push("(field_name = ? AND value_text = ?)".to_string());
+                clauses.push(
+                    "EXISTS (SELECT 1 FROM facts f WHERE f.entity_id = facts.entity_id \
+                     AND f.field_name = ? AND f.value_text = ?)"
+                        .to_string(),
+                );
                 params.push(field.clone());
                 params.push(value.clone());
             }
             FilterCondition::RefContains { field, refs } => {
+                // 空允许集合（resolve_conflicts 的空候选域标记）→ 恒假，不生成 IN () 语法错误
+                // Empty allowed set (the empty-scope marker from resolve_conflicts) → always false;
+                // avoids an `IN ()` syntax error
+                if refs.is_empty() {
+                    clauses.push("(1 = 0)".to_string());
+                    continue;
+                }
                 let marks = refs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 clauses.push(format!(
-                    "EXISTS (SELECT 1 FROM fact_refs r WHERE r.entity_id = facts.entity_id AND r.field_name = ? AND r.ref_value IN ({marks}))"
+                    "EXISTS (SELECT 1 FROM fact_refs r WHERE r.entity_id = facts.entity_id \
+                     AND r.field_name = ? AND r.ref_value IN ({marks}))"
                 ));
                 params.push(field.clone());
                 params.extend(refs.iter().cloned());
             }
             FilterCondition::RefExcludes { field, refs } => {
+                // 空排除集合 → 无约束，跳过
+                // Empty exclusion set → unconstrained, skip
+                if refs.is_empty() {
+                    continue;
+                }
                 let marks = refs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 clauses.push(format!(
-                    "NOT EXISTS (SELECT 1 FROM fact_refs r WHERE r.entity_id = facts.entity_id AND r.field_name = ? AND r.ref_value IN ({marks}))"
+                    "NOT EXISTS (SELECT 1 FROM fact_refs r WHERE r.entity_id = facts.entity_id \
+                     AND r.field_name = ? AND r.ref_value IN ({marks}))"
                 ));
                 params.push(field.clone());
                 params.extend(refs.iter().cloned());

@@ -1,10 +1,10 @@
-//! Command-line filter parsing.
 //! 命令行过滤条件解析。
+//! Command-line filter parsing.
 //!
-//! Translates a comma-separated `--filter` string into [`Filters`].
 //! 把逗号分隔的 `--filter` 字符串翻译成 [`Filters`]。
+//! Translates a comma-separated `--filter` string into [`Filters`].
 //!
-//! Supported operators / 支持的运算符：
+//! 支持的运算符 / Supported operators：
 //! ```text
 //! price<=20       NumericRange { max: 20 }
 //! price>=15       NumericRange { min: 15 }
@@ -101,6 +101,30 @@ fn parse_one(part: &str) -> Result<FilterCondition> {
         });
     }
     Err(anyhow!("cannot parse filter condition: {part:?}"))
+}
+
+/// Format a filter condition for CLI display (Step 3 §8).
+/// 把过滤条件格式化为 CLI 展示文本（Step 3 §8）。
+pub fn format_condition(cond: &FilterCondition) -> String {
+    match cond {
+        FilterCondition::NumericRange { field, min, max } => match (min, max) {
+            (Some(a), Some(b)) if a == b => format!("{field}={a}"),
+            (Some(a), Some(b)) => format!("{a}<={field}<={b}"),
+            (Some(a), None) => format!("{field}>={a}"),
+            (None, Some(b)) => format!("{field}<={b}"),
+            (None, None) => field.clone(),
+        },
+        FilterCondition::TextEquals { field, value } => format!("{field}={value}"),
+        FilterCondition::RefContains { field, refs } if refs.is_empty() => {
+            format!("{field} in=<empty scope>")
+        }
+        FilterCondition::RefContains { field, refs } => {
+            format!("{field} in={}", refs.clone().join("|"))
+        }
+        FilterCondition::RefExcludes { field, refs } => {
+            format!("{field} not_in={}", refs.clone().join("|"))
+        }
+    }
 }
 
 #[cfg(test)]
