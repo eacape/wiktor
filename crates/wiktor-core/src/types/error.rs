@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 /// Wiktor 统一错误类型。
+/// Unified Wiktor error type.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("invalid entity id: {0}")]

@@ -4,6 +4,7 @@ use crate::types::FieldDefinition;
 use serde::Deserialize;
 
 /// 领域包（YAML 配置 + Prompt 模板 + 页面模板三件套）。
+/// Domain pack (a trio: YAML config + Prompt templates + page templates).
 pub trait DomainPack: Send + Sync {
     fn name(&self) -> &str;
     fn version(&self) -> &str;
@@ -14,8 +15,10 @@ pub trait DomainPack: Send + Sync {
 }
 
 /// 领域包配置（从 domain.yaml 解析）。
+/// Domain-pack configuration (parsed from domain.yaml).
 ///
 /// YAML 形如：
+/// YAML shape:
 /// ```yaml
 /// name: milk-tea
 /// version: "0.1.0"
@@ -28,6 +31,11 @@ pub trait DomainPack: Send + Sync {
 /// ```
 /// 自定义 `Deserialize` 把嵌套的 `compile` / `query` 段拍平到本结构，
 /// 保持既有字段（quality_threshold / max_recompiles）不变，仅新增 query_filters。
+/// A custom `Deserialize` flattens the nested `compile` / `query` sections into this struct,
+/// preserving the existing fields (quality_threshold / max_recompiles) and adding query_filters.
+/// A custom `Deserialize` flattens the nested `compile` / `query` sections into this
+/// struct, keeping existing fields (quality_threshold / max_recompiles) unchanged and
+/// only adding query_filters.
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
     pub name: String,
@@ -36,6 +44,7 @@ pub struct DomainConfig {
     pub quality_threshold: f32,
     pub max_recompiles: usize,
     /// `query.filters` 过滤白名单（Step 2 仅解析提示，不强制消费）。
+    /// Whitelist of `query.filters` (Step 2 only parses this as a hint, does not enforce it).
     pub query_filters: Vec<String>,
 }
 
@@ -87,11 +96,13 @@ impl<'de> Deserialize<'de> for DomainConfig {
 }
 
 /// 实体配置。
+/// Entity configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct EntityConfig {
     pub name: String,
     /// 数据源 URI（jsonl:// 或 postgres://）。
+    /// Data source URI (jsonl:// or postgres://).
     pub source: String,
     pub id_field: String,
     pub type_field: String,

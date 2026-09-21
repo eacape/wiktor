@@ -1,8 +1,13 @@
 //! JSONL 文件数据源。
+//! JSONL file data source.
 //!
 //! 每条记录是 JSON 行，必须含 `entity_id`（完整实体 key）；可选含
 //! `source_revision`（缺省 1）；其余字段按 `EntitySchema.fields`
 //! 的 [`FieldType`](crate::types::FieldType) 转成事实平面载荷。
+//! Each record is one JSON line and must contain `entity_id` (a complete entity key);
+//! `source_revision` is optional (defaults to 1); all other fields are converted into
+//! fact-plane payloads according to [`FieldType`](crate::types::FieldType) in
+//! `EntitySchema.fields`.
 
 use crate::traits::EntityConfig;
 use crate::traits::{DataSource, EntitySchema};
@@ -13,9 +18,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 默认分页批量大小。
+/// Default pagination batch size.
 pub const DEFAULT_BATCH_SIZE: usize = 1000;
 
 /// JSONL 文件数据源（实现 [`DataSource`]）。
+/// JSONL file data source (implements [`DataSource`]).
 pub struct JsonlDataSource {
     path: PathBuf,
     schema: EntitySchema,
@@ -23,6 +30,7 @@ pub struct JsonlDataSource {
 
 impl JsonlDataSource {
     /// 从 `jsonl://` URI 构造；相对路径基于 `base_dir` 解析。
+    /// Constructs from a `jsonl://` URI; resolves relative paths against `base_dir`.
     pub fn from_config(cfg: &EntityConfig, base_dir: &Path) -> Result<Self> {
         let uri = cfg.source.strip_prefix("jsonl://").ok_or_else(|| {
             Error::InvalidConfig(format!(
@@ -45,19 +53,24 @@ impl JsonlDataSource {
     }
 
     /// 文件路径（测试/诊断用）。
+    /// File path (for tests and diagnostics).
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     /// 按 Schema 把一条原始实体转成事实平面载荷（`Facts`）。
+    /// Converts one raw entity into a fact-plane payload (`Facts`) according to the schema.
     ///
     /// 缺必填字段或类型不匹配 → `Error::Validation`（fail-fast，带 entity_id）。
+    /// Missing required fields or type mismatches return `Error::Validation`
+    /// (fail-fast, including the entity_id).
     pub fn raw_to_facts(&self, raw: &RawEntity) -> Result<Facts> {
         raw_to_facts(raw, &self.schema)
     }
 }
 
 /// 按 Schema 把 RawEntity 的 fields 按字段类型转成 `Facts` 载荷。
+/// Converts RawEntity fields into a `Facts` payload by their schema-declared types.
 pub fn raw_to_facts(raw: &RawEntity, schema: &EntitySchema) -> Result<Facts> {
     let mut fields: BTreeMap<String, FactValue> = BTreeMap::new();
     for fd in &schema.fields {
@@ -136,6 +149,7 @@ impl DataSource for JsonlDataSource {
         let mut out = Vec::new();
         let mut line_no = 0usize;
         // 只统计非空行作为行号；跳过 offset 个有效行
+        // Count only non-empty lines and skip `offset` valid records
         for line in text.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -149,6 +163,7 @@ impl DataSource for JsonlDataSource {
                 break;
             }
             // fail-fast 坏行
+            // Fail fast on malformed lines
             let record: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
                 Error::Validation(format!(
                     "{}:{} invalid json line: {e}",

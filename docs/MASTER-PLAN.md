@@ -33,42 +33,37 @@ Wiktor 的解法：**编译 → 评分 → 检索 → 反馈 → 再编译**的�
 
 ## 三、系统全景（最终形态）
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  客户端层                                                     │
-│  CLI  │  TUI（可选 feature：质量仪表盘 + 查询调试）            │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ gRPC / HTTP（SSE/WS 按需）
-┌──────────────────────────▼──────────────────────────────────┐
-│  API 层    tonic (gRPC) │ axum (HTTP) │ POST /feedback      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  QueryEngine（编排层；默认路径零 LLM）                        │
-│  QUG 图遍历 ──(失败→fallback)──→ 事实过滤下推【事实平面】     │
-│  → 混合检索（FTS5 BM25 + 向量）→ RRF 融合 → rerank（可选）    │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  内存层  QUG 图 │ 同义词哈希 │ 热点缓存（按实体 ID 失效）      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  存储层（SQLite 一体化；单事务原子发布；litestream 备份）      │
-│  【知识平面】Wiki Markdown + 质量评分 + 发布状态              │
-│  【事实平面】结构化元数据（ETL 直写，带 source_revision）      │
-│  【运行时】任务队列 │ 查询日志 │ FTS5 倒排 │ 向量索引          │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ 任务驱动
-┌──────────────────────────▼──────────────────────────────────┐
-│  编译层（异步 Worker，可水平扩展）                             │
-│  YAML 解析 → 全依赖内容哈希 → LLM 编译 → 质量评分 → 事务入库  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  反馈层（异步分析）                                            │
-│  查询日志 + feedback API → 盲区分析 → 补充编译任务（人工审核）  │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph client["客户端层 Client Layer"]
+        C1[CLI] --- C2[TUI 可选 feature：质量仪表盘 + 查询调试]
+    end
+    client -- "gRPC / HTTP（SSE/WS 按需）" --> api["API 层\n tonic (gRPC) | axum (HTTP) | POST /feedback"]
+
+    api --> qe["QueryEngine 编排层 默认路径零LLM\n orchestration, zero-LLM by default"]
+    qe --> qug{"QUG 图遍历 graph traversal"}
+    qug -- "失败 fallback" --> push["事实过滤下推【事实平面】\n fact-plane filter pushdown"]
+    qug --> push
+    push --> hybrid["混合检索 FTS5 BM25 + 向量\n hybrid search"]
+    hybrid --> rrf["RRF 融合 → rerank 可选"]
+    rrf --> result["结果 results"]
+
+    subgraph mem["内存层 in-memory"]
+        M1[QUG 图] --- M2[同义词哈希 synonym hash]
+        M2 --- M3[热点缓存 按实体ID失效 hot cache]
+    end
+    hybrid -.-> mem
+
+    mem -- "异步同步 async sync" --> storage["存储层 SQLite 一体化；单事务原子发布；litestream 备份\n SQLite-all-in-one, single-tx atomic publish, litestream backup"]
+    storage --> planes["知识平面 Wiki Markdown + 质量评分 + 发布状态\n 事实平面 结构化元数据 ETL 直写 带 source_revision\n 运行时 任务队列 | 查询日志 | FTS5 倒排 | 向量索引"]
+
+    storage -- "任务驱动 task-driven" --> compile["编译层 异步Worker 可水平扩展\n compilation, async worker, scalable"]
+    compile --> cpipe["YAML 解析 → 全依赖内容哈希 → LLM 编译 → 质量评分 → 事务入库\n parse → full-dep content hash → LLM compile → quality score → tx persist"]
+    cpipe --> planes
+
+    storage --> feedback["反馈层 异步分析\n feedback, async analysis"]
+    feedback --> fa["查询日志 + feedback API → 盲区分析 → 补充编译任务 人工审核\n query logs + feedback API → blind-spot analysis → supplemental compile (manual review)"]
+    fa --> compile
 ```
 
 ## 四、数据模型：两平面
@@ -127,10 +122,14 @@ Wiktor 的解法：**编译 → 评分 → 检索 → 反馈 → 再编译**的�
 
 ### 5.3 编译-检索双向反馈
 
-```
-编译 → 索引 → 检索 → 查询日志 → 盲区分析 → 补充编译
-  ↑                                              │
-  └──────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    A[编译 Compile] --> B[索引 Index]
+    B --> C[检索 Retrieve]
+    C --> D[查询日志 Query Log]
+    D --> E[盲区分析 Blind-spot Analysis]
+    E --> F[补充编译 Supplemental Compilation]
+    F --> A
 ```
 
 三个盲区信号：零召回查询 / 低质量召回（点击·采纳率低）/ 查询改写失败。

@@ -1,16 +1,25 @@
 //! 种子 Wiki 页面解析。
+//! Seed-wiki page parsing.
 //!
 //! Step 2 用手工 Markdown 页面模拟编译产物（不接 LLM）：frontmatter 交由
 //! `gray_matter` 解析（YAML → JSON Value → 反序列化为 [`SeedFrontmatter`]），
 //! 正文用 `pulldown-cmark` 的 offset 事件流按 `##` 二级标题切章，导语归入
 //! 首节（heading=`概述`）。不手写 frontmatter 边界 / 标题行匹配这类易错解析。
+//! Step 2 simulates compilation artifacts with hand-written Markdown pages (no LLM):
+//! frontmatter is parsed by `gray_matter` (YAML → JSON Value → deserialized into
+//! [`SeedFrontmatter`]); the body is split into sections by `##` H2 headings using
+//! pulldown-cmark's offset event stream, with the intro folded into the first section
+//! (heading=`概述`/Overview). We avoid error-prone hand-rolled parsing such as
+//! frontmatter-boundary or heading-line matching.
 //!
 //! 页面契约见 `docs/design/step2-seed-wiki-query-loop.md` §3。
+//! The page contract is in `docs/design/step2-seed-wiki-query-loop.md` §3.
 
 use crate::types::error::{Error, Result};
 use crate::types::{EntityId, PageMetadata, Section, WikiPage};
 
 /// seed-wiki 页面 frontmatter（YAML，解析自 `gray_matter` 的 JSON Value）。
+/// Seed-wiki page frontmatter (YAML, parsed from gray_matter's JSON Value).
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SeedFrontmatter {
@@ -25,10 +34,14 @@ pub struct SeedFrontmatter {
 }
 
 /// 解析一个 seed-wiki Markdown 文件内容 → `WikiPage`。
+/// Parses the contents of a seed-wiki Markdown file into a `WikiPage`.
 ///
 /// 文件格式：`---` YAML frontmatter + Markdown 正文（`## ` 二级标题分节）。
+/// File format: `---` YAML frontmatter + Markdown body (sections split by `## ` H2).
 pub fn parse_page(content: &str) -> Result<WikiPage> {
     // frontmatter 用 gray_matter 解析（YAML engine，不手写分隔符边界逻辑）
+    // frontmatter is parsed with gray_matter (YAML engine; no hand-rolled
+    // delimiter-boundary logic)
     let matter = gray_matter::Matter::<gray_matter::engine::YAML>::new();
     let result = matter.parse(content);
     let data = result.data.ok_or_else(|| {
@@ -39,6 +52,7 @@ pub fn parse_page(content: &str) -> Result<WikiPage> {
         .map_err(|e| Error::Validation(format!("invalid frontmatter: {e}")))?;
 
     // 校验 page_id / entity_id 为合法实体 key（domain:type:id）
+    // Validate that page_id / entity_id are valid entity keys (domain:type:id)
     let page_id = frontmatter.page_id.trim();
     if page_id.is_empty() {
         return Err(Error::Validation(
@@ -59,6 +73,7 @@ pub fn parse_page(content: &str) -> Result<WikiPage> {
         sections,
         metadata: PageMetadata {
             // domain_pack_version 由调用方（CLI 从 domain.yaml）填充
+            // domain_pack_version is filled by the caller (CLI reads it from domain.yaml)
             domain_pack_version: String::new(),
             compiled_at: unix_now(),
             model_version: "seed-manual".into(),
@@ -68,14 +83,20 @@ pub fn parse_page(content: &str) -> Result<WikiPage> {
 }
 
 /// 用 pulldown-cmark 的 offset 事件流按 H2 切分正文（§3.3/§3.4）。
+/// Splits the body into sections by H2 using pulldown-cmark's offset event stream (§3.3/§3.4).
 ///
 /// - `##` 二级标题开启新节，节 content 为「本标题行起，到下一标题行前」的原文；
 /// - `##` 之前的导语内容（非空）归为首节，heading = `概述`；
 /// - `###` 及更低级标题留原文，不细分。
+/// - Each `##` H2 heading starts a new section whose content spans from that heading
+///   line up to (but not including) the next heading line;
+/// - Non-empty intro text before the first `##` becomes the first section, heading = `概述`;
+/// - `###` and deeper headings stay inline in the source text, not split further.
 fn split_sections(body: &str) -> Vec<Section> {
     use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
     // 收集 H2 标题的 (起始偏移, 结束偏移, 标题文本)
+    // Collect H2 headings as (start offset, end offset, heading text)
     let mut headings: Vec<(usize, usize, String)> = Vec::new();
     let mut in_h2 = false;
     let mut h2_text = String::new();
@@ -102,6 +123,7 @@ fn split_sections(body: &str) -> Vec<Section> {
     let mut sections = Vec::new();
     if headings.is_empty() {
         // 无任何 H2：整段作导语
+        // No H2 at all: treat the whole body as the intro
         let intro = body.trim();
         if !intro.is_empty() {
             sections.push(Section {
@@ -113,6 +135,7 @@ fn split_sections(body: &str) -> Vec<Section> {
     }
 
     // 导语（首个 H2 之前的内容）归为首节
+    // The intro (content before the first H2) becomes the first section
     let intro = body[..headings[0].0].trim();
     if !intro.is_empty() {
         sections.push(Section {
@@ -179,6 +202,7 @@ tags: [奶茶, 经典]
         assert_eq!(page.metadata.model_version, "seed-manual");
 
         // 导语归首节（概述）+ 成分 + 口感与特征
+        // intro → first section (概述) + 成分 (ingredients) + 口感与特征 (texture & flavor)
         assert_eq!(page.sections.len(), 3);
         assert_eq!(page.sections[0].heading, "概述");
         assert!(page.sections[0].content.contains("波霸珍珠"));
@@ -191,8 +215,10 @@ tags: [奶茶, 经典]
     #[test]
     fn rejects_bad_frontmatter() {
         // 不含 frontmatter
+        // No frontmatter present
         assert!(parse_page("no frontmatter here").is_err());
         // 缺闭合（gray_matter 视为无 frontmatter → data 为空）
+        // Missing closing delimiter (gray_matter treats it as no frontmatter → data empty)
         assert!(parse_page("page_id: x\n").is_err());
     }
 

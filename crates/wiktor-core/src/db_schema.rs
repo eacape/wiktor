@@ -1,9 +1,14 @@
 //! diesel 表定义（`table!` 宏）。
+//! diesel table definitions (the `table!` macro).
 //!
 //! 与 `migrations/` 的 DDL 一一对应；FTS5 虚拟表 `pages_fts` 不在此列——
+//! Corresponds one-to-one with the DDL in `migrations/`; the FTS5 virtual table `pages_fts` is omitted.
 //! 它只被 raw SQL（`SqliteKernel::search`）使用，diesel 无法也不应该表达
+//! it is used only by raw SQL (`SqliteKernel::search`), which diesel cannot and should not express.
 //! FTS5 虚拟表。这里覆盖 ORM 层使用的实体表：pages / page_sections /
+//! FTS5 virtual tables. This covers ORM-layer entity tables: pages / page_sections /
 //! page_quality / facts / fact_refs。
+//! page_quality / facts / fact_refs.
 
 diesel::table! {
     pages (page_id) {

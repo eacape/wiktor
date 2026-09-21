@@ -80,10 +80,14 @@
 
 ### 创新三：编译-检索双向反馈
 
-```
-编译 → 索引 → 检索 → 查询日志 → 盲区分析 → 补充编译
-  ↑                                              │
-  └──────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    A[编译 Compile] --> B[索引 Index]
+    B --> C[检索 Retrieve]
+    C --> D[查询日志 Query Log]
+    D --> E[盲区分析 Blind-spot Analysis]
+    E --> F[补充编译 Supplemental Compilation]
+    F --> A
 ```
 
 三个盲区信号：零召回查询 / 低质量召回（点击·采纳率低）/ 查询改写失败。
@@ -94,42 +98,40 @@
 
 ## 五、架构总览（v3 修订：显式两平面 + fallback）
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  客户端层                                                     │
-│  CLI  │  TUI（质量仪表盘 + 查询调试） │  Web UI（阶段四）      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ gRPC / HTTP / WebSocket / SSE
-┌──────────────────────────▼──────────────────────────────────┐
-│  API 层    tonic (gRPC) │ axum (HTTP) │ POST /feedback      │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  QueryEngine（纯内存，同步，零 LLM）                          │
-│  QUG 图遍历 ──(失败→fallback)──→ 混合检索                    │
-│  → RRF 融合 → 结构化过滤【事实平面】 → 结果                   │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  索引层（内存常驻，原子 swap 替换，可重建）                    │
-│  向量索引 │ BM25 倒排 │ QUG 图 │ 同义词哈希 │ 关系图          │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ 异步同步
-┌──────────────────────────▼──────────────────────────────────┐
-│  存储层（Raft 复制，阶段三）                                   │
-│  【知识平面】Wiki Markdown + 质量评分 + 查询日志 + 任务队列    │
-│  【事实平面】结构化元数据（ETL 直写，不走 LLM）                │
-└──────────────────────────┬──────────────────────────────────┘
-                           │ 任务驱动
-┌──────────────────────────▼──────────────────────────────────┐
-│  编译层（异步 Worker，可水平扩展）                             │
-│  YAML 解析 → 内容哈希增量判断 → LLM 编译 → 质量评分 → 入库     │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-┌──────────────────────────▼──────────────────────────────────┐
-│  反馈层（异步分析）                                            │
-│  查询日志 + feedback API → 盲区分析 → 补充编译任务（人工审核）  │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph client["客户端层 Client Layer"]
+        C1[CLI] --- C2[TUI 质量仪表盘 Quality Dashboard]
+        C1 --- C3[Web UI 阶段四 Phase 4]
+    end
+    client -- "gRPC / HTTP / WebSocket / SSE" --> api["API 层\n tonic (gRPC) | axum (HTTP) | POST /feedback"]
+
+    api --> qe["QueryEngine 纯内存 同步 零LLM\n in-memory, synchronous, zero-LLM"]
+    qe --> qug{"QUG 图遍历\n graph traversal"}
+    qug -- "失败 fallback" --> hybrid["混合检索 hybrid search"]
+    qug --> hybrid
+    hybrid --> rrf["RRF 融合\n RRF fusion"]
+    rrf --> filt["结构化过滤 事实平面\n structured filter (fact plane)"]
+    filt --> result["结果 results"]
+
+    subgraph idx["索引层 内存常驻 原子swap 可重建\n in-memory, atomic swap, rebuildable"]
+        I1[向量索引 vector index] --- I2[BM25 倒排 inverted index]
+        I2 --- I3[QUG 图 graph]
+        I3 --- I4[同义词哈希 synonym hash]
+        I4 --- I5[关系图 relation graph]
+    end
+    hybrid -.-> idx
+
+    idx -- "异步同步 async sync" --> storage["存储层 存储层 阶段三 Raft\n storage (Raft, Phase 3)"]
+    storage --> sp["知识平面 事实平面\n knowledge plane: Wiki Markdown + 质量评分 + 查询日志 + 任务队列\n fact plane: 结构化元数据 ETL 直写 不走LLM"]
+
+    storage -- "任务驱动 task-driven" --> compile["编译层 异步Worker 可水平扩展\n compilation (async worker, scalable)"]
+    compile --> pipe["YAML 解析 → 内容哈希增量判断 → LLM 编译 → 质量评分 → 入库\n parse → content-hash increment → LLM compile → quality score → persist"]
+    pipe --> sp
+
+    storage --> feedback["反馈层 异步分析\n feedback (async analysis)"]
+    feedback --> fa["查询日志 + feedback API → 盲区分析 → 补充编译任务 人工审核\n query logs + feedback API → blind-spot analysis → supplemental compile (manual review)"]
+    fa --> compile
 ```
 
 ## 六、领域包配置

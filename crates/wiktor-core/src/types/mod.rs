@@ -1,9 +1,18 @@
 //! 领域类型模块。
+//! Domain types module.
 //!
 //! 承载两平面模型与查询/反馈路径所需的公共数据类型，无外部依赖：
 //! 实体（`entity`）、页面（`page`）、查询（`query`）、QUG（`qug`）与
 //! 错误（`error`）。模块内同时聚合部分与事实平面过滤下推相关的载荷
 //! 类型（`FactValue` / `Facts` / `Filters` / `FilterCondition`）。
+//! Holds the shared, dependency-free data types for the two-plane model and query/feedback paths:
+//! entities (`entity`), pages (`page`), queries (`query`), QUG (`qug`) and errors (`error`).
+//! It also aggregates fact-plane filter-pushdown payload types (`FactValue` / `Facts` /
+//! `Filters` / `FilterCondition`).
+//! Holds the shared data types for the two-plane model and the query/feedback paths,
+//! with no external dependencies: entity (`entity`), page (`page`), query (`query`),
+//! QUG (`qug`) and error (`error`). It also aggregates payload types related to
+//! fact-plane filter pushdown (`FactValue` / `Facts` / `Filters` / `FilterCondition`).
 
 mod entity;
 pub mod error;
@@ -20,6 +29,7 @@ pub use query::{Cursor, Query, QueryLog, RewrittenQuery, SearchHit};
 pub use qug::{QugEdge, QugPath};
 
 /// 反馈层建议的补充编译任务（进人工审核队列）。
+/// Supplementary compile task suggested by the feedback layer (goes to the human review queue).
 #[derive(Debug, Clone)]
 pub struct CompileTask {
     pub entity_id: EntityId,
@@ -31,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// 事实平面中某个 field 的值（filterable 字段）。
+/// Value of a field in the fact plane (filterable fields).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum FactValue {
@@ -42,6 +53,7 @@ pub enum FactValue {
 }
 
 /// 实体事实（事实平面写入载荷）。
+/// Entity facts (fact-plane write payload).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Facts {
     pub entity_id: EntityId,
@@ -50,6 +62,7 @@ pub struct Facts {
 }
 
 /// 过滤条件（事实平面下推 + 向量候选域共用）。
+/// Filter conditions (shared by fact-plane pushdown and the vector candidate scope).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Filters {
     pub conditions: Vec<FilterCondition>,
@@ -68,6 +81,7 @@ impl Filters {
 }
 
 /// 单条过滤条件。
+/// A single filter condition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FilterCondition {
     NumericRange {
@@ -90,6 +104,7 @@ pub enum FilterCondition {
 }
 
 /// 源数据字段定义（DataSource::schema 返回）。
+/// Source-data field definition (returned by DataSource::schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDefinition {
     pub name: String,
@@ -104,6 +119,8 @@ pub enum FieldType {
     Text,
     Boolean,
     /// 事实表 CHECK 约束用 'reflist'，故 serde 显式 rename（rename_all 会产出 ref_list）。
+    /// The facts table CHECK constraint uses 'reflist', so serde renames it explicitly
+    /// (rename_all would yield `ref_list`).
     #[serde(rename = "reflist")]
     RefList,
     Timestamp,

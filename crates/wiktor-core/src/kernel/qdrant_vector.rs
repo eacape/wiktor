@@ -12,13 +12,20 @@ use qdrant_client::qdrant::{
 use qdrant_client::Qdrant;
 
 /// Qdrant 向量后端（v3.2 起为 Wiktor 默认向量服务）。
+/// Qdrant vector backend (the default Wiktor vector service since v3.2).
 ///
 /// 设计要点：
+/// Design points:
 /// - 集合命名由调用方（QueryEngine）负责，形如 `{prefix}_{domain}_{version}_gen{generation}`；
+/// - Collection naming is the caller's (QueryEngine) responsibility, shaped `{prefix}_{domain}_{version}_gen{generation}`;
 /// - point id 必须是合法 UUID，由 `point_id()` 从 BLAKE3 确定性派生，同一
+/// - point ids must be valid UUIDs, deterministically derived from BLAKE3 by `point_id()`, so the same
 ///   (entity, chunk_type, generation) 幂等覆盖；
+///   (entity, chunk_type, generation) is idempotently overwritten;
 /// - 候选 ID 过滤按 **payload.entity_id** 做关键词匹配（不能用 `Condition::has_id`，
+/// - candidate-ID filtering uses keyword matching on **payload.entity_id** (not `Condition::has_id`,
 ///   那是按 point id 过滤，候选是实体 ID）。
+///   which filters by point id; candidates are entity IDs).
 pub struct QdrantVectorStore {
     client: Qdrant,
     default_dimension: usize,
@@ -26,6 +33,7 @@ pub struct QdrantVectorStore {
 
 impl QdrantVectorStore {
     /// 连接 qdrant（URL 默认指向 gRPC 端口，如 `http://127.0.0.1:6334`）。
+    /// Connects to qdrant (the URL defaults to the gRPC port, e.g. `http://127.0.0.1:6334`).
     pub fn from_config(url: &str, api_key: Option<&str>, dimension: usize) -> Result<Self> {
         let mut cfg = qdrant_client::config::QdrantConfig::from_url(url);
         if let Some(key) = api_key {
@@ -41,11 +49,13 @@ impl QdrantVectorStore {
     }
 
     /// 便捷构造（无 API key）。
+    /// Convenience constructor (no API key).
     pub fn connect(url: &str, dimension: usize) -> Result<Self> {
         Self::from_config(url, None, dimension)
     }
 
     /// 确定性 point id：BLAKE3 前 16 字节 → UUID。
+    /// Deterministic point id: first 16 bytes of BLAKE3 → UUID.
     pub fn point_id(entity_id: &EntityId, chunk_type: &str, generation: u64) -> String {
         let digest = blake3::hash(
             format!("{}|{}|{}", entity_id.to_key(), chunk_type, generation).as_bytes(),
@@ -67,6 +77,7 @@ impl QdrantVectorStore {
     }
 
     /// 集合命名（MVP：调用方也可自行命名，此为主推约定）。
+    /// Collection naming (MVP: callers may name it themselves; this is the recommended convention).
     pub fn collection_name(prefix: &str, domain: &str, version: &str, generation: u64) -> String {
         let v = version.replace('.', "_");
         format!("{prefix}_{domain}_{v}_gen{generation}")
@@ -139,6 +150,7 @@ impl VectorStore for QdrantVectorStore {
         if let Some(ids) = candidate_ids {
             let keys: Vec<String> = ids.iter().map(|e| e.to_key()).collect();
             // payload.entity_id ∈ keys（Keywords 匹配，qdrant 会建 OR 组）
+            // payload.entity_id ∈ keys (Keywords match; qdrant builds an OR group)
             let cond = Condition::matches("entity_id", keys);
             builder = builder.filter(Filter::must([cond]));
         }
@@ -199,6 +211,7 @@ impl VectorStore for QdrantVectorStore {
 }
 
 /// VectorMetadata → qdrant payload（字符串/整数 value；关键词可被 Condition::matches 命中）。
+/// VectorMetadata → qdrant payload (string/integer values; keywords matchable by Condition::matches).
 fn metadata_to_payload(meta: &VectorMetadata) -> std::collections::HashMap<String, Value> {
     let mut map = std::collections::HashMap::new();
     map.insert(
@@ -237,6 +250,7 @@ fn metadata_to_payload(meta: &VectorMetadata) -> std::collections::HashMap<Strin
 }
 
 /// qdrant payload → VectorMetadata（缺失字段给默认值，避免解析失败）。
+/// qdrant payload → VectorMetadata (missing fields get defaults to avoid parse failures).
 fn payload_to_metadata(payload: &std::collections::HashMap<String, Value>) -> VectorMetadata {
     fn str_of(v: Option<&Value>) -> String {
         match v.and_then(|v| v.kind.as_ref()) {
@@ -263,6 +277,7 @@ fn payload_to_metadata(payload: &std::collections::HashMap<String, Value>) -> Ve
 }
 
 // 保留 default_dimension 供后续默认集合创建使用。
+// Keep default_dimension for later default-collection creation.
 #[allow(dead_code)]
 impl QdrantVectorStore {
     fn default_dimension(&self) -> usize {

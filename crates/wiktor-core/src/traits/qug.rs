@@ -3,14 +3,17 @@ use crate::types::{CompiledPage, Query, QugEdge, QugPath, RewrittenQuery};
 use async_trait::async_trait;
 
 /// 查询理解图（编译时构建、查询时只读遍历）。
+/// Query Understanding Graph (built at compile time, traversed read-only at query time).
 #[async_trait]
 pub trait QueryUnderstandingGraph: Send + Sync {
     /// 查询改写；返回 None = QUG 无法处理，调用方必须 fallback 到混合检索。
+    /// Query rewrite; `None` means QUG cannot handle it and the caller must fall back to hybrid search.
     async fn rewrite(&self, query: &Query) -> Result<Option<RewrittenQuery>>;
     fn traverse(&self, node: &str, max_depth: usize) -> Vec<QugPath>;
 }
 
 /// QUG 构建器（从编译产物与领域包配置构建图）。
+/// QUG builder (builds the graph from compilation artifacts and domain-pack configuration).
 #[async_trait]
 pub trait QugBuilder: Send + Sync {
     async fn extract_edges(&self, pages: &[CompiledPage]) -> Result<Vec<QugEdge>>;

@@ -1,11 +1,18 @@
 //! Step1 独立测试审查补充（测试工程师 review，2026-09-20）。
+//! Step1 supplemental review tests (test-engineer review, 2026-09-20).
 //!
 //! 覆盖任务点：
+//! Covered task points:
 //! 1. EntityId::from_key 非法输入（少于 3 段 / 空段 / 含冒号）。
+//!    Invalid inputs (fewer than 3 parts / empty parts / embedded colon).
 //! 2. MockVectorStore：缺失 collection 搜索报错；upsert 后 ensure_collection 幂等不丢点；
+//!    MockVectorStore: missing-collection search errors; ensure_collection after upsert is idempotent and preserves points;
 //!    余弦得分数值正确性；delete 对不存在的 collection 的语义。
+//!    cosine-score correctness; and delete semantics for a missing collection.
 //! 3. facts CAS 并发：多线程同实体不同 source_revision，最终只保留最大 revision 生效。
+//!    facts CAS concurrency: multiple threads write different source revisions for one entity; only the maximum wins.
 //! 4. 回归用例（2026-09-20 修复后转正）：
+//!    Regression cases (promoted after the 2026-09-20 fix):
 //!    - `numeric_range_filter_finds_expected_entity`：NumericRange 参数顺序曾错误
 //!      （field_name 的 ? 排在 min/max 之前，但参数按 [min, max, field] 入栈），
 //!      任何 NumericRange 过滤都查不到结果；修复后必须命中。
@@ -21,6 +28,7 @@ use wiktor_core::traits::{
 use wiktor_core::types::{EntityId, Error, FactValue, Facts, FilterCondition, Filters};
 use wiktor_core::{MockVectorStore, SqliteKernel};
 
+// ---------------------------------------------------------------- EntityId
 // ---------------------------------------------------------------- EntityId
 
 fn meta(entity: &str) -> VectorMetadata {
@@ -56,6 +64,7 @@ fn facts_with(
 #[test]
 fn entity_id_from_key_rejects_fewer_than_three_segments() {
     // 少于 3 段："a:b" / "a" / 空串
+    // Fewer than 3 parts: "a:b" / "a" / empty string
     for bad in ["a:b", "a", ""] {
         let err = EntityId::from_key(bad).expect_err(&format!("{bad:?} should be rejected"));
         assert!(
@@ -68,6 +77,7 @@ fn entity_id_from_key_rejects_fewer_than_three_segments() {
 #[test]
 fn entity_id_from_key_rejects_empty_segments() {
     // 空段：中间空 / id 空 / 全空段
+    // Empty parts: empty middle component / empty id / all parts empty
     for bad in ["a::b", "a:b:", "::", "::c", "a::"] {
         let err = EntityId::from_key(bad).expect_err(&format!("{bad:?} should be rejected"));
         assert!(
@@ -80,6 +90,7 @@ fn entity_id_from_key_rejects_empty_segments() {
 #[test]
 fn entity_id_from_key_rejects_colon_inside_component() {
     // splitn(3) 会把 "a:b:c:d" 拆成 ["a","b","c:d"]，id 含冒号必须报错
+    // splitn(3) makes ["a", "b", "c:d"]; an id containing a colon must error
     for bad in ["a:b:c:d", "a:b:c:d:e", "a:b:x:y"] {
         let err = EntityId::from_key(bad).expect_err(&format!("{bad:?} should be rejected"));
         assert!(
@@ -92,10 +103,12 @@ fn entity_id_from_key_rejects_colon_inside_component() {
 #[test]
 fn entity_id_from_key_roundtrip_with_unicode_id() {
     // 合法 id 含 unicode（不为空、不含冒号）应无损往返
+    // A valid Unicode id (non-empty, no colon) must round-trip losslessly
     let id = EntityId::new("电商", "商品", "sku_珍珠_001").unwrap();
     assert_eq!(EntityId::from_key(&id.to_key()).unwrap(), id);
 }
 
+// ---------------------------------------------------------------- MockVectorStore
 // ---------------------------------------------------------------- MockVectorStore
 
 #[tokio::test]
@@ -111,6 +124,7 @@ async fn mock_search_missing_collection_errors() {
 #[tokio::test]
 async fn mock_search_created_but_empty_collection_returns_empty() {
     // ensure_collection 后（空 collection）搜索：不应报错，应返回空
+    // Searching after ensure_collection (empty collection) should not error and should return empty
     let store = MockVectorStore::new();
     store
         .ensure_collection("c", 2, DistanceMetric::Cosine)
@@ -123,6 +137,7 @@ async fn mock_search_created_but_empty_collection_returns_empty() {
 #[tokio::test]
 async fn mock_upsert_then_ensure_collection_is_idempotent_and_keeps_points() {
     // upsert（mock 自动建 collection）后再 ensure_collection 不应清空数据
+    // ensure_collection after upsert (mock auto-creates the collection) must not clear data
     let store = MockVectorStore::new();
     store
         .upsert(
@@ -136,6 +151,7 @@ async fn mock_upsert_then_ensure_collection_is_idempotent_and_keeps_points() {
         .await
         .unwrap();
     // 幂等：重复调用不报错
+    // Idempotent: repeated calls do not error
     for _ in 0..3 {
         store
             .ensure_collection("c", 2, DistanceMetric::Cosine)
@@ -154,6 +170,7 @@ async fn mock_upsert_then_ensure_collection_is_idempotent_and_keeps_points() {
 #[tokio::test]
 async fn mock_cosine_scores_are_numerically_correct() {
     // 正交向量得分 0，同向得分 1；验证分数本身而非仅排序
+    // Orthogonal vectors score 0 and aligned vectors score 1; verify scores, not only ordering
     let store = MockVectorStore::new();
     store
         .ensure_collection("c", 3, DistanceMetric::Cosine)
@@ -196,6 +213,7 @@ async fn mock_cosine_scores_are_numerically_correct() {
 #[tokio::test]
 async fn mock_search_candidate_ids_filters_by_entity_key_not_point_id() {
     // 候选过滤按 payload.entity_id（to_key）匹配；point id 故意与 entity 不同
+    // Candidate filtering matches payload.entity_id (to_key); point id is intentionally different from the entity
     let store = MockVectorStore::new();
     let key = "dom:prod:target";
     store
@@ -204,6 +222,7 @@ async fn mock_search_candidate_ids_filters_by_entity_key_not_point_id() {
             &[
                 VectorPoint {
                     id: "uuid-1".into(), // point id 与 entity key 无关
+                    // Point id is unrelated to the entity key
                     vector: vec![1.0, 0.0],
                     metadata: meta(key),
                 },
@@ -228,16 +247,20 @@ async fn mock_search_candidate_ids_filters_by_entity_key_not_point_id() {
 #[tokio::test]
 async fn mock_delete_on_missing_collection_is_silent_noop() {
     // 记录当前语义（与 qdrant 的 delete 行为差异见报告）：mock 对不存在 collection 静默成功
+    // Record current semantics (see the report for the qdrant delete difference): mock silently succeeds for a missing collection
     let store = MockVectorStore::new();
     store.delete("never_created", &["p1".into()]).await.unwrap();
 }
 
 // ---------------------------------------------------------------- facts CAS 并发（期望通过）
+// ---------------------------------------------------------------- facts CAS concurrency (expected to pass)
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_upsert_facts_only_max_revision_wins_scalar() {
     // 8 个线程写同一实体、互不相同的 source_revision(1..=8)，随机延迟打乱顺序；
+    // Eight threads write one entity with distinct source revisions (1..=8), with random delays scrambling arrival order;
     // CAS 保证最终每个字段都是最大 revision(8) 的值。
+    // CAS guarantees every field ends with the value from the maximum revision (8).
     let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
     let id = EntityId::new("ecommerce", "product", "concurrent").unwrap();
 
@@ -247,6 +270,7 @@ async fn concurrent_upsert_facts_only_max_revision_wins_scalar() {
         let id = id.clone();
         handles.push(tokio::spawn(async move {
             // 随机小延迟打乱到达顺序
+            // Small random delays scramble arrival order
             let delay_ms = (i * 7919 % 23) * 3;
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             let facts = facts_with(
@@ -272,13 +296,18 @@ async fn concurrent_upsert_facts_only_max_revision_wins_scalar() {
 }
 
 // ---------------------------------------------------------------- 回归用例（原 bug 复现，已修复）
+// ---------------------------------------------------------------- Regression cases (original bug reproduced and fixed)
 
 #[tokio::test]
 async fn numeric_range_filter_finds_expected_entity() {
     // 预期行为：price ∈ [10, 20] 应命中 price=15 的实体。
+    // Expected: price ∈ [10, 20] should match the entity with price=15.
     // 现状 bug：translate_filters 的 NumericRange 把参数按 [min, max, field_name]
+    // Former bug: translate_filters pushed NumericRange parameters as [min, max, field_name]
     // 入栈，而 SQL 中 ? 顺序是 (field_name = ? AND value_numeric >= ? AND ...)，
+    // while SQL placeholder order is (field_name = ? AND value_numeric >= ? AND ...),
     // 导致 field_name 被绑定成 min 值（REAL），永远查不到 → 结果为空。
+    // causing field_name to bind to min (REAL), so nothing could match → empty result.
     let kernel = SqliteKernel::open_in_memory().unwrap();
     let id = EntityId::new("ecommerce", "product", "a").unwrap();
     kernel
@@ -317,9 +346,13 @@ async fn numeric_range_filter_finds_expected_entity() {
 #[tokio::test]
 async fn reflist_write_respects_cas() {
     // 预期行为：revision=1 的 reflist 写回后不得覆盖 revision=2 已生效的 reflist。
+    // Expected: writing the revision=1 reflist must not overwrite the active revision=2 reflist.
     // 现状 bug：upsert_facts 中 fact_refs 的 DELETE+INSERT 不经过 CAS，
+    // Former bug: fact_refs DELETE+INSERT in upsert_facts bypassed CAS,
     // 旧版本会把新版本的引用列表覆盖，而 facts 行本身（source_revision）保持为 2，
+    // so an old revision overwrote the new revision's reference list while the facts row itself (source_revision) remained 2,
     // 造成 get_facts 读到 revision=2 但 refs 却是 revision=1 的内容。
+    // leaving get_facts with revision=2 but references from revision=1.
     let kernel = SqliteKernel::open_in_memory().unwrap();
     let id = EntityId::new("ecommerce", "product", "r1").unwrap();
 

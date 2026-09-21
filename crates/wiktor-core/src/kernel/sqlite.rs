@@ -19,15 +19,21 @@ use std::path::Path;
 use std::sync::Mutex;
 
 /// SQLite 内核：两平面 + FTS5 + 任务队列 + 查询日志，单连接（MVP 单写者）。
+/// SQLite kernel: two-plane storage + FTS5 + task queue + query log, single
+/// connection (MVP single-writer model).
 ///
 /// 存储层使用 diesel（SQLite bundled）：pages/facts 等 CRUD 走 ORM 的类型安全
 /// DSL；FTS5 trigram MATCH、bm25、过滤下推这类核心检索 SQL 走 `diesel::sql_query`
 /// raw SQL 逃生（见 `kernel/sqlite.rs::search`）。
+/// The storage layer uses diesel (SQLite bundled): type-safe CRUD via the ORM DSL
+/// for pages/facts; core retrieval SQL (FTS5 trigram MATCH, bm25, filter pushdown)
+/// goes through the `diesel::sql_query` raw-SQL escape hatch (see `kernel/sqlite.rs::search`).
 pub struct SqliteKernel {
     conn: Mutex<SqliteConnection>,
 }
 
 /// search 返回行（`QueryableByName` 供 `diesel::sql_query` 映射）。
+/// Row returned by `search`, mapped via `QueryableByName` for `diesel::sql_query`.
 #[derive(QueryableByName)]
 struct SearchRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -41,6 +47,7 @@ struct SearchRow {
 }
 
 /// 单列文本行（filter 全量 / 过滤下推用）。
+/// Single text-column row (used for full filter scans and filter pushdown).
 #[derive(QueryableByName)]
 struct TextRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -48,6 +55,7 @@ struct TextRow {
 }
 
 /// COUNT(*) 行（row_counts / schema 版本用）。
+/// COUNT(*) row (used by `row_counts` / schema versioning).
 #[derive(QueryableByName)]
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
@@ -56,6 +64,7 @@ struct CountRow {
 
 impl SqliteKernel {
     /// 打开（不存在则创建）并应用迁移。
+    /// Opens the database (creating it if missing) and applies migrations.
     pub fn open(path: &Path) -> Result<Self> {
         let path_str = path.to_str().ok_or_else(|| {
             Error::InvalidConfig(format!("db path is not valid UTF-8: {}", path.display()))
@@ -76,12 +85,14 @@ impl SqliteKernel {
     }
 
     /// 当前 schema 版本（已应用迁移数）。
+    /// Current schema version (number of applied migrations).
     pub fn schema_version(&self) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         schema::schema_version(&mut conn)
     }
 
     /// 各核心表的行数。
+    /// Row counts for each core table.
     pub fn row_counts(&self) -> Result<BTreeMap<String, i64>> {
         let mut conn = self.conn.lock().unwrap();
         let tables = [
@@ -104,6 +115,7 @@ impl SqliteKernel {
     }
 
     /// 直接执行（供 CLI/工具使用）。
+    /// Executes SQL directly (for CLI / tooling use).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         diesel::connection::SimpleConnection::batch_execute(&mut *conn, sql)?;
@@ -111,9 +123,14 @@ impl SqliteKernel {
     }
 
     /// 写入/覆盖一页知识平面（seed 场景：手工编译产物，评分默认满分，幂等）。
+    /// Writes/overwrites one knowledge-plane page (seed scenario: hand-compiled
+    /// artifacts, default perfect quality score, idempotent).
     ///
     /// 重复导入同一 page_id：diesel `on_conflict(page_id).do_update()` 覆盖页面，
     /// 章节先删后插，不产生重复行；FTS 由触发器同步。
+    /// Re-importing the same page_id: diesel `on_conflict(page_id).do_update()`
+    /// overwrites the page, sections are delete-then-insert, so no duplicate rows;
+    /// FTS is kept in sync by triggers.
     pub fn seed_pages(&self, page: &WikiPage, domain: &str, status: PublishStatus) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let now = unix_now();
@@ -130,6 +147,7 @@ impl SqliteKernel {
 
         conn.transaction(|tx| -> Result<()> {
             // 页面 upsert（等价 INSERT OR REPLACE）
+            // Page upsert (equivalent to INSERT OR REPLACE)
             diesel::insert_into(pages_t::table)
                 .values((
                     pages_t::page_id.eq(&page.page_id),
@@ -168,6 +186,7 @@ impl SqliteKernel {
                 .execute(tx)?;
 
             // 章节重写（先删后插，幂等）
+            // Section rewrite (delete-then-insert, idempotent)
             diesel::delete(
                 page_sections_t::table.filter(page_sections_t::page_id.eq(&page.page_id)),
             )
@@ -185,6 +204,8 @@ impl SqliteKernel {
             }
 
             // 手工 seed 页面默认质量满分（四规则维度 1.0，一致性留空）
+            // Hand-seeded pages default to a perfect quality score (1.0 on the four
+            // rule dimensions; consistency left empty)
             diesel::insert_into(page_quality_t::table)
                 .values((
                     page_quality_t::page_id.eq(&page.page_id),
@@ -213,9 +234,15 @@ impl SqliteKernel {
 
     /// 最小查询闭环：FTS5（长查询 MATCH / 短查询 LIKE）检索知识平面，
     /// 可选事实平面过滤下推（category 关联锚点），写查询日志。
+    /// Minimal query loop: FTS5 (MATCH for long queries / LIKE for short ones)
+    /// over the knowledge plane, optional fact-plane filter pushdown (category
+    /// anchor join), and a query-log write.
     ///
     /// 过滤下推语义：FTS 命中页 → 事实平面过滤出满足条件的 SKU → 取其
     /// `category` 值集合（= 知识页 entity_id）→ `pages.entity_id IN (...)`。
+    /// Filter-pushdown semantics: FTS hit pages → filter SKUs in the fact plane
+    /// → collect their `category` values (= knowledge-page entity_id) →
+    /// `pages.entity_id IN (...)`.
     pub fn search(
         &self,
         text: &str,
@@ -228,12 +255,15 @@ impl SqliteKernel {
         let top_k = top_k.max(1);
 
         // 长查询（≥3 字符）走 FTS5 trigram MATCH；短查询（<3 字符，如"珍珠"）走 LIKE 兜底。
+        // Long queries (≥3 chars) use FTS5 trigram MATCH; short queries (<3 chars,
+        // e.g. "珍珠") fall back to LIKE.
         let is_long = text.chars().count() >= 3;
 
         let mut sql = String::new();
 
         if is_long {
             // FTS5 短语查询：双引号包裹，内部双引号加倍转义
+            // FTS5 phrase query: wrapped in double quotes, inner quotes escaped by doubling
             let match_expr = sq(&format!("\"{}\"", text.replace('"', "\"\"")));
             sql.push_str(&format!(
                 "SELECT p.page_id, p.entity_id, p.title, -bm25(pages_fts) AS score
@@ -255,6 +285,7 @@ impl SqliteKernel {
         }
 
         // 事实平面过滤下推：SKU 满足条件 → category 值集合 → 页 IN
+        // Fact-plane filter pushdown: SKUs matching conditions → category value set → page IN
         if let Some((fragment, fparams)) = facts::filter_where(filters)? {
             let fragment = inline_params(&fragment, &fparams);
             sql.push_str(&format!(
@@ -269,6 +300,7 @@ impl SqliteKernel {
         }
 
         // top_k 来自本进程整数（CLI 解析 usize），内联安全
+        // top_k originates from an in-process integer (CLI parses usize), safe to inline
         sql.push_str(if is_long {
             " ORDER BY score DESC"
         } else {
@@ -284,6 +316,7 @@ impl SqliteKernel {
         })?;
 
         // 执行；失败也写日志（hit_count=0）再返回错误
+        // Execute; on failure, still write the log (hit_count=0) before returning the error
         let run = diesel::sql_query(&sql)
             .load::<SearchRow>(&mut *conn)
             .map_err(Error::Database);
@@ -337,11 +370,15 @@ fn establish(url: &str) -> Result<SqliteConnection> {
 }
 
 /// SQL 字符串字面量（单引号转义防注入）。用于 raw SQL 逃生路径的参数内联。
+/// SQL string literal (single quotes escaped to prevent injection). Used to inline
+/// parameters on the raw-SQL escape path.
 fn sq(v: &str) -> String {
     format!("'{}'", v.replace('\'', "''"))
 }
 
 /// 把 `fragment` 中按序出现的 `?` 占位符替换为内联字符串字面量。
+/// Replaces the `?` placeholders appearing in `fragment`, in order, with inline
+/// string literals.
 fn inline_params(fragment: &str, params: &[String]) -> String {
     let mut out = String::with_capacity(fragment.len() + params.len() * 8);
     let mut iter = params.iter();
@@ -385,6 +422,13 @@ impl EntityStore for SqliteKernel {
                 // 注：CAS 是核心语义（excluded.source_revision > facts.source_revision），
                 // 走 raw SQL 逃生（diesel on_conflict do_update 的 WHERE 表达力不足）。
                 // 本 SQL 是 CAS 唯一真相（原 schema::facts::SQL_UPSERT_FACT 参考常量已删）。
+                // CAS-effect check: only when this revision truly overwrites/inserts a
+                // facts row (affected rows == 1) may we rewrite the derived fact_refs rows —
+                // otherwise an older revision would bypass CAS and pollute the reflist.
+                // Note: CAS is the core semantics (excluded.source_revision > facts.source_revision)
+                // and uses the raw-SQL escape hatch (diesel's on_conflict do_update WHERE
+                // is not expressive enough). This SQL is the single source of truth for
+                // CAS (the former schema::facts::SQL_UPSERT_FACT reference constant was removed).
                 let applied = diesel::sql_query(
                     "INSERT INTO facts (entity_id, field_name, field_type, value_numeric, value_text, value_boolean, value_timestamp, source_revision, updated_at)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
@@ -411,6 +455,8 @@ impl EntityStore for SqliteKernel {
                     == 1;
 
                 // reflist 拆行到 fact_refs（同一事务，先删后插；仅 CAS 生效时执行）
+                // Split reflist into fact_refs rows (same transaction, delete-then-insert;
+                // only runs when CAS applied)
                 if applied {
                     if let FactValue::RefList(refs) = value {
                         diesel::delete(
@@ -440,6 +486,7 @@ impl EntityStore for SqliteKernel {
         let mut conn = self.conn.lock().unwrap();
         if filters.is_empty() {
             // 空条件：返回全量（上限保护）
+            // Empty condition: return everything (with an upper-bound guard)
             let rows: Vec<TextRow> =
                 diesel::sql_query("SELECT DISTINCT entity_id AS value FROM facts LIMIT 10000")
                     .load(&mut *conn)?;
@@ -511,6 +558,7 @@ impl EntityStore for SqliteKernel {
                 "timestamp" => FactValue::Timestamp(timestamp.unwrap_or(0)),
                 "reflist" => {
                     // reflist 值从 fact_refs 读
+                    // reflist values are read back from fact_refs
                     let refs: Vec<String> = fact_refs_t::table
                         .filter(fact_refs_t::entity_id.eq(&key))
                         .filter(fact_refs_t::field_name.eq(&name))
@@ -571,8 +619,10 @@ mod tests {
         f2.fields.insert("price".into(), FactValue::Numeric(20.0));
 
         // 写入 rev=2
+        // Write revision 2
         kernel.upsert_facts(&id, &f2, 2).await.unwrap();
         // 旧 rev=1 不得覆盖
+        // The old revision 1 must not overwrite it
         kernel.upsert_facts(&id, &f1, 1).await.unwrap();
 
         let got = kernel.get_facts(&id).await.unwrap().unwrap();
@@ -644,6 +694,7 @@ mod tests {
             .unwrap();
 
         // 长查询（≥3 字符）走 trigram MATCH
+        // Long queries (≥3 characters) use trigram MATCH
         let hits = kernel
             .search("波霸奶茶", &Filters::empty(), 5, None)
             .unwrap();
@@ -652,12 +703,14 @@ mod tests {
         assert!(hits[0].score > 0.0, "bm25 score must be positive");
 
         // 幂等：重复导入不产生重复页
+        // Idempotent: repeated imports do not create duplicate pages
         kernel
             .seed_pages(&page, "milk-tea", PublishStatus::Accepted)
             .unwrap();
         let counts = kernel.row_counts().unwrap();
         assert_eq!(counts["pages"], 1);
         // 页面 = 导语（概述）+ 成分，共 2 节；重复导入不翻倍
+        // Page = intro (overview) + ingredients, two sections; repeated imports do not double them
         assert_eq!(counts["page_sections"], 2);
     }
 
@@ -674,6 +727,7 @@ mod tests {
             .unwrap();
 
         // 短查询（<3 字符）走 LIKE，score 固定 1.0
+        // Short queries (<3 characters) use LIKE, with a fixed score of 1.0
         let hits = kernel.search("珍珠", &Filters::empty(), 5, None).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].score, 1.0);
@@ -724,6 +778,7 @@ mod tests {
             .unwrap();
 
         // 两个 SKU：boba 页 category 低价 18 元；lemon 页 category 高价 25 元
+        // Two SKUs: the boba page has category price 18; the lemon page category price is 25
         let sku = |id: &str, category: &str, price: f64| -> Facts {
             let mut f = Facts {
                 entity_id: EntityId::new("milk-tea", "product", id).unwrap(),
@@ -744,6 +799,7 @@ mod tests {
         });
 
         // "茶"（短查询 LIKE）→ 两页都命中；过滤 price<=20 → 只保留 boba 页
+        // "茶" (short-query LIKE) hits both pages; price<=20 keeps only the boba page
         let hits = kernel
             .search(
                 "茶",

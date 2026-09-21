@@ -1,9 +1,12 @@
 //! qdrant 集成测试（默认 `#[ignore]`，需本机/远程 qdrant 服务）。
+//! qdrant integration tests (ignored by default; require a local or remote qdrant service).
 //!
 //! 运行方式：
+//! Run with:
 //!   WIKTOR_QDRANT_URL=http://127.0.0.1:6334 cargo test --features vector-qdrant -- --include-ignored
 //!
 //! 连接失败时 skip 而非失败（CI 可能无 qdrant）。
+//! Connection failures skip rather than fail (CI may not provide qdrant).
 
 use wiktor_core::kernel::QdrantVectorStore;
 use wiktor_core::traits::{ChunkType, DistanceMetric, VectorMetadata, VectorPoint, VectorStore};
@@ -75,6 +78,7 @@ async fn qdrant_ensure_upsert_search_delete_roundtrip() {
         .unwrap();
 
     // 无候选：top1 应为 a
+    // No candidates: top1 should be a
     let hits = store
         .search(&collection, &[1.0, 0.0, 0.0, 0.0], 1, None)
         .await
@@ -83,6 +87,7 @@ async fn qdrant_ensure_upsert_search_delete_roundtrip() {
     assert_eq!(hits[0].metadata.entity_id, a.to_key());
 
     // 候选域只含 b：应只返回 b
+    // Candidate scope contains only b: only b should be returned
     let hits = store
         .search(
             &collection,
@@ -96,6 +101,7 @@ async fn qdrant_ensure_upsert_search_delete_roundtrip() {
     assert_eq!(hits[0].metadata.entity_id, b.to_key());
 
     // 删除后为空
+    // Empty after deletion
     store
         .delete(
             &collection,
@@ -110,6 +116,7 @@ async fn qdrant_ensure_upsert_search_delete_roundtrip() {
     assert_eq!(hits.len(), 1);
 
     // 清理
+    // Cleanup
     store.recreate_collection(&collection, 4).await.unwrap();
 }
 

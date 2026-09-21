@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 /// 内存稀疏向量库：无网络、暴力余弦扫描，供单测与测试环境使用。
+/// In-memory sparse vector store: offline brute-force cosine scan for unit tests and test environments.
 #[derive(Clone, Default)]
 pub struct MockVectorStore {
     inner: Arc<RwLock<HashMap<String, MockCollection>>>,
