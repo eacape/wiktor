@@ -493,7 +493,7 @@ The order below expresses only **dependencies** (what must run before what), not
 1. `wiktor-core` trait definitions + two-plane SQLite schema + qdrant vector adapter layer
 2. 20 hand-written seed Wiki pages + JSONL fact plane + SQLite kernel (FTS5) + qdrant vector baseline
 3. Minimum query closed loop: index → QUG/fallback → filter pushdown → CLI display ✅ (delivered in Step 3, 2026-09-21; petgraph QUG graph, QueryEngine orchestration, RRF fusion, `--json`/`--no-vector` CLI; the QUG exit condition is executable — golden three-tier A pure-FTS 85% / B hybrid 100% / C QUG 100%, B is +15pp over A, and QUG adds no further gain over B → disabled by default per the exit condition)
-4. LLM compilation pipeline + require_source_refs contract + four-rule quality scoring + recompilation brake + all-dependency content hash
+4. LLM compilation pipeline + require_source_refs contract + four-rule quality scoring + recompilation brake + all-dependency content hash ✅ (Step 4 delivered 2026-09-22; includes the 0003 migration with accepted-only FTS indexing, BLAKE3 all-dependency hashing with incremental skip, the source-ref-v1 citation contract and four-rule scoring, page/task brakes with lease fencing, token-budget circuit breaking, the `wiktor compile` CLI (mock/openai/ollama, dry-run and exit-code contract), and stale-vector-payload validation; offline acceptance needs no key and no network, real-provider smoke is separately marked; implementation deviations in `docs/design/step4-compile-pipeline.md` §13)
 5. QUG five edge types + golden-queries evaluation (pure vector vs. hybrid vs. QUG, including the exit-condition determination)
 6. Feedback analyzer + `POST /feedback` (authentication / rate limiting / idempotency)
 7. `wiktor-server` (gRPC + HTTP)

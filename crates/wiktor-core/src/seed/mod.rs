@@ -96,7 +96,15 @@ pub fn parse_page(content: &str) -> Result<WikiPage> {
 ///   line up to (but not including) the next heading line;
 /// - Non-empty intro text before the first `##` becomes the first section, heading = `概述`;
 /// - `###` and deeper headings stay inline in the source text, not split further.
-fn split_sections(body: &str) -> Vec<Section> {
+///
+/// `pub(crate)`：Step 4 executor 复用同一 H2 切章语义（§5.2.5：sections 由
+/// renderer/共享 splitter 生成，不信任 Compiler 填值），保证 seed 页与编译页
+/// 的章节切分一致。
+///
+/// `pub(crate)`: the Step 4 executor reuses the same H2-splitting semantics
+/// (§5.2.5: sections come from the renderer/shared splitter, never from the
+/// Compiler), keeping seed-page and compiled-page sectioning consistent.
+pub(crate) fn split_sections(body: &str) -> Vec<Section> {
     use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 
     // 收集 H2 标题的 (起始偏移, 结束偏移, 标题文本)

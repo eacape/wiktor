@@ -6,7 +6,7 @@
 use crate::kernel::SqliteKernel;
 use crate::query_engine::hybrid::{rrf_merge, whitelist_filter};
 use crate::query_engine::qug::QugGraph;
-use crate::traits::VectorStore;
+use crate::traits::{VectorHit, VectorStore};
 use crate::types::error::{Error, Result};
 use crate::types::{Filters, Query, RewrittenQuery, SearchHit};
 use async_trait::async_trait;
@@ -199,6 +199,14 @@ impl<V: VectorStore> QueryEngine<V> {
             .vector_store
             .search(&self.collection, &query_vec, cand_k, candidates.as_deref())
             .await?;
+        // Step 4 §10 必要边界修复：RRF 融合与截取 top_k 之前，对向量 payload 的
+        // accepted/content_hash/generation 做批量校验，丢弃旧代/隔离/不存在页与
+        // 缺版本 metadata 的 hit（A21）。
+        // Step 4 §10 boundary fix: before RRF fusion and top_k truncation, bulk-
+        // validate the vector payload's accepted/content_hash/generation and drop
+        // stale/quarantined/missing pages and hits without version metadata (A21).
+        let vector_hits = self.filter_stale_vector_hits(vector_hits)?;
+        let usable_vector_count = vector_hits.len();
 
         // RRF 融合 + 候选域第二道保护
         // RRF fusion + second-line candidate whitelist
@@ -211,7 +219,7 @@ impl<V: VectorStore> QueryEngine<V> {
             applied_filters: applied,
             candidate_count,
             fts_count: fts_hits.len(),
-            vector_count: vector_hits.len(),
+            vector_count: usable_vector_count,
             rrf_k: self.rrf_k,
         };
         let res = QueryResult {
@@ -244,6 +252,60 @@ impl<V: VectorStore> QueryEngine<V> {
             )));
         }
         Ok(())
+    }
+
+    /// 向量 payload 过期防护（Step 4 §10，A21）：缺版本 metadata（空
+    /// content_hash 或 generation=0）先丢弃；其余按 `(page_id, content_hash,
+    /// generation)` 经 kernel 批量校验。kernel 语义为「页有效 ⇔ 传入的该页全部
+    /// payload 与 accepted head 一致」，因此同页混入旧代 chunk 时整页向量被拒，
+    /// 旧代 hit 无法借同页有效 payload 冒充。
+    /// Vector-payload staleness guard (Step 4 §10, A21): hits without version
+    /// metadata (empty content_hash or generation=0) are dropped first; the rest
+    /// are bulk-validated by the kernel over `(page_id, content_hash,
+    /// generation)`. The kernel's semantics are "a page is valid iff every
+    /// provided payload matches its accepted head", so a page mixing stale
+    /// chunks is rejected as a whole and a stale hit can never ride on a
+    /// sibling's valid payload.
+    fn filter_stale_vector_hits(&self, hits: Vec<VectorHit>) -> Result<Vec<VectorHit>> {
+        if hits.is_empty() {
+            return Ok(hits);
+        }
+        let triples: Vec<(String, String, u64)> = hits
+            .iter()
+            .filter(|h| !h.metadata.content_hash.is_empty() && h.metadata.generation > 0)
+            .map(|h| {
+                (
+                    h.metadata.page_id.clone(),
+                    h.metadata.content_hash.clone(),
+                    h.metadata.generation,
+                )
+            })
+            .collect();
+        if triples.is_empty() {
+            tracing::debug!(
+                dropped = hits.len(),
+                "dropped vector hits without version metadata"
+            );
+            return Ok(Vec::new());
+        }
+        let valid = self.kernel.validate_vector_payloads(&triples)?;
+        let before = hits.len();
+        let kept: Vec<VectorHit> = hits
+            .into_iter()
+            .filter(|h| {
+                !h.metadata.content_hash.is_empty()
+                    && h.metadata.generation > 0
+                    && valid.contains(&h.metadata.page_id)
+            })
+            .collect();
+        if kept.len() != before {
+            tracing::debug!(
+                dropped = before - kept.len(),
+                kept = kept.len(),
+                "dropped stale vector hits before RRF fusion"
+            );
+        }
+        Ok(kept)
     }
 
     /// 写查询日志（成功与可恢复空结果路径都要写；写失败仅 tracing 告警）。

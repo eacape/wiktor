@@ -1,3 +1,4 @@
+use crate::compile::contract::CompileEvidence;
 use crate::types::entity::EntityId;
 use crate::types::qug::QugEdge;
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,13 @@ pub struct CompiledPage {
     /// BLAKE3 哈希：覆盖源数据 + 领域包版本 + Prompt + 编译器 + 模型版本。
     /// BLAKE3 hash covering source data + domain-pack version + Prompt + compiler + model version.
     pub content_hash: String,
+    /// 证据载荷（Step 4 §4：避免丢失 refs/usage；旧 seed 页反序列化为 None，
+    /// 但经 PipelineExecutor 发布时 None 视为 schema 失败）。
+    /// Evidence payload (Step 4 §4: avoids losing refs/usage; legacy seed pages
+    /// deserialize as None, but publishing via PipelineExecutor treats None as a
+    /// schema failure).
+    #[serde(default)]
+    pub evidence: Option<CompileEvidence>,
 }
 
 /// Wiki 页面（纯 Markdown，人类可读，可重建）。
@@ -97,7 +105,13 @@ impl PublishStatus {
 
 /// 编译上下文（参与内容哈希的依赖集合）。
 /// Compilation context (dependency set included in the content hash).
-#[derive(Debug, Clone)]
+///
+/// Step 4 起需序列化：任务快照 `compile_tasks.dependencies_json` 保存 context，
+/// claim 时反序列化还原（Step 4 spec §7/§8.3）。
+/// Serializable since Step 4: the task snapshot
+/// `compile_tasks.dependencies_json` stores the context, deserialized back on
+/// claim (Step 4 spec §7/§8.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompileContext {
     pub domain_pack_version: String,
     pub prompt_template: String,

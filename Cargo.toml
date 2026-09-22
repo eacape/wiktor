@@ -44,9 +44,23 @@ anyhow = "1.0"
 # Graph (petgraph DiGraph for the QUG query-understanding graph; no hand-rolled adjacency lists)
 petgraph = "0.6"
 
-# 日志（QueryEngine 统一写查询日志，日志写入失败用 tracing 报错）
+# 日志（QueryEngine 统一写查询日志，日志写入失败用 tracing 报告）
 # Logging (QueryEngine writes query logs centrally; tracing reports log-write failures)
 tracing = "0.1"
+
+# CLI 人类日志输出到 stderr（Step 4 §9：--json 时 stdout 只有一份 JSON）
+# CLI human logs go to stderr (Step 4 §9: with --json stdout carries only one JSON)
+tracing-subscriber = "0.3"
+
+# LLM 编译管线（Step 4，llm-openai feature）：async-openai 仅隔离在 LlmClient
+# 适配器内（D1：供应商 DTO 不越过适配器）；reqwest 与 SDK 同版同 TLS 栈，
+# 仅供适配器实现单请求语义（关闭自动重试/读取 Retry-After/响应体积上限）。
+# LLM compile pipeline (Step 4, llm-openai feature): async-openai stays isolated
+# behind the LlmClient adapter (D1: vendor DTOs never cross the adapter); reqwest
+# matches the SDK version and TLS stack so the adapter can implement single-request
+# semantics (no auto-retry / Retry-After read / response size cap).
+async-openai = { version = "0.28", default-features = false, features = ["rustls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

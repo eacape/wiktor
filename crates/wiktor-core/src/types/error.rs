@@ -29,6 +29,12 @@ pub enum Error {
 
     #[error("compilation error: {0}")]
     Compilation(String),
+    /// Step 4 类型化编译失败（保留旧 `Compilation(String)` 兼容，禁止解析字符串
+    /// 推断 HTTP 状态）。
+    /// Step 4 typed compile failure (legacy `Compilation(String)` stays compatible;
+    /// never infer HTTP status by parsing strings).
+    #[error("compile failure: {0}")]
+    CompileFailure(#[from] crate::compile::contract::CompileFailure),
     #[error("quality below threshold: {actual} < {threshold}")]
     QualityBelowThreshold { actual: f32, threshold: f32 },
     #[error("content hash mismatch: expected {expected}, got {actual}")]

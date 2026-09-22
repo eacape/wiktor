@@ -21,6 +21,7 @@ mod qug;
 mod reranker;
 mod vector_store;
 
+pub use crate::compile::config::CompilePolicy;
 pub use compiler::Compiler;
 pub use data_source::{DataSource, EntitySchema};
 pub use domain_pack::{

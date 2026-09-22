@@ -19,3 +19,17 @@ serde_yaml_ng = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# llm-openai：转发到 wiktor-core 同名 feature（spec §12 步骤 6/7）；CLI 默认开启，
+# 关闭后 `--provider openai/ollama` 明确报错、mock 离线可跑（A23）。
+# llm-openai: forwards to the same-named wiktor-core feature (spec §12 steps 6/7);
+# the CLI enables it by default; without it `--provider openai/ollama` errors
+# explicitly while mock runs offline (A23).
+default = ["llm-openai"]
+llm-openai = ["wiktor-core/llm-openai"]
+
+[dev-dependencies]
+tempfile = { workspace = true }

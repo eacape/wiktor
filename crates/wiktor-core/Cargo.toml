@@ -23,10 +23,18 @@ async-trait = "0.1"
 petgraph = { workspace = true }
 tracing = { workspace = true }
 qdrant-client = { workspace = true, optional = true }
+async-openai = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
 
 [features]
 default = ["vector-qdrant"]
 vector-qdrant = ["dep:qdrant-client"]
+# llm-openai：async-openai/ollama 单请求适配器（spec §4/§12 步骤 6）。tokio 已是
+# 基础依赖（非 optional，不能进 feature 列表）。CLI 的同名 feature 转发由后续批次实现。
+# llm-openai: the async-openai/ollama single-request adapter (spec §4/§12 step 6).
+# tokio is already a non-optional base dependency and cannot appear in the feature
+# list. CLI feature forwarding lands in a later batch.
+llm-openai = ["dep:async-openai", "dep:reqwest"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

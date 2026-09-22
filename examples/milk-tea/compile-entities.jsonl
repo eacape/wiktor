@@ -1,0 +1,2 @@
+{"entity_id": "milk-tea:drink:tapioca-milk-tea", "name": "珍珠奶茶", "description": "经典珍珠奶茶：红茶底配 Q 弹波霸珍珠，奶香浓郁。", "aliases": ["珍珠奶茶", "波霸奶茶", "波霸"], "category": "milk-tea:drink:tapioca-milk-tea", "price": 19.0, "source_revision": 1}
+{"entity_id": "milk-tea:drink:lemon-tea", "name": "柠檬茶", "description": "手打柠檬茶：香水柠檬现切捣压，茶底清爽回甘。", "aliases": ["柠檬茶", "手打柠檬茶"], "category": "milk-tea:drink:lemon-tea", "price": 12.8, "source_revision": 1}

@@ -1,3 +1,4 @@
+use crate::compile::config::CompilePolicy;
 use crate::traits::{Compiler, QugBuilder, Reranker};
 use crate::types::error::{Error, Result};
 use crate::types::{FieldDefinition, FieldType, Filters};
@@ -27,6 +28,8 @@ pub trait DomainPack: Send + Sync {
 /// compile:
 ///   quality_threshold: 0.75
 ///   max_recompiles: 2
+///   knowledge_fields: [name, description]
+///   required_headings: [概述]
 /// query:
 ///   filters: [price, sugar_level, size, ingredient_ids]
 /// qug:
@@ -36,12 +39,17 @@ pub trait DomainPack: Send + Sync {
 ///   intent_templates: intents.yaml
 /// ```
 /// 自定义 `Deserialize` 把嵌套的 `compile` / `query` / `qug` 段拍平到本结构，
-/// 保持既有字段（quality_threshold / max_recompiles）不变，仅新增 query_filters
-/// 与 qug；缺少 `qug` 段时使用 Step 2 兼容默认值（enabled=false）。
+/// 保持既有字段（quality_threshold / max_recompiles）不变，新增 query_filters、
+/// qug 与 compile_policy；缺少 `qug` 段时使用 Step 2 兼容默认值（enabled=false）。
+/// 缺少整个 `compile` 段时必须实际产生阈值 0.75 / max_recompiles=2（修正历史
+/// derive(Default) 零值 bug），`compile` 段内部严格拒绝未知字段。
 /// A custom `Deserialize` flattens the nested `compile` / `query` / `qug` sections
 /// into this struct, keeping existing fields (quality_threshold / max_recompiles)
-/// unchanged and adding query_filters and qug; a missing `qug` section falls back to
-/// Step 2-compatible defaults (enabled=false).
+/// unchanged and adding query_filters, qug and compile_policy; a missing `qug`
+/// section falls back to Step 2-compatible defaults (enabled=false). A missing
+/// `compile` section must actually yield threshold 0.75 / max_recompiles=2
+/// (fixing the historical derive(Default) zero-value bug); the `compile` section
+/// strictly rejects unknown fields.
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
     pub name: String,
@@ -49,6 +57,16 @@ pub struct DomainConfig {
     pub entities: Vec<EntityConfig>,
     pub quality_threshold: f32,
     pub max_recompiles: usize,
+    /// Step 4 编译策略快照（§3 契约；run 启动时冻结并参与哈希）。
+    /// The Step 4 compile-policy snapshot (§3 contract; frozen at run start and
+    /// hashed).
+    pub compile_policy: CompilePolicy,
+    /// `compile.prompt`（可省略，使用内置 source-ref-v1 模板）。
+    /// `compile.prompt` (optional; falls back to the built-in source-ref-v1 template).
+    pub compile_prompt: Option<String>,
+    /// `compile.output_contract`（默认 require_source_refs）。
+    /// `compile.output_contract` (defaults to require_source_refs).
+    pub compile_output_contract: String,
     /// `query.filters` 过滤白名单（Step 2 仅解析提示，不强制消费）。
     /// Whitelist of `query.filters` (Step 2 only parses this as a hint, does not enforce it).
     pub query_filters: Vec<String>,
@@ -62,13 +80,70 @@ impl<'de> Deserialize<'de> for DomainConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize, Default)]
-        #[serde(rename_all = "snake_case")]
+        // compile 段：deny_unknown_fields 拒绝拼写错误；各字段默认值以
+        // CompilePolicy::default() 为唯一事实来源（§3.1 YAML）。
+        // The compile section: deny_unknown_fields rejects typos; per-field
+        // defaults take CompilePolicy::default() as the single source of truth
+        // (§3.1 YAML).
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case", deny_unknown_fields)]
         struct CompileSection {
             #[serde(default = "default_threshold")]
             quality_threshold: f32,
-            #[serde(default)]
+            #[serde(default = "default_max_recompiles")]
             max_recompiles: usize,
+            #[serde(default)]
+            prompt: Option<String>,
+            #[serde(default = "default_output_contract")]
+            output_contract: String,
+            #[serde(default)]
+            knowledge_fields: Vec<String>,
+            #[serde(default)]
+            sensitive_fields: Vec<String>,
+            #[serde(default = "default_required_headings")]
+            required_headings: Vec<String>,
+            #[serde(default = "default_scorer_version")]
+            scorer_version: String,
+            #[serde(default = "default_min_coverage")]
+            min_coverage: f32,
+            #[serde(default = "default_min_density")]
+            min_density: f32,
+            #[serde(default = "default_max_retries")]
+            max_retries: u32,
+            #[serde(default = "default_task_token_budget")]
+            task_token_budget: u64,
+            #[serde(default = "default_batch_token_budget")]
+            batch_token_budget: u64,
+            #[serde(default)]
+            daily_token_budget: Option<u64>,
+            #[serde(default = "default_max_output_tokens")]
+            max_output_tokens: u32,
+        }
+        impl Default for CompileSection {
+            /// 缺省 compile 段（历史 bug：derive(Default) 产生零值；§3.1 修正为
+            /// 0.75 / 2 及各新字段默认）。
+            /// Defaults for a missing compile section (historical bug:
+            /// derive(Default) produced zeros; §3.1 fixes them to 0.75 / 2 plus
+            /// the new-field defaults).
+            fn default() -> Self {
+                Self {
+                    quality_threshold: default_threshold(),
+                    max_recompiles: default_max_recompiles(),
+                    prompt: None,
+                    output_contract: default_output_contract(),
+                    knowledge_fields: Vec::new(),
+                    sensitive_fields: Vec::new(),
+                    required_headings: default_required_headings(),
+                    scorer_version: default_scorer_version(),
+                    min_coverage: default_min_coverage(),
+                    min_density: default_min_density(),
+                    max_retries: default_max_retries(),
+                    task_token_budget: default_task_token_budget(),
+                    batch_token_budget: default_batch_token_budget(),
+                    daily_token_budget: None,
+                    max_output_tokens: default_max_output_tokens(),
+                }
+            }
         }
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "snake_case")]
@@ -93,14 +168,67 @@ impl<'de> Deserialize<'de> for DomainConfig {
         fn default_threshold() -> f32 {
             0.75
         }
+        fn default_max_recompiles() -> usize {
+            2
+        }
+        fn default_output_contract() -> String {
+            "require_source_refs".to_string()
+        }
+        fn default_required_headings() -> Vec<String> {
+            CompilePolicy::default().required_headings
+        }
+        fn default_scorer_version() -> String {
+            CompilePolicy::default().scorer_version
+        }
+        fn default_min_coverage() -> f32 {
+            CompilePolicy::default().min_coverage
+        }
+        fn default_min_density() -> f32 {
+            CompilePolicy::default().min_density
+        }
+        fn default_max_retries() -> u32 {
+            CompilePolicy::default().max_retries
+        }
+        fn default_task_token_budget() -> u64 {
+            CompilePolicy::default().task_token_budget
+        }
+        fn default_batch_token_budget() -> u64 {
+            CompilePolicy::default().batch_token_budget
+        }
+        fn default_max_output_tokens() -> u32 {
+            CompilePolicy::default().max_output_tokens
+        }
 
         let r = Repr::deserialize(deserializer)?;
+        // max_recompiles 保持公开字段为 usize（Step 2 兼容），策略内为 u32；
+        // 越界值留给 CompilePolicy::validate() 报错。
+        // max_recompiles stays usize in the public field (Step 2 compatibility)
+        // and u32 inside the policy; out-of-range values are left to
+        // CompilePolicy::validate().
+        let compile_policy = CompilePolicy {
+            scorer_version: r.compile.scorer_version,
+            knowledge_fields: r.compile.knowledge_fields,
+            sensitive_fields: r.compile.sensitive_fields,
+            required_headings: r.compile.required_headings,
+            min_coverage: r.compile.min_coverage,
+            min_density: r.compile.min_density,
+            max_recompiles: u32::try_from(r.compile.max_recompiles).unwrap_or(u32::MAX),
+            max_retries: r.compile.max_retries,
+            task_token_budget: r.compile.task_token_budget,
+            batch_token_budget: r.compile.batch_token_budget,
+            daily_token_budget: r.compile.daily_token_budget,
+            max_output_tokens: r.compile.max_output_tokens,
+            ..CompilePolicy::default()
+        };
         Ok(DomainConfig {
             name: r.name,
             version: r.version,
             entities: r.entities,
             quality_threshold: r.compile.quality_threshold,
             max_recompiles: r.compile.max_recompiles,
+            compile_policy,
+            compile_prompt: r.compile.prompt,
+            compile_output_contract: r.compile.output_contract,
             query_filters: r.query.filters,
             qug: r.qug,
         })
@@ -338,4 +466,54 @@ pub struct EntityConfig {
     pub id_field: String,
     pub type_field: String,
     pub fields: Vec<FieldDefinition>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // 缺省 compile 段必须实际产生 0.75/2（历史零值 bug 的回归测试）。
+    // A missing compile section must actually yield 0.75/2 (regression test for
+    // the historical zero-value bug).
+    #[test]
+    fn missing_compile_section_defaults_to_spec() {
+        let config: DomainConfig =
+            serde_yaml_ng::from_str("name: d\nversion: \"0.1.0\"\n").unwrap();
+        assert_eq!(config.quality_threshold, 0.75);
+        assert_eq!(config.max_recompiles, 2);
+        let policy = &config.compile_policy;
+        assert_eq!(policy.min_coverage, 0.60);
+        assert_eq!(policy.min_density, 0.40);
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.task_token_budget, 65536);
+        assert_eq!(policy.batch_token_budget, 262144);
+        assert_eq!(policy.max_output_tokens, 2048);
+        assert_eq!(policy.required_headings, vec!["概述".to_string()]);
+        assert_eq!(config.compile_output_contract, "require_source_refs");
+        assert!(config.compile_prompt.is_none());
+        assert!(policy.validate().is_ok());
+    }
+
+    // compile 段部分提供时其余字段仍取默认。
+    // A partially provided compile section keeps the remaining fields at defaults.
+    #[test]
+    fn partial_compile_section_keeps_defaults() {
+        let yaml = "name: d\nversion: \"0.1.0\"\ncompile:\n  max_recompiles: 1\n";
+        let config: DomainConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.quality_threshold, 0.75);
+        assert_eq!(config.max_recompiles, 1);
+    }
+
+    // compile 段未知字段严格拒绝；query/qug 段维持兼容（不启用严格模式）。
+    // Unknown compile fields are strictly rejected; query/qug sections stay
+    // compatible (no strict mode there).
+    #[test]
+    fn compile_section_rejects_unknown_fields() {
+        let yaml = "name: d\nversion: \"0.1.0\"\ncompile:\n  quality_threshlod: 0.9\n";
+        assert!(serde_yaml_ng::from_str::<DomainConfig>(yaml).is_err());
+        // 既有段不拒绝未知字段（Step 2/3 兼容性）。
+        // Existing sections do not reject unknown fields (Step 2/3 compatibility).
+        let yaml = "name: d\nversion: \"0.1.0\"\nquery:\n  legacy_key: 1\nqug:\n  legacy_key: 1\n";
+        assert!(serde_yaml_ng::from_str::<DomainConfig>(yaml).is_ok());
+    }
 }

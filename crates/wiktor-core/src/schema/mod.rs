@@ -12,6 +12,6 @@ pub mod facts;
 mod knowledge;
 mod migrations;
 mod query_log;
-mod tasks;
+pub mod tasks;
 
 pub use migrations::{migrate, schema_version};

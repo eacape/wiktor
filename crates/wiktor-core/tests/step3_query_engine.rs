@@ -17,7 +17,7 @@
 //! 通过；提升 <5 且无回退 → 输出 `QUG disabled` 仍判通过；有回退 → 测试失败。
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,20 +208,32 @@ async fn seed_all(
 }
 
 /// 把页面灌入 MockVectorStore（Summary 块，确定性嵌入）。
+/// Step 4 §10：向量 payload 必须携带与 accepted head 一致的版本 metadata
+/// （content_hash/generation），否则引擎在 RRF 前会把 hit 当过期向量丢弃——
+/// 因此这里从 kernel 读真实 `(page_id, generation, content_hash)`。
 /// Loads pages into the MockVectorStore (Summary chunks, deterministic embeddings).
+/// Step 4 §10: vector payloads must carry version metadata matching the accepted
+/// head (content_hash/generation), or the engine drops the hit as stale before
+/// RRF — so the real `(page_id, generation, content_hash)` comes from the kernel.
 async fn populate_mock(
     store: &MockVectorStore,
     embedder: &TestEmbedder,
     wiki_pages: &[wiktor_core::types::WikiPage],
-    domain: &str,
-    generation: u64,
+    published: &[(String, i64, String, String)],
 ) {
     store
         .ensure_collection("milk-tea", DIM, DistanceMetric::Cosine)
         .await
         .unwrap();
+    let heads: HashMap<&str, (i64, &str)> = published
+        .iter()
+        .map(|(page_id, generation, hash, _)| (page_id.as_str(), (*generation, hash.as_str())))
+        .collect();
     let mut points = Vec::new();
     for page in wiki_pages {
+        let Some((generation, hash)) = heads.get(page.page_id.as_str()) else {
+            continue;
+        };
         let vec = embedder
             .embed(&format!("{}\n{}", page.title, page.content))
             .await
@@ -233,8 +245,8 @@ async fn populate_mock(
                 entity_id: page.entity_id.to_key(),
                 page_id: page.page_id.clone(),
                 chunk_type: ChunkType::Summary,
-                content_hash: format!("test-{domain}-{generation}"),
-                generation,
+                content_hash: hash.to_string(),
+                generation: u64::try_from(*generation).unwrap_or(0),
             },
         });
     }
@@ -278,11 +290,19 @@ async fn golden_three_tier_qug_gate() {
         goldens.len()
     );
 
-    // 共享向量库与嵌入器；灌入页面向量。
-    // Shared vector store + embedder; load page vectors.
+    // 共享向量库与嵌入器；灌入页面向量（payload 版本 metadata 与 accepted head
+    // 一致，Step 4 §10）。
+    // Shared vector store + embedder; load page vectors (payload version metadata
+    // matches the accepted head, Step 4 §10).
     let vector_store = Arc::new(MockVectorStore::new());
     let embedder = Arc::new(TestEmbedder);
-    populate_mock(&vector_store, &embedder, &wiki_pages, &config.name, 1).await;
+    populate_mock(
+        &vector_store,
+        &embedder,
+        &wiki_pages,
+        &kernel.list_published_pages(&config.name).unwrap(),
+    )
+    .await;
 
     // ---- Tier A: pure FTS（仅原文，无向量、无 QUG、无候选域限制）----
     // ---- Tier A: pure FTS (original text only; no vector, no QUG, no candidate scope) ----

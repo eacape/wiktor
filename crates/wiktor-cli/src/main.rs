@@ -12,6 +12,7 @@ use wiktor_core::traits::{
 use wiktor_core::types::{Cursor, PublishStatus};
 use wiktor_core::{seed, FactValue, Filters, QueryEngine};
 
+mod compile;
 mod embed;
 mod filter;
 
@@ -97,6 +98,11 @@ enum Command {
         #[command(subcommand)]
         command: VectorCommand,
     },
+    /// Compile a data source into Wiki pages via the Step 4 pipeline (explicit
+    /// source/provider; stats + exit codes; read-only dry-run).
+    /// 经 Step 4 编译管线把数据源编译为 Wiki 页面（显式 source/provider；统计与
+    /// 退出码；只读 dry-run）。
+    Compile(compile::CompileArgs),
 }
 
 #[derive(Subcommand)]
@@ -164,6 +170,18 @@ async fn main() -> Result<()> {
                 println!("qdrant ok: {}", health.version);
             }
         },
+        Command::Compile(args) => {
+            // 退出码契约（§9）：Ok(code) → 按 code 退出；Err → anyhow 默认
+            // 退出码 1（数据库/内部运行故障）。
+            // Exit-code contract (§9): Ok(code) exits with code; Err takes
+            // anyhow's default exit code 1 (database/internal faults).
+            let code = compile::run(args).await?;
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
     Ok(())
 }

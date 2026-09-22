@@ -1,0 +1,42 @@
+# Compile-focused domain pack for the milk-tea example (Step 4 spec §12 step 7).
+# 奶茶示例的编译专用领域包（Step 4 spec §12 步骤 7）。
+#
+# 与 domain.yaml 的差异：新增 drink 实体（编译知识平面，entity_id 与
+# products.jsonl 的 category 锚点一致，见 A21）；qug 段保持缺失（默认
+# enabled=false），不触碰既有 seed/golden 期望（A24 回归边界）。
+# Differences from domain.yaml: a drink entity is added for knowledge-plane
+# compilation (its entity_id equals the category anchors in products.jsonl, see
+# A21); the qug section stays absent (defaults to enabled=false), leaving the
+# existing seed/golden expectations untouched (A24 regression boundary).
+name: milk-tea
+version: "0.1.0"
+
+entities:
+  - name: product
+    source: jsonl://products.jsonl
+    id_field: entity_id
+    type_field: category
+    fields:
+      - { name: name, field_type: text, filterable: false }
+      - { name: description, field_type: text, filterable: false }
+      - { name: category, field_type: text, filterable: true }
+      - { name: price, field_type: numeric, filterable: true }
+      - { name: stock, field_type: numeric, filterable: true }
+      - { name: sugar_level, field_type: numeric, filterable: true }
+      - { name: size, field_type: text, filterable: true }
+      - { name: on_sale, field_type: boolean, filterable: false }
+      - { name: ingredient_ids, field_type: reflist, filterable: true }
+  - name: drink
+    source: jsonl://compile-entities.jsonl
+    id_field: entity_id
+    type_field: category
+    fields:
+      - { name: name, field_type: text, filterable: false }
+      - { name: description, field_type: text, filterable: false }
+      - { name: aliases, field_type: reflist, filterable: false }
+      - { name: category, field_type: text, filterable: true }
+      - { name: price, field_type: numeric, filterable: true }
+
+compile:
+  quality_threshold: 0.75
+  knowledge_fields: [name, description, aliases]

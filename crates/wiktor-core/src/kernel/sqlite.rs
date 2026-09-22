@@ -46,6 +46,12 @@ struct SearchRow {
     score: f32,
 }
 
+/// 本二进制支持的 schema 版本（0003_compile_pipeline，见 A22）。`open_existing`
+/// 用它拒绝旧/新 schema 而不迁移。
+/// The schema version this binary supports (0003_compile_pipeline, see A22).
+/// `open_existing` uses it to reject older/newer schemas without migrating.
+const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+
 /// 单列文本行（filter 全量 / 过滤下推用）。
 /// Single text-column row (used for full filter scans and filter pushdown).
 #[derive(QueryableByName)]
@@ -82,6 +88,58 @@ impl SqliteKernel {
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// 打开**已存在**的数据库但不做迁移（Step 4 §9 dry-run 专用 inspect 连接）：
+    /// 不创建文件、不升级 schema；版本落后于 [`SUPPORTED_SCHEMA_VERSION`] 时报
+    /// `migration_required`（消息前缀稳定，供 CLI 判别），绝不自行升级。
+    /// 打开后只读路径（如 `load_accepted_pages`）可用；不执行任何写操作。
+    /// Opens an **existing** database without migrating (the Step 4 §9 dry-run
+    /// inspect connection): never creates the file, never upgrades the schema;
+    /// when the version is behind [`SUPPORTED_SCHEMA_VERSION`] it fails with a
+    /// stable `migration_required` message prefix (for CLI triage) and never
+    /// upgrades on its own. Read-only paths (e.g. `load_accepted_pages`) work on
+    /// the returned kernel; no writes are performed.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(Error::Validation(format!(
+                "database not found: {} (dry-run never creates one)",
+                path.display()
+            )));
+        }
+        let path_str = path.to_str().ok_or_else(|| {
+            Error::InvalidConfig(format!("db path is not valid UTF-8: {}", path.display()))
+        })?;
+        let mut conn = establish(path_str)?;
+        // 不调用 migrate：dry-run 语义禁止迁移/写 pragma。
+        // `schema_version` reads the migrations ledger only; a missing table (a
+        // non-Wiktor or pre-0001 file) surfaces as Error::Database.
+        let version = schema::schema_version(&mut conn).map_err(|e| {
+            Error::InvalidConfig(format!(
+                "migration_required: cannot read schema version of {}: {e}",
+                path.display()
+            ))
+        })?;
+        if version != SUPPORTED_SCHEMA_VERSION {
+            return Err(Error::InvalidConfig(format!(
+                "migration_required: database {} is at schema version {version}, expected \
+                 {SUPPORTED_SCHEMA_VERSION}; dry-run never migrates, open it with a migrating \
+                 command first",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// 取连接锁一次（编译管线事务接口与既有方法共用；poison → Internal）。
+    /// Locks the connection exactly once (shared by the compile-pipeline
+    /// transactional API and the existing methods; poison → Internal).
+    pub(super) fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, SqliteConnection>> {
+        self.conn
+            .lock()
+            .map_err(|_| Error::Internal("kernel connection mutex poisoned".into()))
     }
 
     /// 当前 schema 版本（已应用迁移数）。
@@ -511,7 +569,10 @@ fn inline_params(fragment: &str, params: &[String]) -> String {
     out
 }
 
-fn unix_now() -> i64 {
+/// 当前 Unix 秒（kernel 模块内共用；编译管线 admit 无注入时钟时使用）。
+/// Current Unix seconds (shared inside the kernel module; used by compile admit
+/// which has no injected clock).
+pub(super) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -530,70 +591,12 @@ impl EntityStore for SqliteKernel {
         }
         let mut conn = self.conn.lock().unwrap();
         let now = unix_now();
-        conn.transaction(|tx| -> Result<()> {
-            for (field_name, value) in &facts.fields {
-                let (field_type, numeric, text, boolean, timestamp) = facts::fact_columns(value);
-                // CAS 生效判断：仅当本 revision 真正覆盖/新插入 facts 行（影响行数==1）时，
-                // 才允许重写派生行 fact_refs——否则旧 revision 会绕过 CAS 污染 reflist。
-                // 注：CAS 是核心语义（excluded.source_revision > facts.source_revision），
-                // 走 raw SQL 逃生（diesel on_conflict do_update 的 WHERE 表达力不足）。
-                // 本 SQL 是 CAS 唯一真相（原 schema::facts::SQL_UPSERT_FACT 参考常量已删）。
-                // CAS-effect check: only when this revision truly overwrites/inserts a
-                // facts row (affected rows == 1) may we rewrite the derived fact_refs rows —
-                // otherwise an older revision would bypass CAS and pollute the reflist.
-                // Note: CAS is the core semantics (excluded.source_revision > facts.source_revision)
-                // and uses the raw-SQL escape hatch (diesel's on_conflict do_update WHERE
-                // is not expressive enough). This SQL is the single source of truth for
-                // CAS (the former schema::facts::SQL_UPSERT_FACT reference constant was removed).
-                let applied = diesel::sql_query(
-                    "INSERT INTO facts (entity_id, field_name, field_type, value_numeric, value_text, value_boolean, value_timestamp, source_revision, updated_at)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-                     ON CONFLICT(entity_id, field_name) DO UPDATE SET
-                         field_type      = excluded.field_type,
-                         value_numeric   = excluded.value_numeric,
-                         value_text      = excluded.value_text,
-                         value_boolean   = excluded.value_boolean,
-                         value_timestamp = excluded.value_timestamp,
-                         source_revision = excluded.source_revision,
-                         updated_at      = excluded.updated_at
-                     WHERE excluded.source_revision > facts.source_revision",
-                )
-                .bind::<diesel::sql_types::Text, _>(id.to_key())
-                .bind::<diesel::sql_types::Text, _>(field_name)
-                .bind::<diesel::sql_types::Text, _>(&field_type)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(numeric)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(text)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(boolean)
-                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(timestamp)
-                .bind::<diesel::sql_types::BigInt, _>(source_revision as i64)
-                .bind::<diesel::sql_types::BigInt, _>(now)
-                .execute(tx)?
-                    == 1;
-
-                // reflist 拆行到 fact_refs（同一事务，先删后插；仅 CAS 生效时执行）
-                // Split reflist into fact_refs rows (same transaction, delete-then-insert;
-                // only runs when CAS applied)
-                if applied {
-                    if let FactValue::RefList(refs) = value {
-                        diesel::delete(
-                            fact_refs_t::table
-                                .filter(fact_refs_t::entity_id.eq(id.to_key()))
-                                .filter(fact_refs_t::field_name.eq(field_name)),
-                        )
-                        .execute(tx)?;
-                        for r in refs {
-                            diesel::insert_into(fact_refs_t::table)
-                                .values((
-                                    fact_refs_t::entity_id.eq(id.to_key()),
-                                    fact_refs_t::field_name.eq(field_name),
-                                    fact_refs_t::ref_value.eq(r),
-                                ))
-                                .execute(tx)?;
-                        }
-                    }
-                }
-            }
-            Ok(())
+        // 事实 CAS 写入已抽取为 [`write_facts_cas`]（Step 4 admit 事务复用同一
+        // 实现，保证 facts/fact_refs 语义单源）。
+        // The fact CAS write is extracted into [`write_facts_cas`] (reused by the
+        // Step 4 admit transaction so facts/fact_refs semantics have one source).
+        conn.transaction(|tx| {
+            super::compile_store::write_facts_cas(tx, facts, source_revision, now)
         })?;
         Ok(())
     }
@@ -705,6 +708,15 @@ impl EntityStore for SqliteKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// 测试用版本行（读 `__diesel_schema_migrations.version`）。
+    /// Test-only version row (reads `__diesel_schema_migrations.version`).
+    #[derive(QueryableByName)]
+    struct TestVersionRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        value: String,
+    }
 
     fn sample_page(entity_key: &str, title: &str, body: &str) -> WikiPage {
         crate::seed::parse_page(
@@ -713,6 +725,129 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    /// 搭一个 0001+0002 的 legacy 库文件（含版本行），供 open_existing 拒绝测试。
+    /// Builds a legacy 0001+0002 database file (with version rows) for the
+    /// open_existing rejection tests.
+    fn legacy_db_file(dir: &Path) -> PathBuf {
+        use diesel::connection::SimpleConnection;
+        let path = dir.join("legacy.db");
+        let mut c = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        c.batch_execute(include_str!("../../migrations/0001_create_core/up.sql"))
+            .unwrap();
+        c.batch_execute(include_str!("../../migrations/0002_fts_trigram/up.sql"))
+            .unwrap();
+        c.batch_execute(
+            "CREATE TABLE __diesel_schema_migrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT NOT NULL,
+                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        // 版本行从全新 migrate 的库里取（diesel 记录的版本串以它为准）。
+        // Version rows come from a freshly migrated DB (diesel's recorded strings).
+        let mut fresh = SqliteConnection::establish(":memory:").unwrap();
+        schema::migrate(&mut fresh).unwrap();
+        let versions: Vec<TestVersionRow> = diesel::sql_query(
+            "SELECT version AS value FROM __diesel_schema_migrations ORDER BY version",
+        )
+        .load(&mut fresh)
+        .unwrap();
+        for v in &versions[..2] {
+            diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES (?)")
+                .bind::<diesel::sql_types::Text, _>(&v.value)
+                .execute(&mut c)
+                .unwrap();
+        }
+        path
+    }
+
+    // A20：open_existing 对旧 schema 报 migration_required 且不升级（dry-run
+    // 只读语义）；legacy 数据原样保留。
+    // A20: open_existing reports migration_required on an old schema without
+    // upgrading (dry-run read-only semantics); legacy data survives untouched.
+    #[test]
+    fn open_existing_refuses_legacy_schema_without_migrating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db_file(dir.path());
+        // legacy 页数据
+        // Legacy page data
+        {
+            let mut c = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+            diesel::sql_query(
+                "INSERT INTO pages (page_id, entity_id, domain, entity_type, title, content,
+                    content_hash, generation, status, domain_pack_version, compiled_at,
+                    model_version, embedding_model, created_at, updated_at)
+                 VALUES ('milk-tea:drink:legacy', 'milk-tea:drink:legacy', 'milk-tea', 'drink',
+                    '乌龙奶茶', '乌龙奶茶是经典茶底。', 'h', 1, 'accepted', '0.1.0', 1, 'seed',
+                    'none', 1, 1)",
+            )
+            .execute(&mut c)
+            .unwrap();
+        }
+
+        let err = match SqliteKernel::open_existing(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("open_existing must refuse a legacy schema"),
+        };
+        match &err {
+            Error::InvalidConfig(msg) => {
+                assert!(
+                    msg.starts_with("migration_required:"),
+                    "expected migration_required prefix, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidConfig(migration_required), got {other:?}"),
+        }
+
+        // 未升级：版本仍是 2，legacy 页保留。
+        // Not upgraded: version stays 2 and the legacy page survives.
+        let mut c = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        assert_eq!(schema::schema_version(&mut c).unwrap(), 2);
+        let n: i64 = diesel::sql_query("SELECT COUNT(*) AS n FROM pages")
+            .get_result::<CountRow>(&mut c)
+            .unwrap()
+            .n;
+        assert_eq!(n, 1);
+    }
+
+    // A20：open_existing 对不存在的文件报错且不创建文件。
+    // A20: open_existing errors on a missing file and never creates it.
+    #[test]
+    fn open_existing_missing_file_never_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-here.db");
+        let err = match SqliteKernel::open_existing(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("open_existing must refuse a missing file"),
+        };
+        assert!(matches!(err, Error::Validation(_)), "got {err:?}");
+        assert!(!path.exists(), "dry-run must not create the DB file");
+    }
+
+    // open_existing 对当前 schema 可用，只读路径（load_accepted_pages）正常。
+    // open_existing works on a current-schema DB; read-only paths (e.g.
+    // load_accepted_pages) function normally.
+    #[test]
+    fn open_existing_works_on_current_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current.db");
+        {
+            let kernel = SqliteKernel::open(&path).unwrap();
+            kernel
+                .seed_pages(
+                    &sample_page("milk-tea:drink:a", "乌龙奶茶", "乌龙奶茶是经典茶底。"),
+                    "milk-tea",
+                    PublishStatus::Accepted,
+                )
+                .unwrap();
+        }
+        let kernel = SqliteKernel::open_existing(&path).unwrap();
+        let pages = kernel.load_accepted_pages("milk-tea").unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].wiki.page_id, "milk-tea:drink:a");
     }
 
     #[tokio::test]

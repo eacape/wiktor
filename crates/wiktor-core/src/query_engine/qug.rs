@@ -767,6 +767,10 @@ pub fn compiled_page(wiki: &WikiPage) -> CompiledPage {
         },
         qug_edges: Vec::new(),
         content_hash,
+        // seed 页无证据载荷（Step 4 §4：None 经 executor 发布视为 schema 失败）。
+        // Seed pages carry no evidence payload (Step 4 §4: None published via the
+        // executor is a schema failure).
+        evidence: None,
     }
 }
 
