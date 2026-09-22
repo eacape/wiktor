@@ -40,9 +40,16 @@ const DIM: usize = 768;
 
 /// golden 查询记录（与 Step 2 schema 一致）。
 /// Golden query record (mirrors Step 2's schema).
+///
+/// Step5 批 4 起新格式记录（expected_entity_ids，无 expected_hits）由
+/// Step5 评测器执行；此处期望设默认值并在加载时过滤跳过。
+/// Since Step5 batch 4, new-format records (expected_entity_ids, no
+/// expected_hits) belong to the Step5 evaluator; expectations default here and
+/// such records are skipped at load time.
 #[derive(Debug, Deserialize)]
 struct Golden {
     query: String,
+    #[serde(default)]
     expected_hits: Vec<String>,
     #[serde(default)]
     filters: GoldenFilters,
@@ -267,7 +274,8 @@ fn load_goldens(domain_dir: &Path) -> Vec<Golden> {
         .unwrap()
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).unwrap())
+        .map(|l| serde_json::from_str::<Golden>(l).unwrap())
+        .filter(|g| !g.expected_hits.is_empty())
         .collect()
 }
 

@@ -96,7 +96,17 @@ impl VectorStore for MockVectorStore {
             scored.push((id.clone(), score, point.metadata.clone()));
         }
 
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // 排序：相似度降序 + 点 id 升序 tie-break（Step5 批5 A10：HashMap 迭代
+        // 序不定，同分命中必须确定稳定，评测连续两次运行才可逐位复现）。
+        // Order: similarity descending with a point-id ascending tie-break
+        // (Step5 batch 5 A10: HashMap iteration order is unspecified, so
+        // equal-score hits must be deterministic for bitwise-reproducible
+        // evaluation runs).
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
         Ok(scored
             .into_iter()
             .take(top_k)

@@ -513,7 +513,7 @@ wiktor/                          # Cargo workspace 单仓
 2. 20 个手工种子 Wiki + JSONL 事实平面 + SQLite 内核（FTS5）+ qdrant 向量基线
 3. 最小查询闭环：索引 → QUG/fallback → 过滤下推 → CLI 展示 ✅（Step 3 已交付，2026-09-21；含 petgraph QUG 图、QueryEngine 编排、RRF 融合、`--json`/`--no-vector` CLI；QUG 退出条件可执行——golden 三档 A 纯FTS 85% / B 混合 100% / C QUG 100%，B 相对 A +15pp，QUG 相对 B 无额外增益 → 按退出条件默认关闭）
 4. LLM 编译管线 + require_source_refs 契约 + 四规则质量评分 + 重编译刹车 + 全依赖内容哈希 ✅（Step 4 已交付，2026-09-22；含 0003 迁移与仅 accepted 入索引的 FTS、BLAKE3 全依赖哈希与增量跳过、source-ref-v1 引用契约与四规则评分、页级/任务级刹车与租约 fencing、token 预算熔断、`wiktor compile` CLI（mock/openai/ollama，dry-run 与退出码契约）、向量 payload 过期校验；离线验收无 key 无网络，真实 provider smoke 独立标注；实现偏差见 `docs/design/step4-compile-pipeline.md` §13）
-5. QUG 五类边构建 + golden-queries 评测（纯向量 vs 混合 vs QUG，含退出条件判定）
+5. QUG 五类边构建 + golden-queries 评测（纯向量 vs 混合 vs QUG，含退出条件判定）✅（Step 5 已交付，2026-09-23；含 0004 迁移（qug_builds 代次父表 + qug_page_snapshots/qug_intent_edges 独立持久化）、BLAKE3 source_hash 与 hash 命中复用、单事务原子发布（失败回滚旧图可读）、启动加载 hash 校验与 stale/disabled 显式 fallback、golden 扩容至 134 条（legacy 34 + 新增 100，配额 synonym 25/intent 20/negation 20/attribute_filter 20/negative 15）、A/B/C 三档评测（recall@1/5/10 + negative_precision + 按 kind 分层，双语 + JSON 报告）、`wiktor qug build`/`wiktor eval` CLI（退出码 0/1/2/3/4）；退出条件判定：milk-tea fixture 离线评测（`--no-qdrant` mock 向量后端）C 相对 B 的 recall@10 增益 +40.17pp ≥ 5pp → `qug_decision=enabled`，真实向量后端接入后需复测；实现偏差见 `docs/design/step5-qug-build.md` §9）
 6. 反馈分析器 + `POST /feedback`（认证 / 限流 / 幂等）
 7. `wiktor-server`（gRPC + HTTP）
 8. 一致性仲裁维度 + 任务状态机补全（租约 / 死信 / 兼容检查）

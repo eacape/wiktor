@@ -69,13 +69,13 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let mut c = conn();
-        // A22：0003 后 schema 版本为 3。
-        // A22: schema version is 3 after 0003.
-        assert_eq!(schema_version(&mut c).unwrap(), 3);
+        // A22：0004 后 schema 版本为 4。
+        // A22: schema version is 4 after 0004.
+        assert_eq!(schema_version(&mut c).unwrap(), 4);
         // 重跑无副作用
         // Re-running is side-effect free
         migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 3);
+        assert_eq!(schema_version(&mut c).unwrap(), 4);
         let _ = std::fs::remove_dir_all(
             std::env::temp_dir().join(format!("wiktor_mig_test_{}", std::process::id())),
         );
@@ -257,7 +257,7 @@ mod tests {
         .unwrap();
 
         crate::schema::migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 3);
+        assert_eq!(schema_version(&mut c).unwrap(), 4);
 
         // FTS 仅剩 accepted legacy 页（迁移清空 + accepted 回填）。
         // FTS keeps only the accepted legacy page (cleared then accepted backfill).
@@ -293,18 +293,23 @@ mod tests {
         );
     }
 
-    // A22：down 迁移 —— compile_attempts 非空时拒绝破坏性降级；空新表才允许回退，
-    // 且回退后 schema 回到 0002 语义、再次 migrate 可达 3。
-    // A22: down migration — non-empty compile_attempts refuses destructive
-    // downgrade; empty new tables allow rollback, after which the schema is back to
-    // 0002 semantics and re-migrating reaches 3 again.
+    // A22：down 迁移链 —— qug_builds/compile_attempts 非空时拒绝破坏性降级；
+    // 空新表才允许回退，且回退后 schema 回到 0002 语义、再次 migrate 可达 4。
+    // A22: the down-migration chain — non-empty qug_builds/compile_attempts
+    // refuse destructive downgrades; empty new tables allow rollback, after which
+    // the schema is back to 0002 semantics and re-migrating reaches 4 again.
     #[test]
     fn migration_0003_down_guarded_by_attempts() {
         use diesel_migrations::MigrationHarness;
 
-        // 空 attempts：可回退（guard 表插入 0 不违反 CHECK）。
-        // Empty attempts: revertible (guard inserts 0, CHECK holds).
+        // 空 attempts/qug_builds：可回退（guard 表插入 0 不违反 CHECK）。
+        // 先回退 0004（qug_builds 空）→ 3，再回退 0003（attempts 空）→ 2。
+        // Empty attempts/qug_builds: revertible (the guard inserts 0, CHECK
+        // holds). First revert 0004 (empty qug_builds) → 3, then 0003 (empty
+        // attempts) → 2.
         let mut c = conn();
+        c.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 3);
         c.revert_last_migration(MIGRATIONS).unwrap();
         assert_eq!(schema_version(&mut c).unwrap(), 2);
         // 回退后旧语义触发器恢复：candidate 也入 FTS。
@@ -319,15 +324,19 @@ mod tests {
         .execute(&mut c)
         .unwrap();
         assert_eq!(count(&mut c, "pages_fts"), 1);
-        // 再升级回 0003：candidate 被清出 FTS。
-        // Upgrade to 0003 again: the candidate is pushed out of FTS.
+        // 再升级回 0004：candidate 被清出 FTS。
+        // Upgrade to 0004 again: the candidate is pushed out of FTS.
         crate::schema::migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 3);
+        assert_eq!(schema_version(&mut c).unwrap(), 4);
         assert_eq!(count(&mut c, "pages_fts"), 0);
 
         // 非空 attempts：guard CHECK 失败 → revert 报错，不静默丢审计（§8.1）。
-        // Non-empty attempts: guard CHECK fails → revert errors, audit never
-        // silently dropped (§8.1).
+        // revert_last_migration 先回退 0004（qug_builds 空 → 成功），第二次
+        // revert 触发 0003 守卫失败，版本停在 3。
+        // Non-empty attempts: the guard CHECK fails → revert errors, audit never
+        // silently dropped (§8.1). revert_last_migration first reverts 0004
+        // (empty qug_builds → OK); the second revert trips the 0003 guard and the
+        // version stays 3.
         diesel::sql_query("DELETE FROM pages")
             .execute(&mut c)
             .unwrap();
@@ -359,8 +368,61 @@ mod tests {
         .bind::<diesel::sql_types::BigInt, _>(task_id)
         .execute(&mut c)
         .unwrap();
+        c.revert_last_migration(MIGRATIONS).unwrap();
         assert!(c.revert_last_migration(MIGRATIONS).is_err());
         assert_eq!(schema_version(&mut c).unwrap(), 3);
+    }
+
+    // A5/A6：0004 down —— qug_builds 非空时拒绝回退（不丢 QUG 构建代次）；清空
+    // 后回退成功，且 0004 新结构（表 + build_id 列）一并移除。
+    // A5/A6: the 0004 down — a non-empty qug_builds refuses the downgrade (QUG
+    // build generations are never dropped); once cleared, the downgrade succeeds
+    // and the 0004 structures (tables + build_id column) go away with it.
+    #[test]
+    fn migration_0004_down_guarded_by_builds() {
+        use diesel_migrations::MigrationHarness;
+
+        let mut c = conn();
+        // building 行不占 active published 唯一索引，可独立插入。
+        // A building row does not occupy the active-published partial unique
+        // index and can be inserted standalone.
+        diesel::sql_query(
+            "INSERT INTO qug_builds
+                (domain_name, domain_version, builder_version, source_hash, status,
+                 page_count, edge_count, counts_json, created_at)
+             VALUES ('milk-tea', '0.1.0', 'qug-build-v1', 'deadbeef', 'building', 0, 0, '{}', 1)",
+        )
+        .execute(&mut c)
+        .unwrap();
+        assert!(c.revert_last_migration(MIGRATIONS).is_err());
+        assert_eq!(schema_version(&mut c).unwrap(), 4);
+
+        // 清空后回退：qug_builds/qug_page_snapshots/qug_intent_edges 消失，
+        // qug_edges 回到 0003 形状（无 build_id 列）。
+        // Once cleared: qug_builds/qug_page_snapshots/qug_intent_edges vanish and
+        // qug_edges is back to the 0003 shape (no build_id column).
+        diesel::sql_query("DELETE FROM qug_builds")
+            .execute(&mut c)
+            .unwrap();
+        c.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 3);
+        let tables: Vec<SqlRow> = diesel::sql_query(
+            "SELECT name AS value FROM sqlite_master WHERE type = 'table'
+             AND name IN ('qug_builds', 'qug_page_snapshots', 'qug_intent_edges')",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert!(
+            tables.is_empty(),
+            "0004 tables must be dropped, {} remain",
+            tables.len()
+        );
+        let cols: Vec<SqlRow> = diesel::sql_query(
+            "SELECT name AS value FROM pragma_table_info('qug_edges') WHERE name = 'build_id'",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert!(cols.is_empty(), "qug_edges.build_id must be dropped");
     }
 }
 

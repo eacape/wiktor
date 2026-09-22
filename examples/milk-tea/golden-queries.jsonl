@@ -32,3 +32,103 @@
 {"query":"低糖波霸","expected_hits":["milk-tea:drink:boba-milk-tea"],"filters":{}}
 {"query":"冷饮","expected_hits":["milk-tea:drink:matcha-latte"],"filters":{}}
 {"query":"啵啵","expected_hits":["milk-tea:drink:boba-milk-tea"],"filters":{}}
+{"id":"synonym-01","query":"木薯珍珠","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:pearl"],"notes":"波霸珍珠页 alias 木薯珍珠"}
+{"id":"synonym-02","query":"芝士奶霜","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:cheese-foam"],"notes":"芝士奶盖页 alias 芝士奶霜"}
+{"id":"synonym-03","query":"椰子果冻","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:coconut-jelly"],"notes":"椰果页 alias 椰子果冻"}
+{"id":"synonym-04","query":"芋头圆","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:taro-ball"],"notes":"芋圆页 alias 芋头圆"}
+{"id":"synonym-05","query":"蜜红豆","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:red-bean"],"notes":"红豆页 alias 蜜红豆"}
+{"id":"synonym-06","query":"西米露","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:sago"],"notes":"西米页 alias 西米露"}
+{"id":"synonym-07","query":"柠檬红茶","kind":"synonym","expected_entity_ids":["milk-tea:drink:lemon-tea"],"notes":"柠檬茶页 alias 柠檬红茶"}
+{"id":"synonym-08","query":"芒果沙冰","kind":"synonym","expected_entity_ids":["milk-tea:drink:mango-smoothie"],"notes":"芒果冰沙页 alias 芒果沙冰"}
+{"id":"synonym-09","query":"芒果西米露","kind":"synonym","expected_entity_ids":["milk-tea:drink:mango-pomelo-sago"],"notes":"杨枝甘露页 alias 芒果西米露"}
+{"id":"synonym-10","query":"抹茶牛奶","kind":"synonym","expected_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"抹茶拿铁页 alias 抹茶牛奶"}
+{"id":"synonym-11","query":"椰奶西米","kind":"synonym","expected_entity_ids":["milk-tea:drink:coconut-sago"],"notes":"椰香西米露页 alias 椰奶西米"}
+{"id":"synonym-12","query":"奶茶饮品","kind":"synonym","expected_entity_ids":["milk-tea:concept:milk-tea"],"notes":"奶茶概念页 alias 奶茶饮品"}
+{"id":"synonym-13","query":"果茶","kind":"synonym","expected_entity_ids":["milk-tea:concept:fruit-tea"],"notes":"水果茶概念页 alias 果茶"}
+{"id":"synonym-14","query":"无冰","kind":"synonym","expected_entity_ids":["milk-tea:practice:no-ice"],"notes":"去冰做法页 alias 无冰"}
+{"id":"synonym-15","query":"不要冰","kind":"synonym","expected_entity_ids":["milk-tea:practice:no-ice"],"notes":"去冰做法页 alias 不要冰"}
+{"id":"synonym-16","query":"半糖少糖","kind":"synonym","expected_entity_ids":["milk-tea:practice:half-sugar"],"notes":"半糖做法页 alias 半糖少糖"}
+{"id":"synonym-17","query":"果园","kind":"synonym","expected_entity_ids":["milk-tea:brand:demo-b"],"notes":"果园茶事品牌页 alias 果园"}
+{"id":"synonym-18","query":"奶盖茶","kind":"synonym","expected_entity_ids":["milk-tea:drink:cheese-tea"],"notes":"芝士奶盖茶页 alias 奶盖茶"}
+{"id":"synonym-19","query":"手打柠檬茶","kind":"synonym","expected_entity_ids":["milk-tea:drink:lemon-tea"],"notes":"compile-entities 柠檬茶 alias 手打柠檬茶"}
+{"id":"synonym-20","query":"啵啵奶茶","kind":"synonym","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"notes":"波霸奶茶页 alias 啵啵 + 奶茶"}
+{"id":"synonym-21","query":"拿铁","kind":"synonym","expected_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"抹茶拿铁页 tag 拿铁"}
+{"id":"synonym-22","query":"抹茶","kind":"synonym","expected_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"抹茶拿铁页 tag 抹茶"}
+{"id":"synonym-23","query":"柠檬","kind":"synonym","expected_entity_ids":["milk-tea:drink:lemon-tea"],"notes":"柠檬茶页 tag 柠檬"}
+{"id":"synonym-24","query":"椰奶","kind":"synonym","expected_entity_ids":["milk-tea:drink:coconut-sago"],"notes":"椰香西米露页 tag 椰奶"}
+{"id":"synonym-25","query":"小料","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:coconut-jelly","milk-tea:ingredient:pearl","milk-tea:ingredient:red-bean","milk-tea:ingredient:sago","milk-tea:ingredient:taro-ball"],"notes":"tag 小料仅命中五个配料实体"}
+{"id":"intent-01","query":"冰的柠檬茶","kind":"intent","expected_entity_ids":["milk-tea:drink:lemon-tea"],"notes":"cold_drink expansion 冰饮 + 柠檬茶"}
+{"id":"intent-02","query":"冰的芒果冰沙","kind":"intent","expected_entity_ids":["milk-tea:drink:mango-smoothie"],"notes":"cold_drink expansion 冰饮 + 芒果冰沙"}
+{"id":"intent-03","query":"冰的抹茶拿铁","kind":"intent","expected_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"cold_drink expansion 冰饮 + 抹茶拿铁"}
+{"id":"intent-04","query":"冰的椰香西米露","kind":"intent","expected_entity_ids":["milk-tea:drink:coconut-sago"],"notes":"cold_drink expansion 冰饮 + 椰香西米露"}
+{"id":"intent-05","query":"冰的水果茶","kind":"intent","expected_entity_ids":["milk-tea:concept:fruit-tea"],"notes":"cold_drink expansion 冰饮 + 水果茶概念"}
+{"id":"intent-06","query":"冰的奶茶","kind":"intent","expected_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"cold_drink + 奶茶，两杯奶茶均相关"}
+{"id":"intent-07","query":"冰的杨枝甘露","kind":"intent","expected_entity_ids":["milk-tea:drink:mango-pomelo-sago"],"notes":"cold_drink expansion 冰饮 + 杨枝甘露"}
+{"id":"intent-08","query":"冰的珍珠奶茶","kind":"intent","expected_entity_ids":["milk-tea:drink:tapioca-milk-tea"],"notes":"cold_drink expansion 冰饮 + 珍珠奶茶"}
+{"id":"intent-09","query":"少糖的杨枝甘露","kind":"intent","expected_entity_ids":["milk-tea:drink:mango-pomelo-sago"],"notes":"low_sugar sugar≤30；杨枝甘露 SKU sugar 4-94"}
+{"id":"intent-10","query":"少糖的芝士奶盖茶","kind":"intent","expected_entity_ids":["milk-tea:drink:cheese-tea"],"notes":"low_sugar sugar≤30；芝士奶盖茶 SKU sugar 27-97"}
+{"id":"intent-11","query":"少糖的芒果冰沙","kind":"intent","expected_entity_ids":["milk-tea:drink:mango-smoothie"],"notes":"low_sugar sugar≤30；芒果冰沙 SKU sugar 2-99"}
+{"id":"intent-12","query":"低糖的抹茶拿铁","kind":"intent","expected_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"low_sugar sugar≤30；抹茶拿铁 SKU sugar 9-97"}
+{"id":"intent-13","query":"不甜的椰香西米露","kind":"intent","expected_entity_ids":["milk-tea:drink:coconut-sago"],"notes":"low_sugar sugar≤30；椰香西米露 SKU sugar 3-90"}
+{"id":"intent-14","query":"不甜的柠檬茶","kind":"intent","expected_entity_ids":["milk-tea:drink:lemon-tea"],"notes":"low_sugar sugar≤30；柠檬茶 SKU sugar 1-93"}
+{"id":"intent-15","query":"少糖的水果茶","kind":"intent","expected_entity_ids":["milk-tea:concept:fruit-tea"],"notes":"low_sugar sugar≤30；水果茶 SKU sugar 7-96"}
+{"id":"intent-16","query":"少糖的珍珠奶茶","kind":"intent","expected_entity_ids":["milk-tea:drink:tapioca-milk-tea"],"notes":"low_sugar sugar≤30；珍珠奶茶 SKU sugar 4-100"}
+{"id":"intent-17","query":"低糖的波霸奶茶","kind":"intent","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"notes":"low_sugar sugar≤30；波霸奶茶 SKU sugar 2-92"}
+{"id":"intent-18","query":"不甜的波霸奶茶","kind":"intent","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"notes":"low_sugar sugar≤30；波霸奶茶 SKU sugar 2-92"}
+{"id":"intent-19","query":"低糖的柠檬茶","kind":"intent","expected_entity_ids":["milk-tea:drink:lemon-tea"],"notes":"low_sugar sugar≤30；柠檬茶 SKU sugar 1-93"}
+{"id":"intent-20","query":"少糖的椰香西米露","kind":"intent","expected_entity_ids":["milk-tea:drink:coconut-sago"],"notes":"low_sugar sugar≤30；椰香西米露 SKU sugar 3-90"}
+{"id":"negation-01","query":"不要珍珠的柠檬茶","kind":"negation","expected_entity_ids":["milk-tea:drink:lemon-tea"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"柠檬茶 SKU 无珍珠；波霸/珍珠奶茶全部 SKU 含珍珠"}
+{"id":"negation-02","query":"不加珍珠的柠檬茶","kind":"negation","expected_entity_ids":["milk-tea:drink:lemon-tea"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"no_pearl 意图短语 不加珍珠"}
+{"id":"negation-03","query":"不要珍珠的芝士奶盖茶","kind":"negation","expected_entity_ids":["milk-tea:drink:cheese-tea"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"芝士奶盖茶 SKU 无珍珠"}
+{"id":"negation-04","query":"不加珍珠的芝士奶盖茶","kind":"negation","expected_entity_ids":["milk-tea:drink:cheese-tea"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"no_pearl 意图短语 不加珍珠"}
+{"id":"negation-05","query":"不要珍珠的椰香西米露","kind":"negation","expected_entity_ids":["milk-tea:drink:coconut-sago"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"椰香西米露 SKU 无珍珠"}
+{"id":"negation-06","query":"不加珍珠的椰香西米露","kind":"negation","expected_entity_ids":["milk-tea:drink:coconut-sago"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"no_pearl 意图短语 不加珍珠"}
+{"id":"negation-07","query":"不要珍珠的奶茶","kind":"negation","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"两杯奶茶均含珍珠，排除后零命中"}
+{"id":"negation-08","query":"不加珍珠的奶茶","kind":"negation","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"no_pearl 意图短语 不加珍珠，排除后零命中"}
+{"id":"negation-09","query":"不要椰果的柠檬茶","kind":"negation","expected_entity_ids":["milk-tea:drink:lemon-tea"],"must_exclude_entity_ids":["milk-tea:drink:coconut-sago","milk-tea:drink:mango-pomelo-sago"],"notes":"椰香西米露/杨枝甘露全部 SKU 含椰果"}
+{"id":"negation-10","query":"不要椰果的芝士奶盖茶","kind":"negation","expected_entity_ids":["milk-tea:drink:cheese-tea"],"must_exclude_entity_ids":["milk-tea:drink:coconut-sago","milk-tea:drink:mango-pomelo-sago"],"notes":"芝士奶盖茶 SKU 无椰果"}
+{"id":"negation-11","query":"不要椰果的波霸奶茶","kind":"negation","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"must_exclude_entity_ids":["milk-tea:drink:coconut-sago","milk-tea:drink:mango-pomelo-sago"],"notes":"波霸奶茶 SKU 无椰果"}
+{"id":"negation-12","query":"不要芋圆的柠檬茶","kind":"negation","expected_entity_ids":["milk-tea:drink:lemon-tea"],"must_exclude_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"抹茶拿铁全部 SKU 含芋圆"}
+{"id":"negation-13","query":"不要芋圆的波霸奶茶","kind":"negation","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"must_exclude_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"波霸奶茶 SKU 无芋圆"}
+{"id":"negation-14","query":"不要奶盖的波霸奶茶","kind":"negation","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"must_exclude_entity_ids":["milk-tea:drink:cheese-tea"],"notes":"芝士奶盖茶全部 SKU 含奶盖"}
+{"id":"negation-15","query":"不要奶盖的椰香西米露","kind":"negation","expected_entity_ids":["milk-tea:drink:coconut-sago"],"must_exclude_entity_ids":["milk-tea:drink:cheese-tea"],"notes":"椰香西米露 SKU 无奶盖"}
+{"id":"negation-16","query":"不要奶盖的杨枝甘露","kind":"negation","expected_entity_ids":["milk-tea:drink:mango-pomelo-sago"],"must_exclude_entity_ids":["milk-tea:drink:cheese-tea"],"notes":"杨枝甘露 SKU 无奶盖"}
+{"id":"negation-17","query":"不要西米的芝士奶盖茶","kind":"negation","expected_entity_ids":["milk-tea:drink:cheese-tea"],"must_exclude_entity_ids":["milk-tea:concept:fruit-tea"],"notes":"水果茶全部 SKU 含西米"}
+{"id":"negation-18","query":"没有珍珠的椰香西米露","kind":"negation","expected_entity_ids":["milk-tea:drink:coconut-sago"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"泛化否定短语（非 intents 模板）"}
+{"id":"negation-19","query":"没有椰果的柠檬茶","kind":"negation","expected_entity_ids":["milk-tea:drink:lemon-tea"],"must_exclude_entity_ids":["milk-tea:drink:coconut-sago","milk-tea:drink:mango-pomelo-sago"],"notes":"泛化否定短语（非 intents 模板）"}
+{"id":"negation-20","query":"不要珍珠的柠檬红茶","kind":"negation","expected_entity_ids":["milk-tea:drink:lemon-tea"],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"alias 柠檬红茶 + no_pearl 排除"}
+{"id":"attribute-filter-01","query":"波霸奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"filters":{"price_min":21,"price_max":22},"notes":"波霸奶茶 SKU 14.8-22.0 含 22 档；珍珠奶茶 12.2-19.7 不入区间"}
+{"id":"attribute-filter-02","query":"珍珠奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:tapioca-milk-tea"],"filters":{"price_min":12,"price_max":14},"notes":"珍珠奶茶 SKU 12.2-19.7；波霸奶茶 14.8 起不入区间"}
+{"id":"attribute-filter-03","query":"柠檬茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:lemon-tea"],"filters":{"price_max":10},"notes":"柠檬茶 SKU 8.3-14.8"}
+{"id":"attribute-filter-04","query":"芒果冰沙","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:mango-smoothie"],"filters":{"price_min":27},"notes":"芒果冰沙 SKU 20.5-28.6"}
+{"id":"attribute-filter-05","query":"杨枝甘露","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:mango-pomelo-sago"],"filters":{"price_min":22,"price_max":30},"notes":"杨枝甘露 SKU 22.5-33.1"}
+{"id":"attribute-filter-06","query":"芝士奶盖茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:cheese-tea"],"filters":{"price_max":19},"notes":"芝士奶盖茶 SKU 18.1-24.9"}
+{"id":"attribute-filter-07","query":"抹茶拿铁","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:matcha-latte"],"filters":{"price_min":24},"notes":"抹茶拿铁 SKU 17.6-24.5"}
+{"id":"attribute-filter-08","query":"椰香西米露","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:coconut-sago"],"filters":{"price_max":15},"notes":"椰香西米露 SKU 13.3-20.6"}
+{"id":"attribute-filter-09","query":"奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"filters":{"size":"中杯","sugar_max":10},"notes":"中杯仅波霸/杨枝甘露/芒果冰沙；文本匹配的奶茶中波霸 sugar 2 达标"}
+{"id":"attribute-filter-10","query":"奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:tapioca-milk-tea"],"filters":{"sugar_max":5,"size":"大杯"},"notes":"大杯中 sugar≤5：柠檬茶1/珍珠奶茶4；文本匹配的奶茶为珍珠奶茶"}
+{"id":"attribute-filter-11","query":"奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:tapioca-milk-tea"],"filters":{"sugar_min":95},"notes":"珍珠奶茶 SKU sugar 至 100；波霸奶茶至 92"}
+{"id":"attribute-filter-12","query":"柠檬茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:lemon-tea"],"filters":{"size":"大杯"},"notes":"柠檬茶 SKU 均为大杯"}
+{"id":"attribute-filter-13","query":"波霸奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:boba-milk-tea"],"filters":{"size":"中杯"},"notes":"波霸奶茶 SKU 均为中杯"}
+{"id":"attribute-filter-14","query":"杨枝甘露","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:mango-pomelo-sago"],"filters":{"size":"中杯"},"notes":"杨枝甘露 SKU 均为中杯"}
+{"id":"attribute-filter-15","query":"抹茶拿铁","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:matcha-latte"],"filters":{"size":"超大杯"},"notes":"抹茶拿铁 SKU 均为超大杯"}
+{"id":"attribute-filter-16","query":"珍珠奶茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"filters":{"ingredients":["milk-tea:ingredient:pearl"]},"notes":"波霸/珍珠奶茶全部 SKU 含珍珠"}
+{"id":"attribute-filter-17","query":"芝士奶盖茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:cheese-tea"],"filters":{"exclude_ingredients":["milk-tea:ingredient:pearl"]},"notes":"芝士奶盖茶 SKU 无珍珠"}
+{"id":"attribute-filter-18","query":"芒果冰沙","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:mango-smoothie"],"filters":{"ingredients":["milk-tea:ingredient:sago"]},"notes":"芒果冰沙部分 SKU 含西米"}
+{"id":"attribute-filter-19","query":"椰香西米露","kind":"attribute_filter","expected_entity_ids":["milk-tea:drink:coconut-sago"],"filters":{"ingredients":["milk-tea:ingredient:coconut-jelly"]},"notes":"椰香西米露全部 SKU 含椰果"}
+{"id":"attribute-filter-20","query":"水果茶","kind":"attribute_filter","expected_entity_ids":["milk-tea:concept:fruit-tea"],"filters":{"sugar_min":90,"size":"超大杯"},"notes":"水果茶 SKU sugar 至 96，超大杯"}
+{"id":"negative-01","query":"螺蛳粉奶茶","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-02","query":"佛跳墙","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-03","query":"章鱼小丸子","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-04","query":"麻辣烫","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-05","query":"高尔夫球课","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-06","query":"生煎包奶茶","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-07","query":"烤羊肉串","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-08","query":"羽绒服","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：领域外查询"}
+{"id":"negative-09","query":"不要珍珠","kind":"negative","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"排除语义：含珍珠饮品不得出现"}
+{"id":"negative-10","query":"不加珍珠","kind":"negative","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:boba-milk-tea","milk-tea:drink:tapioca-milk-tea"],"notes":"排除语义：含珍珠饮品不得出现"}
+{"id":"negative-11","query":"不要椰果","kind":"negative","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:coconut-sago","milk-tea:drink:mango-pomelo-sago"],"notes":"排除语义：椰香西米露/杨枝甘露全部 SKU 含椰果"}
+{"id":"negative-12","query":"不要芋圆","kind":"negative","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:matcha-latte"],"notes":"排除语义：抹茶拿铁全部 SKU 含芋圆"}
+{"id":"negative-13","query":"不要奶盖","kind":"negative","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:drink:cheese-tea"],"notes":"排除语义：芝士奶盖茶全部 SKU 含奶盖"}
+{"id":"negative-14","query":"不要西米","kind":"negative","expected_entity_ids":[],"must_exclude_entity_ids":["milk-tea:concept:fruit-tea"],"notes":"排除语义：水果茶全部 SKU 含西米"}
+{"id":"negative-15","query":"芒果柠檬茶","kind":"negative","expected_entity_ids":[],"notes":"零命中语义：无芒果柠檬茶实体"}

@@ -24,6 +24,7 @@
 //! - [`data`]：数据源适配器（JSONL 起步）
 //! - [`seed`]：种子 Wiki 页面解析（手工编译产物的 Markdown 契约）
 //! - [`compile`]：Step 4 编译管线契约（配置/哈希/输出契约/评分）
+//! - [`eval`]：Step 5 golden 集加载与 A/B/C 评测（批 4 起：loader/校验/hash）
 //! - [`types`]: domain types (no external dependencies)
 //! - [`traits`]: core abstract traits (depend only on `types`)
 //! - [`schema`]: SQLite DDL for the two planes + queue + logs + inverted index
@@ -32,10 +33,13 @@
 //! - [`data`]: data source adapters (starting with JSONL)
 //! - [`seed`]: seed-wiki page parsing (Markdown contract for hand-compiled artifacts)
 //! - [`compile`]: Step 4 compile-pipeline contracts (config/hash/output contract/scoring)
+//! - [`eval`]: Step 5 golden-set loading and A/B/C evaluation (batch 4 onward:
+//!   loader/validation/hash)
 
 pub mod compile;
 pub mod data;
 mod db_schema;
+pub mod eval;
 pub mod kernel;
 pub mod query_engine;
 pub mod schema;

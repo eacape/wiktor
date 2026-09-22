@@ -160,6 +160,10 @@ diesel::table! {
         edge_json -> Text,
         generation -> BigInt,
         content_hash -> Text,
+        // 0004 新增列：Step5 镜像行的代次归属（Step4 载荷 NULL 合法）。
+        // Column added in 0004: the generation owner of Step5 mirror rows
+        // (Step4 payloads legally keep NULL).
+        build_id -> Nullable<BigInt>,
     }
 }
 

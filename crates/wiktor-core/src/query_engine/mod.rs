@@ -3,10 +3,11 @@
 //! Query-engine orchestration: QUG rewrite/fallback → filter-pushdown candidate
 //! scope → FTS + vector dual recall → RRF fusion → query log. Zero-LLM by default.
 
+use crate::kernel::qug_store::{load_active_qug, QUG_STALE_PREFIX};
 use crate::kernel::SqliteKernel;
 use crate::query_engine::hybrid::{rrf_merge, whitelist_filter};
 use crate::query_engine::qug::QugGraph;
-use crate::traits::{VectorHit, VectorStore};
+use crate::traits::{DomainConfig, VectorHit, VectorStore};
 use crate::types::error::{Error, Result};
 use crate::types::{Filters, Query, RewrittenQuery, SearchHit};
 use async_trait::async_trait;
@@ -31,6 +32,15 @@ pub enum RewriteStatus {
     /// QUG 被领域配置关闭（或增益不足降级）。
     /// QUG disabled by domain config (or degraded for insufficient gain).
     Disabled,
+    /// Step5 批3：active published build 存在，但其 source_hash 与当前来源
+    /// （页清单/config/intents）不一致——图不可用，显式走混合 fallback
+    /// （spec §2 术语、§4.4；绝不静默用旧图或内存重建图顶替）。
+    /// Step5 batch 3: an active published build exists but its source_hash
+    /// disagrees with the current source (page list/config/intents) — the graph
+    /// is unusable and hybrid retrieval is the explicit fallback (spec §2 terms,
+    /// §4.4; never silently substituted by the stale or a rebuilt in-memory
+    /// graph).
+    Stale,
 }
 
 /// 查询诊断信息（CLI 展示 + 评测报告）。
@@ -74,10 +84,35 @@ pub struct QueryEngine<V: VectorStore> {
     pub kernel: Arc<SqliteKernel>,
     pub vector_store: Arc<V>,
     pub qug: Option<Arc<QugGraph>>,
+    /// Step5 批3：`qug=None` 时的 stale 标记——`true` 表示 active build 存在但
+    /// source_hash 不一致（查询诊断写 `stale`）；`false` 表示无 active build 或
+    /// QUG 显式关闭（诊断写 `disabled`）。由 [`QueryEngine::with_persistent_qug`]
+    /// / [`QueryEngine::reload_persistent_qug`] 维护；Step3 内存注入路径恒为
+    /// `false`。
+    /// Step5 batch 3: the stale flag for `qug=None` — `true` means an active
+    /// build exists but its source_hash disagrees (query diagnostics report
+    /// `stale`); `false` means no active build or QUG explicitly off
+    /// (diagnostics report `disabled`). Maintained by
+    /// [`QueryEngine::with_persistent_qug`] / [`QueryEngine::reload_persistent_qug`];
+    /// the Step3 in-memory injection path keeps it `false`.
+    pub qug_stale: bool,
     pub embedder: Arc<dyn QueryEmbedder>,
     pub collection: String,
     pub candidate_multiplier: usize,
     pub rrf_k: u32,
+    /// Step5 批5 评测 A 档开关：`true` 时 `search` 跳过整条向量路（嵌入、向量
+    /// 检索、payload 过期校验），RRF 退化为 FTS 单路名次——`1/(k+r)` 对名次
+    /// 单调，故最终排序等价纯 FTS5 BM25（tie-break page_id，确定稳定）。默认
+    /// `false`，不改变既有检索行为；QUG 语义不受本开关影响（A 档以 `qug=None`
+    /// 表达）。
+    /// Step5 batch-5 tier-A switch: when `true`, `search` skips the whole
+    /// vector path (embedding, vector search, payload staleness validation) and
+    /// RRF degenerates to the FTS-only ranking — `1/(k+r)` is monotonic in the
+    /// rank, so the final order equals pure FTS5 BM25 (deterministic page_id
+    /// tie-break). Defaults to `false` and never changes existing retrieval
+    /// behavior; QUG semantics are untouched (tier A expresses itself via
+    /// `qug=None`).
+    pub fts_only: bool,
 }
 
 impl<V: VectorStore> QueryEngine<V> {
@@ -101,11 +136,109 @@ impl<V: VectorStore> QueryEngine<V> {
             kernel,
             vector_store,
             qug,
+            qug_stale: false,
             embedder,
             collection: collection.into(),
             candidate_multiplier,
             rrf_k,
+            fts_only: false,
         })
+    }
+
+    /// Step5 批3 构造路径（spec §4.4）：QUG 图优先从持久化 active published
+    /// build 加载（`qug.enabled=false` 时保持关闭）；active 缺失/stale/加载失败
+    /// 时 `qug=None` 并记录对应状态，查询期写 `disabled`/`stale` 诊断并显式走
+    /// 混合 fallback——绝不静默用内存重建图顶替持久化图（A7）。
+    /// `intents_bytes` 由调用方在启动/reload 时冻结传入，查询线程不解析 YAML。
+    /// The Step5 batch-3 construction path (spec §4.4): the QUG graph is loaded
+    /// from the persisted active published build first (kept off when
+    /// `qug.enabled=false`); on a missing/stale/failed load, `qug=None` plus the
+    /// corresponding recorded state makes queries report `disabled`/`stale` and
+    /// fall back explicitly to hybrid retrieval — never silently substituting a
+    /// rebuilt in-memory graph for the persisted one (A7). `intents_bytes` are
+    /// frozen and passed in at startup/reload; query threads never parse YAML.
+    pub fn with_persistent_qug(
+        kernel: Arc<SqliteKernel>,
+        vector_store: Arc<V>,
+        domain: &DomainConfig,
+        intents_bytes: &[u8],
+        embedder: Arc<dyn QueryEmbedder>,
+        collection: impl Into<String>,
+        rrf_k: u32,
+    ) -> Result<Self> {
+        let mut engine = Self::new(
+            kernel,
+            vector_store,
+            None,
+            embedder,
+            collection,
+            // candidate_multiplier 与 max_depth 同源冻结 domain config。
+            // candidate_multiplier comes frozen from the same domain config as
+            // max_depth.
+            domain.qug.candidate_multiplier,
+            rrf_k,
+        )?;
+        engine.reload_persistent_qug(domain, intents_bytes);
+        Ok(engine)
+    }
+
+    /// Step5 批3 重载路径（spec §4.4："build 成功后的 reload 由调用方显式触发"）：
+    /// 重新从持久化 active build 加载图并更新 stale 状态。所有加载结果都被吸收为
+    /// 引擎状态（图缺失/stale/损坏 → `qug=None` + 对应诊断态），本方法不返回错误；
+    /// eval 等强一致路径必须直接调用 [`load_active_qug`] 并对错误失败（§4.3）。
+    /// The Step5 batch-3 reload path (spec §4.4: "the reload after a successful
+    /// build is explicitly triggered by the caller"): re-loads the graph from the
+    /// persisted active build and refreshes the stale state. Every load outcome is
+    /// absorbed into engine state (missing/stale/corrupt → `qug=None` plus the
+    /// matching diagnosis state), so this method never fails; strongly-consistent
+    /// paths such as eval must call [`load_active_qug`] directly and fail on
+    /// errors (§4.3).
+    pub fn reload_persistent_qug(&mut self, domain: &DomainConfig, intents_bytes: &[u8]) {
+        if !domain.qug.enabled {
+            // QUG 关闭：disabled 语义（Step2 兼容）。
+            // QUG off: the disabled semantics (Step2 compatibility).
+            self.qug = None;
+            self.qug_stale = false;
+            return;
+        }
+        match load_active_qug(&self.kernel, domain, intents_bytes) {
+            Ok(Some(graph)) => {
+                self.qug = Some(graph);
+                self.qug_stale = false;
+            }
+            Ok(None) => {
+                // 无 active published build → disabled 诊断（§4.4）。
+                // No active published build → the disabled diagnosis (§4.4).
+                self.qug = None;
+                self.qug_stale = false;
+            }
+            Err(e) if e.to_string().contains(QUG_STALE_PREFIX) => {
+                // hash 不一致 → stale 诊断；绝不加载旧图或内存重建图顶替（A7）。
+                // 前缀匹配沿用批2 SOURCE_CHANGED_PREFIX 的 contains 约定（Error
+                // Display 会带 "validation error: " 等变体外衣）。
+                // Hash mismatch → the stale diagnosis; the stale graph is never
+                // loaded nor substituted by an in-memory rebuild (A7). The prefix
+                // match follows batch 2's SOURCE_CHANGED_PREFIX contains()
+                // convention (the Error Display wraps the message in variants
+                // like "validation error: ").
+                tracing::warn!(error = %e, "QUG active build is stale; falling back to hybrid retrieval");
+                self.qug = None;
+                self.qug_stale = true;
+            }
+            Err(e) => {
+                // 载荷损坏/图校验失败等内部错误：普通查询显式 fallback 并记录原因
+                // （spec §4.3）；诊断归入 disabled 语义，原因走 tracing 供运维
+                // 定位（exit 4 路径由直接调用 load_active_qug 的命令承担）。
+                // Internal errors such as corrupt payloads / failed graph
+                // validation: ordinary queries fall back explicitly with the
+                // reason recorded (spec §4.3); the diagnosis falls into the
+                // disabled semantics with the cause on tracing for ops (exit-4
+                // paths belong to commands calling load_active_qug directly).
+                tracing::error!(error = %e, "QUG persistent load failed; falling back to hybrid retrieval");
+                self.qug = None;
+                self.qug_stale = false;
+            }
+        }
     }
 
     /// 执行查询全链路（Step 3 §5）。
@@ -114,13 +247,16 @@ impl<V: VectorStore> QueryEngine<V> {
         let started = Instant::now();
         self.validate(query)?;
 
-        // QUG 改写（disabled → 跳过；None → 显式 fallback）
-        // QUG rewrite (disabled → skip; None → explicit fallback)
+        // QUG 改写（disabled/stale → 显式 fallback；批3：qug=None 且 stale 标记
+        // 置位时诊断写 stale，其余 None 写 disabled）
+        // QUG rewrite (disabled/stale → explicit fallback; batch 3: qug=None with
+        // the stale flag set reports stale, any other None reports disabled)
         let (rewritten, rewrite_failure, status) = match &self.qug {
             Some(graph) => match graph.rewrite(query)? {
                 Some(r) => (Some(r), false, RewriteStatus::Applied),
                 None => (None, true, RewriteStatus::Fallback),
             },
+            None if self.qug_stale => (None, false, RewriteStatus::Stale),
             None => (None, false, RewriteStatus::Disabled),
         };
 
@@ -192,20 +328,28 @@ impl<V: VectorStore> QueryEngine<V> {
             candidates.as_deref(),
         )?;
 
-        // 向量路径（候选域白名单；Mock 供无 qdrant 环境）
-        // Vector path (candidate whitelist; Mock for qdrant-less environments)
-        let query_vec = self.embedder.embed(&terms.join(" ")).await?;
-        let vector_hits = self
-            .vector_store
-            .search(&self.collection, &query_vec, cand_k, candidates.as_deref())
-            .await?;
-        // Step 4 §10 必要边界修复：RRF 融合与截取 top_k 之前，对向量 payload 的
-        // accepted/content_hash/generation 做批量校验，丢弃旧代/隔离/不存在页与
-        // 缺版本 metadata 的 hit（A21）。
-        // Step 4 §10 boundary fix: before RRF fusion and top_k truncation, bulk-
-        // validate the vector payload's accepted/content_hash/generation and drop
-        // stale/quarantined/missing pages and hits without version metadata (A21).
-        let vector_hits = self.filter_stale_vector_hits(vector_hits)?;
+        // 向量路径（候选域白名单；Mock 供无 qdrant 环境）。`fts_only`（评测
+        // A 档）整路跳过：不嵌入、不检索、不做 payload 过期校验，vector_count
+        // 恒 0。
+        // Vector path (candidate whitelist; Mock for qdrant-less environments).
+        // `fts_only` (evaluation tier A) skips the whole path: no embedding, no
+        // search, no payload staleness validation; vector_count stays 0.
+        let vector_hits = if self.fts_only {
+            Vec::new()
+        } else {
+            let query_vec = self.embedder.embed(&terms.join(" ")).await?;
+            let vector_hits = self
+                .vector_store
+                .search(&self.collection, &query_vec, cand_k, candidates.as_deref())
+                .await?;
+            // Step 4 §10 必要边界修复：RRF 融合与截取 top_k 之前，对向量 payload 的
+            // accepted/content_hash/generation 做批量校验，丢弃旧代/隔离/不存在页与
+            // 缺版本 metadata 的 hit（A21）。
+            // Step 4 §10 boundary fix: before RRF fusion and top_k truncation, bulk-
+            // validate the vector payload's accepted/content_hash/generation and drop
+            // stale/quarantined/missing pages and hits without version metadata (A21).
+            self.filter_stale_vector_hits(vector_hits)?
+        };
         let usable_vector_count = vector_hits.len();
 
         // RRF 融合 + 候选域第二道保护

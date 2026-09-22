@@ -46,11 +46,12 @@ struct SearchRow {
     score: f32,
 }
 
-/// 本二进制支持的 schema 版本（0003_compile_pipeline，见 A22）。`open_existing`
-/// 用它拒绝旧/新 schema 而不迁移。
-/// The schema version this binary supports (0003_compile_pipeline, see A22).
-/// `open_existing` uses it to reject older/newer schemas without migrating.
-const SUPPORTED_SCHEMA_VERSION: i64 = 3;
+/// 本二进制支持的 schema 版本（0004_qug_persistence，见 A22/Step5 §5）。
+/// `open_existing` 用它拒绝旧/新 schema 而不迁移。
+/// The schema version this binary supports (0004_qug_persistence, see A22 /
+/// Step5 §5). `open_existing` uses it to reject older/newer schemas without
+/// migrating.
+const SUPPORTED_SCHEMA_VERSION: i64 = 4;
 
 /// 单列文本行（filter 全量 / 过滤下推用）。
 /// Single text-column row (used for full filter scans and filter pushdown).
@@ -203,6 +204,20 @@ impl SqliteKernel {
         let entity_key = page.entity_id.to_key();
         let entity_type = page.entity_id.entity_type.clone();
 
+        // STEP5-001：frontmatter_json 统一承载 title/aliases/tags（批1
+        // `page_frontmatter_json` 为规范写法），legacy `'{}'` 页在重跑 seed 后
+        // 恢复供边；upsert 双分支同写，重复 seed 幂等（文本确定）。
+        // STEP5-001: frontmatter_json uniformly carries title/aliases/tags (the
+        // batch-1 `page_frontmatter_json` is the canonical writer shape), so
+        // legacy `'{}'` pages regain their edges on a seed re-run; both upsert
+        // branches write it and repeated seeding is idempotent (deterministic
+        // text).
+        let frontmatter_json = crate::query_engine::qug::qug_build::page_frontmatter_json(
+            &page.title,
+            &page.aliases,
+            &page.tags,
+        )?;
+
         conn.transaction(|tx| -> Result<()> {
             // 页面 upsert（等价 INSERT OR REPLACE）
             // Page upsert (equivalent to INSERT OR REPLACE)
@@ -221,6 +236,7 @@ impl SqliteKernel {
                     pages_t::compiled_at.eq(page.metadata.compiled_at),
                     pages_t::model_version.eq(&page.metadata.model_version),
                     pages_t::embedding_model.eq(&page.metadata.embedding_model),
+                    pages_t::frontmatter_json.eq(&frontmatter_json),
                     pages_t::created_at.eq(now),
                     pages_t::updated_at.eq(now),
                 ))
@@ -239,6 +255,7 @@ impl SqliteKernel {
                     pages_t::compiled_at.eq(page.metadata.compiled_at),
                     pages_t::model_version.eq(&page.metadata.model_version),
                     pages_t::embedding_model.eq(&page.metadata.embedding_model),
+                    pages_t::frontmatter_json.eq(&frontmatter_json),
                     pages_t::updated_at.eq(now),
                 ))
                 .execute(tx)?;

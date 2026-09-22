@@ -493,8 +493,13 @@ fn serialized_artifact(page: &CompiledPage) -> Result<String> {
     Ok(json)
 }
 
-/// frontmatter JSON（§8.1：aliases/tags/完整 refs/质量策略；不混入正文）。
-/// Frontmatter JSON (§8.1: aliases/tags/full refs/quality policy; never the body).
+/// frontmatter JSON（§8.1：title/aliases/tags/完整 refs/质量策略；不混入正文）。
+/// STEP5-001（additive）：补写 title——Synonym/Hyponym 需要锚点；title 不参与
+/// content_hash/artifact_version 口径，故本次写入不改变任何既有 hash 语义。
+/// Frontmatter JSON (§8.1: title/aliases/tags/full refs/quality policy; never
+/// the body). STEP5-001 (additive): the title is now written — Synonym/Hyponym
+/// edges need the anchor; the title takes no part in the content_hash /
+/// artifact_version formulas, so this write changes no existing hash semantics.
 fn build_frontmatter_json(page: &CompiledPage, deps: &StoredDependencies) -> Result<String> {
     let evidence: &CompileEvidence = page
         .evidence
@@ -506,6 +511,7 @@ fn build_frontmatter_json(page: &CompiledPage, deps: &StoredDependencies) -> Res
         .flat_map(|s| s.refs.iter())
         .collect();
     let value = serde_json::json!({
+        "title": page.wiki.title,
         "aliases": page.wiki.aliases,
         "tags": page.wiki.tags,
         "refs": refs,

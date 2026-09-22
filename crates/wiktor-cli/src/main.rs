@@ -5,13 +5,11 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use wiktor_core::data::JsonlDataSource;
 use wiktor_core::kernel::{MockVectorStore, SqliteKernel};
-use wiktor_core::query_engine::qug::build_qug_from_wiki;
-use wiktor_core::traits::{
-    DataSource, DistanceMetric, DomainConfig, EntityStore, IntentConfig, VectorStore,
-};
+use wiktor_core::traits::{DataSource, DistanceMetric, DomainConfig, EntityStore, VectorStore};
 use wiktor_core::types::{Cursor, PublishStatus};
 use wiktor_core::{seed, FactValue, Filters, QueryEngine};
 
+mod commands;
 mod compile;
 mod embed;
 mod filter;
@@ -103,6 +101,24 @@ enum Command {
     /// 经 Step 4 编译管线把数据源编译为 Wiki 页面（显式 source/provider；统计与
     /// 退出码；只读 dry-run）。
     Compile(compile::CompileArgs),
+    /// QUG graph operations (Step 5).
+    /// QUG 图操作（Step 5）。
+    Qug {
+        #[command(subcommand)]
+        command: QugCommand,
+    },
+    /// Run the A/B/C golden evaluation and write the report trio (Step 5).
+    /// 运行 A/B/C golden 评测并写出三件套报告（Step 5）。
+    Eval(commands::eval::EvalArgs),
+}
+
+#[derive(Subcommand)]
+enum QugCommand {
+    /// Derive the five edge types from accepted pages + intents and publish the
+    /// graph transactionally (hash reuse; --force / --dry-run; exit codes D7).
+    /// 从 accepted 页与意图配置派生五类边并事务发布图（hash 命中复用；
+    /// --force / --dry-run；退出码见 D7）。
+    Build(commands::qug::BuildArgs),
 }
 
 #[derive(Subcommand)]
@@ -171,24 +187,48 @@ async fn main() -> Result<()> {
             }
         },
         Command::Compile(args) => {
-            // 退出码契约（§9）：Ok(code) → 按 code 退出；Err → anyhow 默认
+            // 退出码契约（§9/D7）：Ok(code) → 按 code 退出；Err → anyhow 默认
             // 退出码 1（数据库/内部运行故障）。
-            // Exit-code contract (§9): Ok(code) exits with code; Err takes
+            // Exit-code contract (§9/D7): Ok(code) exits with code; Err takes
             // anyhow's default exit code 1 (database/internal faults).
-            let code = compile::run(args).await?;
-            use std::io::Write as _;
-            let _ = std::io::stdout().flush();
-            if code != 0 {
-                std::process::exit(code);
-            }
+            finish(compile::run(args).await?)?
         }
+        Command::Qug { command } => match command {
+            QugCommand::Build(args) => finish(commands::qug::run(args).await?)?,
+        },
+        Command::Eval(args) => finish(commands::eval::run(args).await?)?,
+    }
+    Ok(())
+}
+
+/// 统一收尾：刷新 stdout 后按命令返回的退出码结束进程（0 = 正常返回）。
+/// 返回 Ok(code) 的命令自带退出码（step4 compile 与 Step5 build/eval 的
+/// 0/1/2/3/4 契约）；Err 走 anyhow 默认退出码 1。
+/// Shared epilogue: flush stdout, then end the process with the command-provided
+/// exit code (0 = return normally). Commands returning Ok(code) carry their own
+/// exit-code contract (step4 compile and Step5 build/eval's 0/1/2/3/4); Err
+/// takes anyhow's default exit code 1.
+fn finish(code: i32) -> Result<()> {
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    if code != 0 {
+        std::process::exit(code);
     }
     Ok(())
 }
 
 /// Seed knowledge pages + fact-plane data.
 /// 导入知识页面与事实平面数据。
-async fn cmd_seed(db: &Path, domain_yaml: &Path, pages_dir: Option<&Path>) -> Result<()> {
+///
+/// pub(crate)：Step5 批6 的 CLI 集成测试复用同一条 seed 路径灌库，保证测试与
+/// 生产 seed 语义一致。
+/// pub(crate): the Step5 batch-6 CLI integration tests reuse the same seeding
+/// path so tests match the production seed semantics.
+pub(crate) async fn cmd_seed(
+    db: &Path,
+    domain_yaml: &Path,
+    pages_dir: Option<&Path>,
+) -> Result<()> {
     let domain_dir = domain_yaml
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -284,31 +324,6 @@ async fn cmd_search(
         None => Filters::empty(),
     };
 
-    // QUG 图（可选）：从 domain.yaml + intents.yaml + seed-wiki 页面构建。
-    // `qug.enabled=false` 时禁用（传 None → 诊断状态 Disabled）。
-    // QUG graph (optional): built from domain.yaml + intents.yaml + seed-wiki pages.
-    // `qug.enabled=false` disables it (None → diagnostics report Disabled).
-    let (qug, candidate_multiplier) = match domain_yaml {
-        Some(path) => {
-            let config = load_domain_config(path)?;
-            let domain_dir = path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            let intents = load_intents(&config, &domain_dir)?;
-            let wiki_pages = load_seed_pages(&domain_dir.join("seed-wiki"))?;
-            let built = build_qug_from_wiki(&wiki_pages, &config, &intents)?;
-            let mult = config.qug.candidate_multiplier;
-            let qug = if config.qug.enabled {
-                Some(built.graph)
-            } else {
-                None
-            };
-            (qug, mult)
-        }
-        None => (None, 5),
-    };
-
     // 向量路径：--no-vector 也建空集合（引擎向量路返回 0 命中、RRF 只剩 FTS，
     // 诊断仍标记 vector=0），避免 Mock 对缺失集合报错。
     // Vector path: `--no-vector` still creates an empty collection (the vector path
@@ -320,16 +335,69 @@ async fn cmd_search(
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let embedder = Arc::new(embed::DeterministicEmbedder::new(embed::DIM));
-    let engine = QueryEngine::new(
-        kernel.clone(),
-        vector_store.clone(),
-        qug,
-        embedder,
-        "milk-tea",
-        candidate_multiplier,
-        60,
-    )
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    // QUG 图（Step5 批3）：优先从持久化 active published build 加载（审计代次，
+    // 含 seed 与 Step4 编译页边）；无 active / stale / 加载失败 → qug=None，查询
+    // 诊断写 disabled/stale 并显式走混合 fallback。绝不静默用 seed-wiki 内存重建
+    // 图顶替持久化图（A7：不得旧图临时顶替；且 seed-wiki 内存路径不含 Step4 编
+    // 译页边，会与审计代次漂移）。intents.yaml 以原始 bytes 冻结传入，查询路径
+    // 不解析 YAML。
+    // QUG graph (Step5 batch 3): load from the persisted active published build
+    // first (the audited generation, covering both seed and Step4 compiled-page
+    // edges); missing/stale/failed load → qug=None, query diagnostics report
+    // disabled/stale and hybrid retrieval is the explicit fallback. Never
+    // silently rebuild the graph in memory from seed-wiki over the persisted one
+    // (A7: the stale graph must never be substituted, and the seed-wiki memory
+    // path lacks Step4 compiled-page edges so it would drift from the audited
+    // generation). intents.yaml is frozen and passed in as raw bytes; the query
+    // path never parses YAML.
+    let (engine, qug_enabled) = match domain_yaml {
+        Some(path) => {
+            let config = load_domain_config(path)?;
+            let domain_dir = path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            let intents_bytes = load_intents_bytes(&config, &domain_dir)?;
+            let enabled = config.qug.enabled;
+            let engine = QueryEngine::with_persistent_qug(
+                kernel.clone(),
+                vector_store.clone(),
+                &config,
+                &intents_bytes,
+                embedder,
+                "milk-tea",
+                60,
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+            (engine, enabled)
+        }
+        None => (
+            QueryEngine::new(
+                kernel.clone(),
+                vector_store.clone(),
+                None,
+                embedder,
+                "milk-tea",
+                5,
+                60,
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            false,
+        ),
+    };
+
+    // 运维提示（不改变退出语义）：QUG 不可用时的原因线索；`wiktor qug build`
+    // 由 Step5 CLI 批次提供。
+    // Ops hint (does not change exit semantics): why QUG is unavailable; the
+    // `wiktor qug build` command arrives with the Step5 CLI batch.
+    let qug_hint = if engine.qug_stale {
+        Some("active QUG build is stale (source changed); run `wiktor qug build` to refresh")
+    } else if qug_enabled && engine.qug.is_none() {
+        Some("no active QUG build; run `wiktor qug build` to publish one")
+    } else {
+        None
+    };
 
     let query = wiktor_core::types::Query {
         text: text.to_string(),
@@ -390,8 +458,12 @@ async fn cmd_search(
         wiktor_core::query_engine::RewriteStatus::Applied => "applied",
         wiktor_core::query_engine::RewriteStatus::Fallback => "fallback (no matching QUG path)",
         wiktor_core::query_engine::RewriteStatus::Disabled => "disabled",
+        wiktor_core::query_engine::RewriteStatus::Stale => "stale (active QUG build out of date)",
     };
     println!("rewrite: {status}");
+    if let Some(hint) = &qug_hint {
+        println!("hint: {hint}");
+    }
     if let Some(r) = &result.rewritten {
         println!("expanded_terms: {}", r.expanded_terms.join(", "));
     } else {
@@ -438,41 +510,19 @@ fn load_domain_config(path: &Path) -> Result<DomainConfig> {
     serde_yaml_ng::from_str(&yaml_text).map_err(|e| anyhow!("parse domain.yaml: {e}"))
 }
 
-/// 加载并解析 intents.yaml（qug.intent_templates 指向的文件；相对 domain 目录解析）。
-/// Loads and parses intents.yaml (the file pointed to by qug.intent_templates;
-/// resolved relative to the domain directory).
-fn load_intents(config: &DomainConfig, domain_dir: &Path) -> Result<IntentConfig> {
+/// 读取 intents.yaml 原始 bytes（qug.intent_templates 指向的文件；相对 domain
+/// 目录解析）。Step5 批3 查询路径冻结原文传给持久化加载器（参与 source_hash），
+/// 不再在查询侧解析 YAML（spec §4.4）。
+/// Reads the raw intents.yaml bytes (the file pointed to by qug.intent_templates,
+/// resolved relative to the domain directory). The Step5 batch-3 query path
+/// freezes the raw bytes for the persistent loader (they participate in
+/// source_hash) and no longer parses YAML on the query side (spec §4.4).
+fn load_intents_bytes(config: &DomainConfig, domain_dir: &Path) -> Result<Vec<u8>> {
     match &config.qug.intent_templates {
         Some(rel) => {
             let path = domain_dir.join(rel);
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("read intents.yaml {}", path.display()))?;
-            serde_yaml_ng::from_str(&text).map_err(|e| anyhow!("parse intents.yaml: {e}"))
+            std::fs::read(&path).with_context(|| format!("read intents.yaml {}", path.display()))
         }
-        None => Ok(IntentConfig {
-            version: "0.0.0".into(),
-            intents: Vec::new(),
-        }),
+        None => Ok(Vec::new()),
     }
-}
-
-/// 读取 seed-wiki 目录下全部 Markdown 页面。
-/// Reads all Markdown pages in the seed-wiki directory.
-fn load_seed_pages(dir: &Path) -> Result<Vec<wiktor_core::types::WikiPage>> {
-    let mut md_files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .with_context(|| format!("read seed-wiki dir {}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
-        .collect();
-    md_files.sort();
-    let mut pages = Vec::new();
-    for path in &md_files {
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        pages.push(
-            seed::parse_page(&content)
-                .with_context(|| format!("parse seed page {}", path.display()))?,
-        );
-    }
-    Ok(pages)
 }

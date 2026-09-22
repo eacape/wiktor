@@ -20,9 +20,20 @@
 pub(crate) mod compile_store;
 mod mock_vector;
 mod qdrant_vector;
+// pub：Step 5 批2 的 QUG 存储层（QugStore trait + SqliteKernel 实现 +
+// build_and_publish_qug 编排），供 CLI 后续批次直接使用；query_engine 不依赖
+// diesel，故编排落在本模块（spec step5 §4.1）。批3 追加运行时加载入口
+// load_active_qug 与 stale 稳定前缀。
+// pub: the Step 5 batch-2 QUG storage layer (QugStore trait + SqliteKernel
+// implementation + the build_and_publish_qug orchestration) for later CLI
+// batches; query_engine stays diesel-free, so the orchestration lives here
+// (spec step5 §4.1). Batch 3 adds the runtime load entry load_active_qug and
+// the stale stable prefix.
+pub mod qug_store;
 mod sqlite;
 
 pub use mock_vector::MockVectorStore;
+pub use qug_store::{build_and_publish_qug, load_active_qug, QugStore, QUG_STALE_PREFIX};
 pub use sqlite::SqliteKernel;
 
 #[cfg(feature = "vector-qdrant")]

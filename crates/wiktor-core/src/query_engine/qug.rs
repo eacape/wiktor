@@ -50,6 +50,7 @@ pub struct QugNode {
 /// QUG 图：petgraph DiGraph + phrase→NodeIndex 索引（HashMap 只做索引，不承担图语义）。
 /// QUG graph: petgraph DiGraph + a phrase→NodeIndex index (the HashMap is only an
 /// index; it carries no graph semantics).
+#[derive(Debug)]
 pub struct QugGraph {
     pub graph: DiGraph<QugNode, QugEdge>,
     pub by_phrase: HashMap<String, NodeIndex>,
@@ -788,3 +789,9 @@ pub fn build_qug_from_wiki(
         intents,
     })
 }
+
+/// Step 5 批1：五类边持久化前的纯函数构建层（类型契约 / hash / 硬上限 / 去重），
+/// 见 `docs/design/step5-qug-build.md` §4.2。
+/// Step 5 batch 1: pure-function build layer before persistence (type contract /
+/// hashing / hard caps / dedup), see docs/design/step5-qug-build.md §4.2.
+pub mod qug_build;

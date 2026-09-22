@@ -21,9 +21,18 @@ use wiktor_core::types::{Cursor, FilterCondition, Filters, PublishStatus};
 
 /// Golden query record (from golden-queries.jsonl).
 /// golden 查询记录（来自 golden-queries.jsonl）。
+///
+/// Step5 批 4 起文件混有新格式记录（id/kind/expected_entity_ids，无
+/// expected_hits）；它们由 Step5 评测器（批 5）执行，此处解析宽容并在
+/// runner 中跳过（期望为空即视为新格式记录）。
+/// Since Step5 batch 4 the file mixes in new-format records
+/// (id/kind/expected_entity_ids, no expected_hits); the Step5 evaluator
+/// (batch 5) runs those. Parsing stays lenient here and the runner skips
+/// them (an empty expectation marks a new-format record).
 #[derive(Debug, Deserialize)]
 struct Golden {
     query: String,
+    #[serde(default)]
     expected_hits: Vec<String>,
     #[serde(default)]
     filters: GoldenFilters,
@@ -170,13 +179,14 @@ async fn golden_queries_pass_rate() {
     );
     assert!(counts["fact_refs"] > 0);
 
-    // load goldens
-    // 加载 golden
+    // load goldens; only legacy-format records (expected_hits) run here.
+    // 加载 golden；仅 legacy 格式记录（expected_hits）在此执行。
     let goldens: Vec<Golden> = std::fs::read_to_string(domain_dir.join("golden-queries.jsonl"))
         .unwrap()
         .lines()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).unwrap())
+        .map(|l| serde_json::from_str::<Golden>(l).unwrap())
+        .filter(|g| !g.expected_hits.is_empty())
         .collect();
     assert!(
         goldens.len() >= 20,
