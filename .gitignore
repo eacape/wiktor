@@ -3,6 +3,7 @@
 *.db-wal
 *.db-shm
 .DS_Store
+._*
 .env
 *.key
 
