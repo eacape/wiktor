@@ -12,6 +12,13 @@
 //!   且无 ref issue。比值以 f64 中间计算后转 f32，无 epsilon；NaN/Inf 由
 //!   [`validate_score_finite`] 拒绝，禁止 clamp 隐藏插件 bug。
 //!
+//! Step8 §6.2 扩展（偏差 STEP8-013）：`RuleScorer` 新增
+//! [`RuleScorer::score_with_consistency`] 扩展方法（默认实现 = 旧四维路径，
+//! 既有 executor 四维调用零改动）；`RuleBasedScorer` 覆写为五维组合——
+//! consistency=None 时 overall 仍为四维平均，`Some(s)` 时五维等权，且
+//! `s < min_consistency` 产生稳定 issue `CONSISTENCY_BELOW_THRESHOLD` 不得
+//! accepted。
+//!
 //! Semantics (§6):
 //! - U: non-empty string-leaf pointers in the knowledge snapshot (one per string
 //!   field, one per non-empty reflist element); C is the subset of U hit by valid,
@@ -25,8 +32,17 @@
 //!   citation=1 AND no ref issue. Ratios are computed in f64 then converted to
 //!   f32 with no epsilon; NaN/Inf is rejected by [`validate_score_finite`] —
 //!   never clamped to hide plugin bugs.
+//!
+//! Step8 §6.2 extension (deviation STEP8-013): `RuleScorer` gains the
+//! [`RuleScorer::score_with_consistency`] extension method (default
+//! implementation = the legacy four-dim path, so the existing executor call site
+//! is untouched); `RuleBasedScorer` overrides it with the five-dim combination —
+//! consistency=None keeps the four-dim overall, `Some(s)` yields the five-dim
+//! equal-weight average, and `s < min_consistency` raises the stable issue
+//! `CONSISTENCY_BELOW_THRESHOLD` so the page can never be accepted.
 
 use crate::compile::config::CompilePolicy;
+use crate::compile::consistency::{ConsistencyReport, CONSISTENCY_BELOW_THRESHOLD};
 use crate::compile::contract::{QualityIssue, RefReport};
 use crate::types::error::{Error, Result};
 use crate::types::{CompileContext, CompiledPage, QualityScore, RawEntity};
@@ -44,6 +60,17 @@ pub struct ScoreReport {
 
 /// 四规则评分器（§6 签名；executor 在所有 Compiler 实现之后调用）。
 /// The rule scorer (§6 signature; the executor calls it after every Compiler).
+///
+/// Step8 §6.2（偏差 STEP8-013）：扩展方法
+/// [`RuleScorer::score_with_consistency`] 以「带默认实现 = 旧四维路径」的方式
+/// 挂在本 trait 上，而非独立 `QualityScorerV2` trait——既有实现（只覆写
+/// `score`）自动保持 Step4 行为，B3 接状态机时 executor 改点最小。
+/// Step8 §6.2 (deviation STEP8-013): the extension method
+/// [`RuleScorer::score_with_consistency`] hangs off this trait with a default
+/// implementation equal to the legacy four-dim path instead of a separate
+/// `QualityScorerV2` trait — existing implementations that only override `score`
+/// keep Step4 behavior automatically, minimizing the executor delta when B3
+/// wires the state machine.
 pub trait RuleScorer: Send + Sync {
     fn score(
         &self,
@@ -54,6 +81,32 @@ pub trait RuleScorer: Send + Sync {
         ctx: &CompileContext,
         policy: &CompilePolicy,
     ) -> ScoreReport;
+
+    /// Step8 §6.2 扩展入口：在四维之上组合仲裁报告（`consistency.score` 为
+    /// `None` 时与 [`RuleScorer::score`] 等价）。
+    /// Step8 §6.2 extension entry: combines the arbitration report on top of the
+    /// four dimensions (with `consistency.score` of `None` this equals
+    /// [`RuleScorer::score`]).
+    // 参数形状由 spec §6.2 签名逐字固定（self + 7 参），不做收敛重构。
+    // The parameter shape is fixed verbatim by the §6.2 signature (self + 7
+    // args); no collapsing refactor.
+    #[allow(clippy::too_many_arguments)]
+    fn score_with_consistency(
+        &self,
+        source: &RawEntity,
+        page: Option<&CompiledPage>,
+        refs: &RefReport,
+        schema_valid: bool,
+        consistency: &ConsistencyReport,
+        ctx: &CompileContext,
+        policy: &CompilePolicy,
+    ) -> ScoreReport {
+        // 默认实现 = 旧四维路径：未适配一致性的实现行为逐字节不变。
+        // Default = the legacy four-dim path: unadapted implementations stay
+        // byte-identical.
+        let _ = consistency;
+        self.score(source, page, refs, schema_valid, ctx, policy)
+    }
 }
 
 /// 内置规则评分器（scorer_version=rules-v1 的参考实现）。
@@ -70,6 +123,11 @@ impl RuleBasedScorer {
 }
 
 impl RuleScorer for RuleBasedScorer {
+    /// 旧四维入口（Step4 兼容）：以「无可比较证据」的空报告走 V2 组合——
+    /// 空报告 score=None，四维逻辑单源，行为逐字节不变。
+    /// The legacy four-dim entry (Step4 compatible): routes through the V2
+    /// combination with an empty no-comparison report — score=None, the four-dim
+    /// logic stays single-source and byte-identical.
     fn score(
         &self,
         source: &RawEntity,
@@ -79,10 +137,55 @@ impl RuleScorer for RuleBasedScorer {
         ctx: &CompileContext,
         policy: &CompilePolicy,
     ) -> ScoreReport {
-        let issues = refs.issues.clone();
-        // 无法解码（page=None）或结构失败：四维全零，仍产出可观测报告。
-        // Undecodable (page=None) or structural failure: all four dimensions zero,
-        // still producing an observable report.
+        self.score_with_consistency(
+            source,
+            page,
+            refs,
+            schema_valid,
+            &ConsistencyReport::default(),
+            ctx,
+            policy,
+        )
+    }
+
+    /// Step8 §6.2：四维按 Step4 公式；consistency=None → 四维 overall；
+    /// Some(s) → 五维等权（由 [`QualityScore::overall`] 单源实现）；且
+    /// `s < min_consistency` 追加稳定 issue `CONSISTENCY_BELOW_THRESHOLD`，
+    /// issues 非空即拒绝发布（D4）。
+    /// Step8 §6.2: the four dimensions follow the Step4 formulas;
+    /// consistency=None → four-dim overall; Some(s) → five-dim equal weight
+    /// (single-sourced in [`QualityScore::overall`]); and `s < min_consistency`
+    /// appends the stable issue `CONSISTENCY_BELOW_THRESHOLD` — a non-empty issue
+    /// list rejects publishing (D4).
+    #[allow(clippy::too_many_arguments)]
+    fn score_with_consistency(
+        &self,
+        source: &RawEntity,
+        page: Option<&CompiledPage>,
+        refs: &RefReport,
+        schema_valid: bool,
+        consistency: &ConsistencyReport,
+        ctx: &CompileContext,
+        policy: &CompilePolicy,
+    ) -> ScoreReport {
+        let mut issues = refs.issues.clone();
+        // D4：有可比证据且低于阈值 → 稳定 issue（无论四维是否可算都记录）。
+        // D4: comparable evidence below the floor → the stable issue (recorded
+        // whether or not the four dimensions are computable).
+        if let Some(s) = consistency.score {
+            if s < policy.consistency.min_consistency {
+                issues.push(QualityIssue {
+                    code: CONSISTENCY_BELOW_THRESHOLD.to_string(),
+                    path: "/consistency".to_string(),
+                });
+            }
+        }
+        // 无法解码（page=None）或结构失败：四维全零，仍产出可观测报告；一致性
+        // 得分原样保留（结构失败页本身无可比较证据，正常管线不会出现 Some）。
+        // Undecodable (page=None) or structural failure: all four dimensions
+        // zero, still producing an observable report; the consistency score is
+        // carried through verbatim (a structurally broken page has no comparable
+        // evidence, so Some never occurs in the real pipeline).
         if page.is_none() || !schema_valid {
             return ScoreReport {
                 quality: QualityScore {
@@ -90,7 +193,7 @@ impl RuleScorer for RuleBasedScorer {
                     citation: 0.0,
                     schema_compliance: 0.0,
                     density: 0.0,
-                    consistency: None,
+                    consistency: consistency.score,
                 },
                 issues,
                 accepted: false,
@@ -136,14 +239,16 @@ impl RuleScorer for RuleBasedScorer {
         let schema_compliance = 1.0f64;
 
         // f64 中间计算后转 f32；比较使用现有 f32 API，无 epsilon（§6）。
+        // consistency 原样进入 QualityScore（None 时 overall 走四维平均）。
         // f64 intermediates converted to f32; comparisons use the existing f32 API
-        // with no epsilon (§6).
+        // with no epsilon (§6). consistency flows into QualityScore verbatim
+        // (None keeps the four-dim overall).
         let quality = QualityScore {
             coverage: coverage as f32,
             citation: citation as f32,
             schema_compliance: schema_compliance as f32,
             density: density as f32,
-            consistency: None,
+            consistency: consistency.score,
         };
         let accepted = passes_gates(&quality, &issues, ctx, policy);
         ScoreReport {
@@ -198,9 +303,12 @@ fn coverable_units(source: &RawEntity) -> BTreeSet<String> {
 }
 
 /// executor 发布前的有限性检查：任何 NaN/Inf/越界分数都是内部错误（§6，
-/// 禁止 clamp 隐藏插件 bug）。
+/// 禁止 clamp 隐藏插件 bug）。Step8 §6.2：consistency 为 `Some(s)` 时同样
+/// 必须 finite 且在 [0,1]，越界按内部/数据错误拒绝（fail-closed）。
 /// Finiteness gate before publishing: any NaN/Inf/out-of-range score is an
-/// internal error (§6; never clamp to hide plugin bugs).
+/// internal error (§6; never clamp to hide plugin bugs). Step8 §6.2: a
+/// `Some(s)` consistency must likewise be finite within [0,1]; violations are
+/// rejected as internal/data errors (fail-closed).
 pub fn validate_score_finite(report: &ScoreReport) -> Result<()> {
     let q = report.quality;
     for (name, v) in [
@@ -212,6 +320,13 @@ pub fn validate_score_finite(report: &ScoreReport) -> Result<()> {
         if !(v.is_finite() && (0.0..=1.0).contains(&v)) {
             return Err(Error::Internal(format!(
                 "scorer produced non-finite or out-of-range {name}: {v}"
+            )));
+        }
+    }
+    if let Some(s) = q.consistency {
+        if !(s.is_finite() && (0.0..=1.0).contains(&s)) {
+            return Err(Error::Internal(format!(
+                "scorer produced non-finite or out-of-range consistency: {s}"
             )));
         }
     }
@@ -292,6 +407,8 @@ mod tests {
             embedding_model: "none".into(),
             quality_threshold: threshold,
             require_source_refs: true,
+            schema_version: None,
+            prompt_version: None,
         }
     }
 
@@ -529,5 +646,227 @@ mod tests {
             validate_score_finite(&report),
             Err(Error::Internal(_))
         ));
+        // Step8 §6.2：consistency Some(s) 越界同样拒绝（fail-closed）。
+        // Step8 §6.2: an out-of-range consistency Some(s) is rejected too
+        // (fail-closed).
+        report.quality.coverage = 0.5;
+        report.quality.consistency = Some(f32::NAN);
+        assert!(matches!(
+            validate_score_finite(&report),
+            Err(Error::Internal(_))
+        ));
+        report.quality.consistency = Some(1.5);
+        assert!(matches!(
+            validate_score_finite(&report),
+            Err(Error::Internal(_))
+        ));
+        report.quality.consistency = Some(0.0);
+        assert!(validate_score_finite(&report).is_ok());
+    }
+
+    // —— Step8 §6.2 评分组合（A6/A3）/ Step8 §6.2 score combination (A6/A3) ——
+
+    use crate::compile::config::ConsistencyPolicy;
+    use crate::compile::consistency::{ConsistencyArbiter, ConsistencyReport};
+    use std::sync::Arc;
+
+    struct PresetArbiter {
+        report: ConsistencyReport,
+    }
+
+    impl ConsistencyArbiter for PresetArbiter {
+        fn arbitrate(
+            &self,
+            _candidate: &CompiledPage,
+            _related: &[CompiledPage],
+            _policy: &crate::compile::config::ConsistencyPolicy,
+        ) -> crate::types::error::Result<ConsistencyReport> {
+            Ok(self.report.clone())
+        }
+    }
+
+    fn report_with(score: Option<f32>) -> ConsistencyReport {
+        ConsistencyReport {
+            score,
+            compared_claims: u32::from(score.is_some()),
+            findings: vec![],
+            candidate_count: 0,
+        }
+    }
+
+    // A6（第一性）：overall() None → 四维平均逐字节不变；Some(s) → 五维等权。
+    // A6 (first principles): overall() with None is the byte-identical four-dim
+    // average; with Some(s) the five-dim equal-weight average.
+    #[test]
+    fn overall_branches_on_consistency() {
+        let dims = (0.6f32, 1.0f32, 1.0f32, 0.4f32);
+        let none = QualityScore {
+            coverage: dims.0,
+            citation: dims.1,
+            schema_compliance: dims.2,
+            density: dims.3,
+            consistency: None,
+        };
+        assert_eq!(none.overall(), (dims.0 + dims.1 + dims.2 + dims.3) / 4.0);
+        let some = QualityScore {
+            consistency: Some(1.0),
+            ..none
+        };
+        assert_eq!(
+            some.overall(),
+            (dims.0 + dims.1 + dims.2 + dims.3 + 1.0) / 5.0
+        );
+    }
+
+    // A6/A3：fake arbiter（trait 对象）产出 None/1/0 报告流入评分组合器：
+    // None → overall=旧四维平均且 accepted；Some(1) → 五维平均且 accepted；
+    // Some(0) → 低于 min_consistency=1.0 产生 CONSISTENCY_BELOW_THRESHOLD 且
+    // 不得 accepted；0/1 精确表达。
+    // A6/A3: a fake arbiter (trait object) feeds None/1/0 reports into the
+    // combinator: None → overall equals the legacy four-dim average and accepted;
+    // Some(1) → the five-dim average and accepted; Some(0) → below
+    // min_consistency=1.0 raises CONSISTENCY_BELOW_THRESHOLD and can never be
+    // accepted; 0/1 are expressed exactly.
+    #[test]
+    fn fake_arbiter_reports_flow_through_scorer() {
+        let src = source();
+        let ev = evidence("## 概述\n\n- 啵啵[[ref:r1]]\n- 珍珠[[ref:r2]]\n");
+        let refs = DefaultSourceRefValidator.validate(&src, &ev, true);
+        assert!(refs.issues.is_empty());
+        let p = page(&ev);
+        let ctx = context(0.75);
+        let policy = CompilePolicy::default();
+        let scorer = RuleBasedScorer;
+        // 四维全 1（正引用满分路径）。
+        // All four dimensions are 1 (the positive-refs full-score path).
+        assert_eq!(
+            scorer
+                .score(&src, Some(&p), &refs, true, &ctx, &policy)
+                .quality
+                .coverage,
+            1.0
+        );
+
+        // None：与旧四维入口 score() 逐字节一致。
+        // None: byte-identical to the legacy score() entry.
+        let arb_none = Arc::new(PresetArbiter {
+            report: report_with(None),
+        }) as Arc<dyn ConsistencyArbiter>;
+        let r_none = arb_none.arbitrate(&p, &[], &policy.consistency).unwrap();
+        let via_v2 =
+            scorer.score_with_consistency(&src, Some(&p), &refs, true, &r_none, &ctx, &policy);
+        let legacy = scorer.score(&src, Some(&p), &refs, true, &ctx, &policy);
+        assert_eq!(via_v2, legacy);
+        assert_eq!(via_v2.quality.consistency, None);
+        assert_eq!(via_v2.quality.overall(), 1.0);
+        assert!(via_v2.accepted);
+
+        // Some(1)：五维平均 = 1，accepted，0/1 精确表达。
+        // Some(1): the five-dim average is 1, accepted, expressed exactly.
+        let arb_one = Arc::new(PresetArbiter {
+            report: report_with(Some(1.0)),
+        }) as Arc<dyn ConsistencyArbiter>;
+        let r_one = arb_one.arbitrate(&p, &[], &policy.consistency).unwrap();
+        let via_one =
+            scorer.score_with_consistency(&src, Some(&p), &refs, true, &r_one, &ctx, &policy);
+        assert_eq!(via_one.quality.consistency, Some(1.0));
+        assert_eq!(via_one.quality.overall(), 1.0);
+        assert!(via_one.issues.is_empty());
+        assert!(via_one.accepted);
+        assert!(validate_score_finite(&via_one).is_ok());
+
+        // Some(0)：五维平均 0.8>0.75 但低于 min_consistency → 稳定 issue、不得
+        // accepted。
+        // Some(0): the five-dim average 0.8>0.75 but below min_consistency → the
+        // stable issue and never accepted.
+        let arb_zero = Arc::new(PresetArbiter {
+            report: report_with(Some(0.0)),
+        }) as Arc<dyn ConsistencyArbiter>;
+        let r_zero = arb_zero.arbitrate(&p, &[], &policy.consistency).unwrap();
+        let via_zero =
+            scorer.score_with_consistency(&src, Some(&p), &refs, true, &r_zero, &ctx, &policy);
+        assert_eq!(via_zero.quality.consistency, Some(0.0));
+        assert_eq!(via_zero.quality.overall(), 0.8);
+        assert!(via_zero
+            .issues
+            .iter()
+            .any(|i| i.code == "CONSISTENCY_BELOW_THRESHOLD"));
+        assert!(!via_zero.accepted);
+        assert!(validate_score_finite(&via_zero).is_ok());
+    }
+
+    // A6：Some(s) 高于自定义阈值（min_consistency=0.5）→ 无 issue、accepted；
+    // 五维 overall 参与阈值门槛。
+    // A6: Some(s) above a custom floor (min_consistency=0.5) → no issue, accepted;
+    // the five-dim overall participates in the threshold gate.
+    #[test]
+    fn consistency_above_custom_floor_is_accepted() {
+        let src = source();
+        let ev = evidence("## 概述\n\n- 啵啵[[ref:r1]]\n- 珍珠[[ref:r2]]\n");
+        let refs = DefaultSourceRefValidator.validate(&src, &ev, true);
+        let p = page(&ev);
+        let ctx = context(0.75);
+        let policy = CompilePolicy {
+            consistency: ConsistencyPolicy {
+                min_consistency: 0.5,
+                ..ConsistencyPolicy::default()
+            },
+            ..CompilePolicy::default()
+        };
+        let report = RuleBasedScorer.score_with_consistency(
+            &src,
+            Some(&p),
+            &refs,
+            true,
+            &report_with(Some(0.6)),
+            &ctx,
+            &policy,
+        );
+        assert_eq!(report.quality.consistency, Some(0.6));
+        // 五维：(1+1+1+1+0.6)/5 = 0.92。
+        // Five dims: (1+1+1+1+0.6)/5 = 0.92.
+        assert!((report.quality.overall() - 0.92).abs() < 1e-6);
+        assert!(report.issues.is_empty());
+        assert!(report.accepted);
+    }
+
+    // A3（scorer 侧）：只覆写 score() 的既有实现经默认 score_with_consistency
+    // 保持旧四维路径（consistency 参数不影响结果）。
+    // A3 (scorer side): an existing implementation that only overrides score()
+    // keeps the legacy four-dim path through the default score_with_consistency
+    // (the consistency parameter never affects the result).
+    #[test]
+    fn legacy_scorer_default_method_ignores_consistency() {
+        struct LegacyOnly;
+        impl RuleScorer for LegacyOnly {
+            fn score(
+                &self,
+                source: &RawEntity,
+                page: Option<&CompiledPage>,
+                refs: &RefReport,
+                schema_valid: bool,
+                ctx: &CompileContext,
+                policy: &CompilePolicy,
+            ) -> ScoreReport {
+                RuleBasedScorer.score(source, page, refs, schema_valid, ctx, policy)
+            }
+        }
+        let src = source();
+        let ev = evidence("## 概述\n\n- 啵啵[[ref:r1]]\n- 珍珠[[ref:r2]]\n");
+        let refs = DefaultSourceRefValidator.validate(&src, &ev, true);
+        let ctx = context(0.75);
+        let policy = CompilePolicy::default();
+        let legacy = LegacyOnly.score(&src, Some(&page(&ev)), &refs, true, &ctx, &policy);
+        let via_default = LegacyOnly.score_with_consistency(
+            &src,
+            Some(&page(&ev)),
+            &refs,
+            true,
+            &report_with(Some(0.0)),
+            &ctx,
+            &policy,
+        );
+        assert_eq!(legacy, via_default);
+        assert_eq!(via_default.quality.consistency, None);
     }
 }

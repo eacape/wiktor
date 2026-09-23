@@ -10,8 +10,15 @@
 //!   → `write_report_files` 到 `--out-dir`（默认 ./feedback-reports；写盘失败 →
 //!   1）→ 人类摘要 / `--json` 单份报告 JSON（stdout 只一份 JSON）；
 //! - `list`：limit 1..=1000（越界 → 2）→ 表格或 `--json` 数组；
-//! - `review approve/ignore`：透传 kernel 批4 转换 —— 非 pending / subject 缺
-//!   字段 / 协议错误 → Validation → 3；存储错误 → 1。
+//! - `review approve/ignore`：透传 kernel 审核转换——非 pending / subject 缺
+//!   字段 / 协议错误 → Validation → 3；存储错误 → 1。Step8 批 B6（§7/§8，
+//!   A16/A17）追加语义：approve `compile_dead_letter` 从 canonical subject 解析
+//!   task_id、要求任务 dead，以原任务快照 force 新建 epoch admission 并回填
+//!   task_id（失败整体回滚）；approve `consistency_conflict` 只能批准为一次新
+//!   的 supplemental_compile 审核转换（建议行创建并批准 + force admission，不能
+//!   直接发布）；approve `compatibility_conflict` 仅审计批准（不建任务、不能绕
+//!   过 preflight）；三者均可 ignore；未知/其余 action fail-closed（Validation
+//!   → 3）。
 //!
 //! `wiktor feedback analyze|list|review` (Step 6 spec `step6-feedback-loop.md`
 //! §3 D11/D12, §8 CLI contract and exit codes, §10 A13/A14/A15/A16, §11 batch 6).
@@ -27,9 +34,17 @@
 //!   (default ./feedback-reports; write failure → 1) → human summary / `--json`
 //!   single report JSON (exactly one JSON on stdout, logs to stderr);
 //! - `list`: limit 1..=1000 (out of range → 2) → table or `--json` array;
-//! - `review approve/ignore`: pass-through to the kernel's batch-4 transitions —
+//! - `review approve/ignore`: pass-through to the kernel's review transitions —
 //!   non-pending / missing subject fields / protocol errors → Validation → 3;
-//!   store errors → 1.
+//!   store errors → 1. Step8 batch B6 (§7/§8, A16/A17) adds: approving a
+//!   `compile_dead_letter` parses the task_id from the canonical subject,
+//!   requires a dead task, re-admits a new epoch from the original task snapshot
+//!   with force and backfills the task_id (any failure rolls everything back);
+//!   approving a `consistency_conflict` can only convert it into one new
+//!   supplemental_compile review (the suggestion row is created and approved
+//!   with a force admission — never a direct publish); approving a
+//!   `compatibility_conflict` is audit-only (no task, no preflight bypass); all
+//!   three are ignorable; unknown/other actions fail closed (Validation → 3).
 
 use std::path::PathBuf;
 
@@ -93,13 +108,19 @@ pub enum FeedbackCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ReviewCommand {
-    /// Approve a pending review item (supplemental_compile queues a compile
-    /// task; query_template is an audit-only approval).
-    /// 批准 pending 审核项（supplemental_compile 排队编译任务；
-    /// query_template 仅审计批准）。
+    /// Approve a pending review item. supplemental_compile queues a compile task;
+    /// query_template/compatibility_conflict are audit-only approvals;
+    /// compile_dead_letter re-admits a new epoch from the original dead task's
+    /// snapshot; consistency_conflict converts into one new approved
+    /// supplemental_compile review (never a direct publish).
+    /// 批准 pending 审核项。supplemental_compile 排队编译任务；
+    /// query_template/compatibility_conflict 仅审计批准；compile_dead_letter 以
+    /// 原 dead 任务快照新建 epoch admission；consistency_conflict 只能转换为一次
+    /// 新的 supplemental_compile 审核批准（不能直接发布）。
     Approve(ApproveArgs),
-    /// Ignore a pending review item (audit-only transition).
-    /// 忽略 pending 审核项（纯审计转换）。
+    /// Ignore a pending review item (audit-only transition; covers the Step8
+    /// dead-letter/conflict actions too).
+    /// 忽略 pending 审核项（纯审计转换；同样覆盖 Step8 死信/冲突三类动作）。
     Ignore(IgnoreArgs),
 }
 
@@ -1103,6 +1124,11 @@ mod tests {
             embedding_model: "none".into(),
             quality_threshold: 0.75,
             require_source_refs: true,
+            // Step8 版本身份字段（serde default；夹具保持 legacy None）。
+            // Step8 version-identity fields (serde default; the fixture keeps
+            // legacy None).
+            schema_version: None,
+            prompt_version: None,
         }
     }
 

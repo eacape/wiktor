@@ -8,6 +8,16 @@
 //!   `serde_json::Number` 的稳定文本（`1` 与 `1.0` 可不同），拒绝非有限值。
 //! - `content_hash`：固定前缀 `wiktor.compile.hash.v1\0`，域定长帧（域名本身也
 //!   带 u64 LE 长度域），域序固定；`source_revision` 是 CAS 身份，不入语义哈希。
+//!   Step8 批 B1 追加四个身份域：`schema_version` / `prompt_version` /
+//!   `consistency_policy`（不含 top_k）/ `compatibility`（§6.2）——黄金哈希随
+//!   之重钉（STEP8-012），编码与前 10 域顺序不变。
+//! - `content_hash`: fixed prefix `wiktor.compile.hash.v1\0`, length-framed
+//!   domains (domain names themselves carry a u64 LE length prefix) in fixed
+//!   order; `source_revision` is CAS identity and never enters the semantic hash.
+//!   Step8 batch B1 appends four identity domains: `schema_version` /
+//!   `prompt_version` / `consistency_policy` (without top_k) / `compatibility`
+//!   (§6.2) — the golden hash is re-pinned accordingly (STEP8-012); the
+//!   encoding and the first 10 domain orders are unchanged.
 //! - `snapshot_hash`：完整 RawEntity 的 BLAKE3，用于“同 revision 不同内容”冲突检测。
 //!
 //! Design highlights:
@@ -125,10 +135,20 @@ pub struct HashDependencies<'a> {
 ///
 /// 域序固定：`source`、`domain_pack_version`、`prompt_template`、
 /// `compiler_version`、`model_version`、`embedding_model`、`artifact_version`、
-/// `scorer_version`、`quality_policy`、`knowledge_schema`。
+/// `scorer_version`、`quality_policy`、`knowledge_schema`，以及 Step8 追加的
+/// `schema_version`、`prompt_version`、`consistency_policy`、`compatibility`
+/// （§6.2「策略和版本继续进入 content hash」；Step8 批 B1）。`consistency_
+/// policy` 只含身份字段（enabled/min_consistency/compare_pointers）——top_k
+/// 是运行期召回参数不入哈希；回收间隔与 preflight 开关同样不入哈希。
 /// Fixed domain order: `source`, `domain_pack_version`, `prompt_template`,
 /// `compiler_version`, `model_version`, `embedding_model`, `artifact_version`,
-/// `scorer_version`, `quality_policy`, `knowledge_schema`.
+/// `scorer_version`, `quality_policy`, `knowledge_schema`, plus the Step8
+/// additions `schema_version`, `prompt_version`, `consistency_policy` and
+/// `compatibility` (§6.2 "policy and versions keep entering the content hash";
+/// Step8 batch B1). `consistency_policy` carries identity fields only
+/// (enabled/min_consistency/compare_pointers) — top_k is a runtime recall
+/// parameter and is excluded; the reaper interval and the preflight toggle are
+/// excluded as well.
 pub fn content_hash(input: HashDependencies<'_>) -> Result<String> {
     // source 域 = canonical {entity_id, fields}；source_revision 不入语义哈希。
     // source domain = canonical {entity_id, fields}; source_revision is excluded
@@ -160,10 +180,37 @@ pub fn content_hash(input: HashDependencies<'_>) -> Result<String> {
     });
     let knowledge_schema = schema_to_value(input.source_schema);
 
+    // Step8 §6.2（批 B1）：版本/策略身份新增哈希域。
+    // - schema/prompt 版本：legacy 缺省为空串（长度域下仍是确定编码）。
+    // - consistency_policy：只含身份字段（enabled/min_consistency/
+    //   compare_pointers）；top_k 是运行期召回参数不入哈希（§6.2）。
+    // - compatibility：兼容矩阵快照（D10，载体 CompilePolicy.compatibility，
+    //   STEP8-010）；None 编码为 null。semver 范围经 serde 序列化为规范文本
+    //   （禁止手写版本比较/排序）。
+    // Step8 §6.2 (batch B1): new version/policy-identity hash domains.
+    // - schema/prompt versions: absent (legacy) encodes as the empty string,
+    //   still deterministic under length framing.
+    // - consistency_policy: identity fields only (enabled/min_consistency/
+    //   compare_pointers); top_k is a runtime recall parameter and stays out of
+    //   the hash (§6.2).
+    // - compatibility: the compatibility-matrix snapshot (D10, carrier
+    //   CompilePolicy.compatibility, STEP8-010); None encodes as null. semver
+    //   ranges serialize to canonical text via serde (hand-rolled version
+    //   comparison/ordering is forbidden).
+    let consistency_identity = serde_json::json!({
+        "enabled": input.policy.consistency.enabled,
+        "min_consistency": input.policy.consistency.min_consistency,
+        "compare_pointers": input.policy.consistency.compare_pointers,
+    });
+    let compatibility_value = match &input.policy.compatibility {
+        None => Value::Null,
+        Some(spec) => serde_json::to_value(spec)?,
+    };
+
     // 文本域直接写 UTF-8 bytes（域名带长度域，无拼接歧义）；路径字符串不入哈希。
     // Text domains are written as raw UTF-8 bytes (length-framed domain names, no
     // splice ambiguity); path strings are excluded from the hash.
-    let domains: [(&str, Vec<u8>); 10] = [
+    let domains: [(&str, Vec<u8>); 14] = [
         ("source", canonical_json(&source_value)?),
         (
             "domain_pack_version",
@@ -195,6 +242,28 @@ pub fn content_hash(input: HashDependencies<'_>) -> Result<String> {
         ),
         ("quality_policy", canonical_json(&quality_policy)?),
         ("knowledge_schema", canonical_json(&knowledge_schema)?),
+        (
+            "schema_version",
+            input
+                .context
+                .schema_version
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec(),
+        ),
+        (
+            "prompt_version",
+            input
+                .context
+                .prompt_version
+                .as_deref()
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec(),
+        ),
+        ("consistency_policy", canonical_json(&consistency_identity)?),
+        ("compatibility", canonical_json(&compatibility_value)?),
     ];
 
     let mut framed = Vec::from(HASH_PREFIX);
@@ -378,6 +447,8 @@ mod tests {
             embedding_model: "none".into(),
             quality_threshold: 0.75,
             require_source_refs: true,
+            schema_version: None,
+            prompt_version: None,
         };
         let policy = CompilePolicy::default();
         let schema = EntitySchema {
@@ -414,12 +485,20 @@ mod tests {
         assert!(hex
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-        // 黄金 hex（首次生成后固定；与 A3 全依赖失效语义联动）。
+        // 黄金 hex（首次生成后固定；与 A3 全依赖失效语义联动）。Step8 批 B1
+        // 追加 schema_version/prompt_version/consistency_policy/compatibility
+        // 四个身份域后重钉（STEP8-012）；旧值
+        // 22454908077c71dcf1e9fd073395ccbf392a769dd4a84fa7b9a8d6283e8a102e
+        // 仅对 Step4 哈希域形状有效。
         // Golden hex (pinned after first generation; tied to A3 dependency
-        // invalidation semantics).
+        // invalidation semantics). Re-pinned after Step8 batch B1 appended the
+        // four identity domains schema_version/prompt_version/
+        // consistency_policy/compatibility (STEP8-012); the previous value
+        // 22454908077c71dcf1e9fd073395ccbf392a769dd4a84fa7b9a8d6283e8a102e was
+        // only valid for the Step4 hash-domain shape.
         assert_eq!(
             hex,
-            "22454908077c71dcf1e9fd073395ccbf392a769dd4a84fa7b9a8d6283e8a102e"
+            "2ee5fecd04bfb1105c3275d8e98dc63a7b083c1ed17a73c79b628d2f659b64a9"
         );
     }
 
@@ -462,5 +541,74 @@ mod tests {
             snapshot_hash(&source).unwrap(),
             snapshot_hash(&edited).unwrap()
         );
+    }
+
+    // Step8 §6.2（批 B1）：版本身份（schema/prompt）、一致性策略身份
+    // （enabled/阈值/比较指针）与兼容矩阵进入 content_hash；top_k 作为运行期
+    // 召回参数不入哈希。
+    // Step8 §6.2 (batch B1): version identity (schema/prompt), the
+    // consistency-policy identity (enabled/threshold/pointers) and the
+    // compatibility matrix enter the content_hash; top_k, a runtime recall
+    // parameter, does not.
+    #[test]
+    fn step8_identity_domains_invalidate_content_hash() {
+        let (source, context, policy, schema) = fixture();
+        let hash = |ctx: &CompileContext, pol: &CompilePolicy| {
+            content_hash(HashDependencies {
+                source: &source,
+                context: ctx,
+                policy: pol,
+                source_schema: &schema,
+            })
+            .unwrap()
+        };
+        let base = hash(&context, &policy);
+
+        // schema/prompt 版本入哈希（legacy None 与显式版本不同）。
+        // schema/prompt versions join the hash (legacy None differs from an
+        // explicit version).
+        let mut ctx_v = context.clone();
+        ctx_v.schema_version = Some("2.1.0".into());
+        ctx_v.prompt_version = Some("3.0.0".into());
+        assert_ne!(base, hash(&ctx_v, &policy));
+
+        // 一致性身份入哈希：enabled、阈值、比较指针任一变化都触发新哈希。
+        // Consistency identity joins the hash: enabled, the threshold or the
+        // pointers each trigger a new hash.
+        let mut pol_on = policy.clone();
+        pol_on.consistency.enabled = true;
+        assert_ne!(base, hash(&context, &pol_on));
+        let mut pol_min = policy.clone();
+        pol_min.consistency.min_consistency = 0.8;
+        assert_ne!(base, hash(&context, &pol_min));
+        let mut pol_ptr = policy.clone();
+        pol_ptr.consistency.compare_pointers = vec!["/fields/description".into()];
+        assert_ne!(base, hash(&context, &pol_ptr));
+
+        // top_k 不入哈希（§6.2：top-k 不进 content hash）。
+        // top_k stays out of the hash (§6.2: top-k never enters content hash).
+        let mut pol_topk = policy.clone();
+        pol_topk.consistency.top_k = 16;
+        assert_eq!(base, hash(&context, &pol_topk));
+
+        // 回收间隔 / preflight 开关不入哈希（运行期时钟/开关）。
+        // Reaper interval / preflight toggle stay out of the hash (runtime
+        // clock/toggle).
+        let mut pol_clock = policy.clone();
+        pol_clock.lease_reaper_interval_seconds = 60;
+        pol_clock.compatibility_preflight = false;
+        assert_eq!(base, hash(&context, &pol_clock));
+
+        // 兼容矩阵快照入哈希（D10）。
+        // The compatibility-matrix snapshot joins the hash (D10).
+        let mut pol_compat = policy.clone();
+        pol_compat.compatibility = Some(
+            serde_yaml_ng::from_str(
+                "domain_pack: \">=1.0.0,<2.0.0\"\nschema: \">=2.0.0,<3.0.0\"\n\
+                 prompt: \">=3.0.0,<4.0.0\"\nartifact: [\"wiki-v1\"]",
+            )
+            .unwrap(),
+        );
+        assert_ne!(base, hash(&context, &pol_compat));
     }
 }

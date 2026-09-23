@@ -555,7 +555,16 @@ mod tests {
     }
 
     fn ctx() -> CompileContext {
-        crate::compile::config::build_context("test-v1", "S", "test-model", "none", 0.75, true)
+        crate::compile::config::build_context(
+            "test-v1",
+            "S",
+            "test-model",
+            "none",
+            0.75,
+            true,
+            None,
+            None,
+        )
     }
 
     /// 计数 Mock LlmClient：固定响应/失败脚本 + 调用计数（断言单请求语义）。

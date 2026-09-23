@@ -46,12 +46,12 @@ struct SearchRow {
     score: f32,
 }
 
-/// 本二进制支持的 schema 版本（0005_feedback_loop，见 Step5 §5 / Step6 §5）。
-/// `open_existing` 用它拒绝旧/新 schema 而不迁移。
-/// The schema version this binary supports (0005_feedback_loop, see Step5 §5 /
-/// Step6 §5). `open_existing` uses it to reject older/newer schemas without
-/// migrating.
-const SUPPORTED_SCHEMA_VERSION: i64 = 5;
+/// 本二进制支持的 schema 版本（0006_step8_consistency，见 Step5 §5 / Step6 §5 /
+/// Step8 §5.2）。`open_existing` 用它拒绝旧/新 schema 而不迁移。
+/// The schema version this binary supports (0006_step8_consistency, see Step5 §5 /
+/// Step6 §5 / Step8 §5.2). `open_existing` uses it to reject older/newer schemas
+/// without migrating.
+const SUPPORTED_SCHEMA_VERSION: i64 = 6;
 
 /// 单列文本行（filter 全量 / 过滤下推用）。
 /// Single text-column row (used for full filter scans and filter pushdown).
@@ -1195,5 +1195,205 @@ mod tests {
         let ids: Vec<&str> = hits.iter().map(|h| h.page_id.as_str()).collect();
         assert!(ids.contains(&"milk-tea:drink:boba"));
         assert!(!ids.contains(&"milk-tea:drink:lemon"));
+    }
+
+    // ===== Step8 批 B7：WAL/busy timeout 与锁不跨 await（§8）=====
+    // ===== Step8 batch B7: WAL/busy-timeout and no-lock-across-await (§8) =====
+
+    /// PRAGMA journal_mode 返回值（列名即 journal_mode）。
+    /// The PRAGMA journal_mode row (the column is named journal_mode).
+    #[derive(QueryableByName)]
+    struct JournalModeRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        journal_mode: String,
+    }
+
+    /// 文件库由 schema::migrate 设置 WAL，连接级 busy_timeout=5s（spec step6
+    /// §9，见 BUSY_TIMEOUT_PRAGMA_SQL）。两连接并发写：A 持写事务 300ms，B 的
+    /// 写经 busy 处理等待 A 提交后成功——不损坏、不死锁（WAL 下 busy 重试语义）。
+    /// File DBs get WAL from schema::migrate and each connection a 5s
+    /// busy_timeout (spec step6 §9; see BUSY_TIMEOUT_PRAGMA_SQL). Two concurrent
+    /// writers: A holds its write transaction for 300ms, B's write waits through
+    /// the busy handler and succeeds after A commits — no corruption, no deadlock
+    /// (busy-retry semantics under WAL).
+    #[test]
+    fn busy_timeout_waits_for_peer_write_then_succeeds() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy-wait.db");
+        let ka = Arc::new(SqliteKernel::open(&path).unwrap());
+        let kb = Arc::new(SqliteKernel::open(&path).unwrap());
+        // WAL 在位（文件库；内存库恒 "memory"）。
+        // WAL is in place (file DBs; in-memory stays "memory").
+        {
+            let mut conn = ka.lock_conn().unwrap();
+            let mode: JournalModeRow = diesel::sql_query("PRAGMA journal_mode")
+                .get_result(&mut *conn)
+                .unwrap();
+            assert_eq!(mode.journal_mode, "wal");
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let holder_ka = ka.clone();
+        let holder = std::thread::spawn(move || {
+            let mut conn = holder_ka.lock_conn().unwrap();
+            conn.immediate_transaction(|tx| -> diesel::result::QueryResult<()> {
+                diesel::sql_query(
+                    "INSERT INTO review_queue
+                        (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
+                     VALUES ('milk-tea', 'query_template', '[]', '{\"seq\":1}', '{}', 1)",
+                )
+                .execute(tx)?;
+                started_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.recv().unwrap();
+        // B 的写必须在 busy 等待后成功（5s 窗口内 A 已提交）。
+        // B's write must succeed after the busy wait (A commits within the 5s
+        // window).
+        kb.execute_batch(
+            "INSERT INTO review_queue
+                (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
+             VALUES ('milk-tea', 'query_template', '[]', '{\"seq\":2}', '{}', 2)",
+        )
+        .unwrap();
+        holder.join().unwrap();
+        let mut conn = kb.lock_conn().unwrap();
+        let n: CountRow = diesel::sql_query("SELECT COUNT(*) AS n FROM review_queue")
+            .get_result(&mut *conn)
+            .unwrap();
+        assert_eq!(n.n, 2, "A's and B's writes both landed; no lost update");
+    }
+
+    /// busy 超时路径：把 B 的连接级 busy_timeout 收窄到 300ms，A 持写事务 1s；
+    /// B 的写在 300ms 后干净报错（非 5s 默认、非死锁），随后 A 提交、B 连接仍
+    /// 可用且后续写成功——无损坏。
+    /// The busy-timeout path: narrow B's connection-local busy_timeout to 300ms
+    /// while A holds its write transaction for 1s; B's write fails cleanly after
+    /// ~300ms (not the 5s default, no deadlock); after A commits, B's connection
+    /// stays usable and the next write succeeds — no corruption.
+    #[test]
+    fn busy_timeout_errors_cleanly_without_corruption() {
+        use diesel::connection::SimpleConnection;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("busy-error.db");
+        let ka = Arc::new(SqliteKernel::open(&path).unwrap());
+        let kb = Arc::new(SqliteKernel::open(&path).unwrap());
+        // 连接级 pragma 仅作用于 B（不落库）。
+        // The connection-local pragma affects B only (never persisted).
+        {
+            let mut conn = kb.lock_conn().unwrap();
+            SimpleConnection::batch_execute(&mut *conn, "PRAGMA busy_timeout=300").unwrap();
+        }
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let holder_ka = ka.clone();
+        let holder = std::thread::spawn(move || {
+            let mut conn = holder_ka.lock_conn().unwrap();
+            conn.immediate_transaction(|tx| -> diesel::result::QueryResult<()> {
+                diesel::sql_query(
+                    "INSERT INTO review_queue
+                        (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
+                     VALUES ('milk-tea', 'query_template', '[]', '{\"seq\":1}', '{}', 1)",
+                )
+                .execute(tx)?;
+                started_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let err = kb.execute_batch(
+            "INSERT INTO review_queue
+                (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
+             VALUES ('milk-tea', 'query_template', '[]', '{\"seq\":2}', '{}', 2)",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            err.is_err(),
+            "B's write must fail cleanly when the peer stalls past its timeout"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "expected a busy-timeout error near 300ms, took {elapsed:?}"
+        );
+        holder.join().unwrap();
+        // A 已提交：B 连接仍可用，同样的写重试成功——无损坏、无残留锁。
+        // A committed: B's connection stays usable and the same write retries
+        // fine — no corruption, no leaked lock.
+        kb.execute_batch(
+            "INSERT INTO review_queue
+                (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
+             VALUES ('milk-tea', 'query_template', '[]', '{\"seq\":2}', '{}', 2)",
+        )
+        .unwrap();
+        let mut conn = kb.lock_conn().unwrap();
+        let n: CountRow = diesel::sql_query("SELECT COUNT(*) AS n FROM review_queue")
+            .get_result(&mut *conn)
+            .unwrap();
+        assert_eq!(n.n, 2, "A's row plus B's eventual row; no partial writes");
+    }
+
+    /// §8 锁不跨 await 的运行时探针：kernel 方法是同步的、guard 在方法体内
+    /// drop；async 包装（EntityStore::upsert_facts 等）在返回前已完成同步体。
+    /// 并发多个 async 任务（含 spawn_blocking 写）不互锁死——若任一 await 点
+    /// 持 guard，同 kernel 的另一任务将自锁（Mutex 非重入）。编译期形态审计
+    /// （kernel 全同步、事务体只接 &mut SqliteConnection）与此运行时探针互为
+    /// 印证。
+    /// §8 no-lock-across-await runtime probe: kernel methods are synchronous and
+    /// their guards drop inside the method body; async wrappers (e.g.
+    /// EntityStore::upsert_facts) finish the synchronous body before returning.
+    /// Many concurrent async tasks (including spawn_blocking writes) never
+    /// deadlock — if any await point held the guard, another task on the same
+    /// kernel would self-deadlock (the Mutex is non-reentrant). The
+    /// compile-time-form audit (the kernel is fully synchronous; transaction
+    /// bodies take only &mut SqliteConnection) and this runtime probe corroborate
+    /// each other.
+    #[tokio::test]
+    async fn concurrent_kernel_writes_never_deadlock_across_await() {
+        use crate::compile::executor::blocking;
+        use std::sync::Arc;
+        let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+        let mut handles = Vec::new();
+        for i in 0..4u32 {
+            let k = kernel.clone();
+            handles.push(tokio::spawn(async move {
+                for n in 0..5u32 {
+                    let mut f = Facts {
+                        entity_id: EntityId::new("ecommerce", "product", format!("p{i}-{n}"))
+                            .unwrap(),
+                        fields: BTreeMap::new(),
+                        source_revision: 1,
+                    };
+                    f.fields.insert("price".into(), FactValue::Numeric(10.0));
+                    // async 包装（内部同步 取锁+事务，返回前必 drop guard）。
+                    // The async wrapper (synchronous lock+transaction inside; the
+                    // guard is dropped before returning).
+                    k.upsert_facts(&f.entity_id, &f, 1).await.unwrap();
+                    // spawn_blocking 写路径与 async 包装并发交错。
+                    // The spawn_blocking write path interleaves with the async
+                    // wrapper.
+                    let k2 = k.clone();
+                    blocking(move || {
+                        let mut conn = k2.lock_conn().unwrap();
+                        let _ = diesel::sql_query("SELECT 1").execute(&mut *conn);
+                        Ok::<(), crate::types::error::Error>(())
+                    })
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(20), h)
+                .await
+                .expect("concurrent kernel writes must not deadlock")
+                .unwrap();
+        }
+        assert_eq!(kernel.row_counts().unwrap()["facts"], 4 * 5);
     }
 }

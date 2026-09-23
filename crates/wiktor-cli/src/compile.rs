@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use clap::Args;
+use wiktor_core::compile::compatibility::COMPATIBILITY_REJECTED_PREFIX;
 use wiktor_core::compile::config::{
     build_context, CompilePolicy, CompileStats, RunOptions, SystemClock,
 };
+use wiktor_core::compile::consistency::{SourceRefConsistencyArbiter, SqliteFtsCandidateProvider};
 use wiktor_core::compile::contract::{system_prompt, DefaultSourceRefValidator};
 use wiktor_core::compile::executor::PipelineExecutor;
 use wiktor_core::compile::mock::MockCompiler;
@@ -109,6 +111,12 @@ pub struct CompileArgs {
     /// 只读计划：不建库/迁移/写入、不占预算、不请求模型
     #[arg(long)]
     pub dry_run: bool,
+    /// Skip the compatibility preflight; only allowed on an empty database with
+    /// no old artifact — any existing compile data still exits 3 (fail-closed)
+    /// 跳过兼容 preflight；仅允许空数据库/无旧 artifact 时跳过——发现任何旧
+    /// 数据仍以退出码 3 结束（fail-closed）
+    #[arg(long)]
+    pub skip_compatibility_check: bool,
     /// Override compile.batch_token_budget (positive integer)
     /// 覆盖 compile.batch_token_budget（正整数）
     #[arg(long)]
@@ -233,6 +241,17 @@ pub async fn run(args: CompileArgs) -> Result<i32> {
     if let Err(e) = policy.validate() {
         return input_error(e);
     }
+    // —— Step8 §5.1/§6.4：领域身份五元组（strict semver 已在解析期验证；
+    //     schema/prompt 版本随 ctx 进入 content_hash 并随 dependencies_json
+    //     持久化，兼容 preflight 的实际消费在 B5）——
+    // —— Step8 §5.1/§6.4: the domain-identity five-tuple (strict semver already
+    //     validated at parse time; the schema/prompt versions enter the
+    //     content_hash with ctx and ride dependencies_json; the actual
+    //     preflight consumption lands in B5) ——
+    let identity = match config.identity() {
+        Ok(i) => i,
+        Err(e) => return input_error(e),
+    };
 
     // —— 编译上下文：Prompt = compile.prompt 文件（相对 domain 目录）或内置
     //     source-ref-v1 模板；Prompt bytes 参与 content_hash（§3.1/§7）——
@@ -260,6 +279,16 @@ pub async fn run(args: CompileArgs) -> Result<i32> {
         &args.embedding_model,
         config.quality_threshold,
         config.compile_output_contract == "require_source_refs",
+        identity
+            .schema_version
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        identity
+            .prompt_version
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
     );
 
     // —— 数据源（schema 必填/类型规则沿用 raw_to_facts；有界读取见 data/jsonl）——
@@ -306,17 +335,55 @@ pub async fn run(args: CompileArgs) -> Result<i32> {
         Arc::new(SqliteKernel::open(&args.db)?)
     };
 
+    // —— Step8 §7（批 B5）：--skip-compatibility-check 只允许空数据库/无旧
+    //     artifact 时跳过重复检查；发现任何旧数据 fail-closed 以退出码 3 结束
+    //     （进入 run 之前，零写入）。空库时以关闭 preflight 的策略运行（等价于
+    //     跳过必然为空的检查）；该开关绝不能绕过不兼容结果（D11）。
+    // —— Step8 §7 (batch B5): --skip-compatibility-check may only skip the
+    //     repeated check on an empty database with no old artifact; any existing
+    //     compile data fails closed with exit code 3 (before the run, zero
+    //     writes). On an empty database the policy runs with the preflight
+    //     toggled off (equivalent to skipping the necessarily-empty check); the
+    //     flag can never bypass an incompatible result (D11).
+    if args.skip_compatibility_check {
+        let has_old = match kernel.has_existing_compile_data() {
+            Ok(v) => v,
+            Err(e) => return classify_run_error(e),
+        };
+        if has_old {
+            return compatibility_rejected(format!(
+                "--skip-compatibility-check refused: {} already holds compile data \
+                 (accepted pages or pending/running/dead tasks)",
+                args.db.display()
+            ));
+        }
+        policy.compatibility_preflight = false;
+    }
+
     // —— 执行（§3）：executor 内部把每个 scanned 实体归入唯一终态分类 ——
     // —— Execution (§3): the executor files every scanned entity into exactly
     //     one final classification ——
-    let executor = PipelineExecutor::new(
-        kernel,
+    // Step8 §4（上层拍板）：`consistency.enabled` 时装配默认确定性仲裁器与
+    // SQLite FTS 有界候选提供器；否则保持 None 路径（不仲裁，consistency 列
+    // NULL）。
+    // Step8 §4 (upstream ruling): with `consistency.enabled` the default
+    // deterministic arbiter and the bounded SQLite FTS candidate provider are
+    // wired; otherwise the None path is kept (no arbitration, NULL consistency
+    // column).
+    let consistency_enabled = policy.consistency.enabled;
+    let mut executor = PipelineExecutor::new(
+        kernel.clone(),
         compiler,
         Arc::new(RuleBasedScorer::new()),
         Arc::new(DefaultSourceRefValidator::new()),
         Arc::new(SystemClock),
         policy,
     );
+    if consistency_enabled {
+        executor = executor
+            .with_consistency_arbiter(Arc::new(SourceRefConsistencyArbiter::new()))
+            .with_candidate_provider(Arc::new(SqliteFtsCandidateProvider::new(kernel)));
+    }
     let options = RunOptions {
         limit: args.limit,
         batch_size: args.batch_size,
@@ -394,16 +461,40 @@ fn exit_code(stats: &CompileStats) -> i32 {
 }
 
 /// run 级错误分类（§9）：数据库/内部运行故障 → Err（main 以退出码 1 结束）；
-/// 参数/配置/输入文件协议错误 → 退出码 2。
+/// 参数/配置/输入文件协议错误 → 退出码 2。Step8 D11：兼容 preflight 拒绝
+/// （稳定前缀 contains 匹配，commands::classify_error 同惯例）→ 退出码 3
+/// （配置/迁移错误语义；不计入单页 failed/quarantined 统计）。
 /// Run-level error classification (§9): database/internal faults → Err (main
 /// exits with code 1); parameter/config/input-protocol errors → exit code 2.
+/// Step8 D11: a compatibility-preflight rejection (matched via the stable
+/// prefix with `contains`, the commands::classify_error convention) → exit
+/// code 3 (config/migration-error semantics; never counted in the per-page
+/// failed/quarantined statistics).
 fn classify_run_error(err: Error) -> Result<i32> {
+    if let Error::InvalidConfig(msg) = &err {
+        if msg.contains(COMPATIBILITY_REJECTED_PREFIX) {
+            return compatibility_rejected(err);
+        }
+    }
     match err {
         Error::Database(_) | Error::Internal(_) | Error::Migration(_) | Error::Serialization(_) => {
             Err(anyhow!(err))
         }
         _ => input_error(err),
     }
+}
+
+/// 兼容拒绝（Step8 §7/D11）：stderr 一条人类可读消息，退出码 3。Step4 的
+/// 退出码 3 = failed/quarantined；Step8 起「配置/迁移/兼容错误」同为 3——一次
+/// run 内二者互斥（兼容拒绝时单页统计恒为零，stats 可区分）。
+/// Compatibility rejection (Step8 §7/D11): one human-readable stderr line, exit
+/// code 3. Step4's exit code 3 = failed/quarantined; since Step8 a
+/// "config/migration/compatibility error" is also 3 — the two are mutually
+/// exclusive within one run (on a compatibility rejection the per-page stats
+/// are always zero, which distinguishes them).
+fn compatibility_rejected<E: std::fmt::Display>(err: E) -> Result<i32> {
+    eprintln!("wiktor compile: {err}");
+    Ok(EXIT_FAILURES)
 }
 
 /// 输入错误：stderr 打印一条人类可读消息并以 `Ok(EXIT_INPUT)` 返回退出码 2
@@ -493,6 +584,7 @@ mod tests {
             batch_size: 32,
             force: false,
             dry_run: false,
+            skip_compatibility_check: false,
             batch_token_budget: None,
             task_token_budget: None,
             daily_token_budget: None,
@@ -727,5 +819,61 @@ mod tests {
         let mut args = base_args(&db);
         args.domain = dir.path().join("missing.yaml");
         assert_eq!(run(args).await.unwrap(), EXIT_INPUT);
+    }
+
+    // Step8 §7（批 B5）：--skip-compatibility-check 在空库/无旧 artifact 时放行
+    // ——跳过 preflight 正常编译（退出码 0、页落库）。
+    // Step8 §7 (batch B5): --skip-compatibility-check is allowed on an empty
+    // database with no old artifact — the preflight is skipped and compilation
+    // proceeds (exit 0, pages persisted).
+    #[tokio::test]
+    async fn b5_skip_check_allowed_on_empty_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fresh.db");
+        let mut args = base_args(&db);
+        args.skip_compatibility_check = true;
+        assert_eq!(run(args).await.unwrap(), EXIT_OK);
+        let kernel = SqliteKernel::open(&db).unwrap();
+        assert_eq!(kernel.load_accepted_pages("milk-tea").unwrap().len(), 2);
+    }
+
+    // Step8 §7（批 B5）：--skip-compatibility-check 遇到任何旧数据 fail-closed
+    // ——退出码 3、进入 run 前零写入（无新任务/页/审核行）。
+    // Step8 §7 (batch B5): --skip-compatibility-check fails closed on any old
+    // data — exit 3 with zero writes before the run (no new tasks/pages/review
+    // rows).
+    #[tokio::test]
+    async fn b5_skip_check_fails_closed_on_existing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("existing.db");
+        // 首次正常编译制造旧数据（默认策略无矩阵 → legacy 直通）。
+        // A first normal compile creates the old data (the default policy has
+        // no matrix → the legacy pass-through).
+        assert_eq!(run(base_args(&db)).await.unwrap(), EXIT_OK);
+        let before = SqliteKernel::open(&db).unwrap().row_counts().unwrap();
+        assert!(before["pages"] > 0, "precondition: the first run published");
+
+        let mut args = base_args(&db);
+        args.skip_compatibility_check = true;
+        assert_eq!(run(args).await.unwrap(), EXIT_FAILURES);
+
+        let after = SqliteKernel::open(&db).unwrap().row_counts().unwrap();
+        assert_eq!(after, before, "the refused run must write nothing");
+        assert_eq!(after["review_queue"], 0, "the skip path writes no review");
+    }
+
+    // Step8 D11：兼容拒绝的稳定前缀 → 退出码 3（配置/迁移错误语义）；普通
+    // InvalidConfig 仍为 2。
+    // Step8 D11: the compatibility-rejection stable prefix → exit 3 (the
+    // config/migration-error semantics); a plain InvalidConfig stays 2.
+    #[test]
+    fn b5_run_error_classification_maps_compatibility_prefix() {
+        let rejected = classify_run_error(Error::InvalidConfig(format!(
+            "{COMPATIBILITY_REJECTED_PREFIX}: domain \"milk-tea\" has 2 violation(s)"
+        )))
+        .unwrap();
+        assert_eq!(rejected, EXIT_FAILURES);
+        let plain = classify_run_error(Error::InvalidConfig("bad policy".into())).unwrap();
+        assert_eq!(plain, EXIT_INPUT);
     }
 }

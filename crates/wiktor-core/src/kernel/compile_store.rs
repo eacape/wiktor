@@ -18,9 +18,11 @@
 //!   the diesel table DSL; all methods are synchronous, no guard held across await.
 //! - Mutex poison → `Error::Internal`; no new `unwrap` in this layer.
 
+use crate::compile::compatibility::{PersistedPageIdentity, PersistedTaskSnapshot};
 use crate::compile::config::{
     Admission, CommitOutcome, CompilePolicy, FailureDisposition, PreparedSource, TaskLease,
 };
+use crate::compile::consistency::{ConsistencyReport, CONSISTENCY_CONFLICT, CONSISTENCY_SCORE};
 use crate::compile::contract::{CompileEvidence, CompileFailure};
 use crate::compile::hash::{content_hash, schema_to_value, HashDependencies};
 use crate::compile::quality::ScoreReport;
@@ -76,6 +78,48 @@ struct StoredFrontmatter {
     aliases: Vec<String>,
     #[serde(default)]
     tags: Vec<String>,
+}
+
+/// 过期租约回收统计（Step8 §6.3/D8/A11）：`recover_compile_leases` 的结构化
+/// 返回。字段为 spec §6.3 逐字五计数，另附扫描行数；`dead_quarantined` 当前
+/// 回收路径不产生（回收 dead 分支恒为 `failed`），字段照 spec 保留以稳定观测面。
+/// Expired-lease recovery stats (Step8 §6.3/D8/A11): the structured return of
+/// `recover_compile_leases`. The five fields match spec §6.3 verbatim, plus the
+/// scanned row count; `dead_quarantined` is never produced by the current
+/// recovery path (the recovery dead branch is always `failed`) and is kept per
+/// spec to stabilize the observability surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryStats {
+    /// 回收后重排为 pending（未超限，退避 `next_attempt_at`）的任务数。
+    /// Tasks requeued as pending after recovery (under the limit, with a backoff
+    /// `next_attempt_at`).
+    pub recovered_pending: u64,
+    /// 回收后进入 dead/failed（重试耗尽）的任务数。
+    /// Tasks recovered into dead/failed (retries exhausted).
+    pub dead_failed: u64,
+    /// 回收后进入 dead/quarantined 的任务数（当前回收路径恒为 0）。
+    /// Tasks recovered into dead/quarantined (always 0 on the current path).
+    pub dead_quarantined: u64,
+    /// 因 source head 前进而以 succeeded/superseded 收尾的任务数。
+    /// Tasks finalized as succeeded/superseded because the source head moved on.
+    pub superseded: u64,
+    /// 本次回收实际新插入的审核行数（死信等；`ON CONFLICT DO NOTHING` 幂等
+    /// 跳过不计入，A10）。
+    /// Review rows actually inserted by this recovery pass (dead letters etc.;
+    /// rows skipped by the idempotent `ON CONFLICT DO NOTHING` do not count, A10).
+    pub review_inserted: u64,
+    /// 扫描到的过期 running 任务总数（可选总扫描数）。
+    /// Total expired running tasks scanned (the optional scan count).
+    pub scanned: u64,
+}
+
+impl RecoveryStats {
+    /// 被回收终结/重排的任务总数（不含审核行与扫描计数）。
+    /// Total tasks recovered into a terminal/requeued state (excluding review
+    /// rows and the scan count).
+    pub fn recovered_tasks(&self) -> u64 {
+        self.recovered_pending + self.dead_failed + self.dead_quarantined + self.superseded
+    }
 }
 
 // ===== `diesel::sql_query` 行映射（QueryableByName）=====
@@ -171,6 +215,13 @@ struct PublishTaskRow {
 
 #[derive(QueryableByName)]
 struct FailureTaskRow {
+    /// Step8 批 B3：死信/冲突诊断需要任务身份（entity_id/desired_hash）。
+    /// Step8 batch B3: the dead-letter/conflict diagnostics need the task
+    /// identity (entity_id/desired_hash).
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    desired_hash: String,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     epoch: i64,
     #[diesel(sql_type = diesel::sql_types::Text)]
@@ -263,6 +314,30 @@ struct QualityRow {
     schema_compliance: f64,
     #[diesel(sql_type = diesel::sql_types::Double)]
     density: f64,
+    /// Step8：发布时写入的一致性值（旧行/未仲裁行为 NULL）。
+    /// Step8: the consistency value written at publish (NULL for legacy rows or
+    /// un-arbitrated pages).
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    consistency: Option<f64>,
+}
+
+/// top_k_related_pages 的质量行（Step8 §6.1：额外读取 consistency 列；独立行
+/// 结构，不改变 load_accepted_pages 的既有读取形状）。
+/// Quality row for `top_k_related_pages` (Step8 §6.1: also reads the
+/// consistency column; a separate row struct so the existing
+/// `load_accepted_pages` read shape is untouched).
+#[derive(QueryableByName)]
+struct RelatedQualityRow {
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    coverage: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    citation: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    schema_compliance: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    density: f64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    consistency: Option<f64>,
 }
 
 #[derive(QueryableByName)]
@@ -289,6 +364,34 @@ struct TaskIdRow {
 struct ArtifactJsonRow {
     #[diesel(sql_type = diesel::sql_types::Text)]
     artifact_json: String,
+}
+
+/// compatibility_page_identities 行（Step8 批 B5 §6.4：身份四列只读投影）。
+/// Row for `compatibility_page_identities` (Step8 batch B5 §6.4: a read-only
+/// projection of the four identity columns).
+#[derive(QueryableByName)]
+struct CompatPageRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    page_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    domain_pack_version: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    artifact_version: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    frontmatter_json: String,
+}
+
+/// compatibility_task_snapshots 行（Step8 批 B5 §6.4：快照三列只读投影）。
+/// Row for `compatibility_task_snapshots` (Step8 batch B5 §6.4: a read-only
+/// projection of the three snapshot columns).
+#[derive(QueryableByName)]
+struct CompatTaskRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    task_id: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    dependencies_json: String,
 }
 
 /// list_published_pages 行（Step 4 §10：向量 worker 的稳定键读取接口）。
@@ -351,6 +454,195 @@ fn backoff_seconds(retry_count: i64) -> i64 {
         let shift = (retry_count - 1).min(6);
         (1i64 << shift).min(60)
     }
+}
+
+// ===== Step8 批 B3：死信审核与一致性诊断（§5.2/§6.3/D5/D6/D7）=====
+// ===== Step8 batch B3: dead-letter review and consistency diagnostics
+// (§5.2/§6.3/D5/D6/D7) =====
+
+/// consistency_json / 死信 reason_json 的体积上限（§5.2：canonical JSON
+/// ≤64 KiB；超限 fail-closed，不截断、不猜删）。
+/// Size cap for consistency_json / dead-letter reason_json (§5.2: canonical JSON
+/// ≤64 KiB; overruns fail closed — never truncated, never guessed away).
+const MAX_CONSISTENCY_JSON_BYTES: usize = 64 * 1024;
+
+/// findings 的诊断编码（§5.2 canonical 形状）：`key` 序列化为
+/// `{entity_id,pointer}`（ClaimKey 全键，STEP8-019），`old_hash`=证据值摘要、
+/// `new_hash`=候选值摘要（BLAKE3 hex）；原文不落任何诊断列。
+/// The findings diagnostic encoding (§5.2 canonical shape): `key` serializes as
+/// `{entity_id,pointer}` (the full ClaimKey, STEP8-019), `old_hash` = the
+/// evidence value digest, `new_hash` = the candidate value digest (BLAKE3 hex);
+/// raw values never reach any diagnostic column.
+fn consistency_findings_json(report: &ConsistencyReport) -> Vec<serde_json::Value> {
+    report
+        .findings
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "key": {"entity_id": f.key.entity_id, "pointer": f.key.pointer},
+                "old_hash": f.evidence_value_hash,
+                "new_hash": f.candidate_value_hash,
+            })
+        })
+        .collect()
+}
+
+/// Step8 §5.2 canonical 诊断/理由 JSON：`code` + 任务身份（task_id/epoch/
+/// attempt_no/entity_id/desired_hash）+ findings；kernel `canonical_text` 序列化
+/// （键序稳定紧凑，与 quality_json 同一 canonical 纪律）；超 64 KiB → Validation。
+/// The Step8 §5.2 canonical diagnostic/reason JSON: `code` + task identity
+/// (task_id/epoch/attempt_no/entity_id/desired_hash) + findings; serialized via
+/// the kernel `canonical_text` (stable compact key order, the same canonical
+/// discipline as quality_json); over 64 KiB → Validation.
+fn consistency_diagnostic_json(
+    code: &str,
+    task_id: i64,
+    epoch: i64,
+    attempt_no: i64,
+    entity_id: &str,
+    desired_hash: &str,
+    findings: Vec<serde_json::Value>,
+) -> Result<String> {
+    let text = canonical_text(&serde_json::json!({
+        "code": code,
+        "task_id": task_id,
+        "epoch": epoch,
+        "attempt_no": attempt_no,
+        "entity_id": entity_id,
+        "desired_hash": desired_hash,
+        "findings": findings,
+    }))?;
+    if text.len() > MAX_CONSISTENCY_JSON_BYTES {
+        return Err(Error::Validation(format!(
+            "consistency diagnostic exceeds {MAX_CONSISTENCY_JSON_BYTES} bytes"
+        )));
+    }
+    Ok(text)
+}
+
+/// 发布诊断（Step8 §5.2「数量」域）：`code=CONSISTENCY_SCORE`、任务身份、
+/// score/compared_claims/candidate_count 与 findings 摘要（score=None → null，
+/// 即「有仲裁、无可比较证据」）；与冲突诊断同一体积上限。
+/// The publish diagnostic (Step8 §5.2 "counts" fields): `code=CONSISTENCY_SCORE`
+/// with task identity, score/compared_claims/candidate_count and the findings
+/// summary (score=None → null, i.e. "arbitrated but no comparable evidence");
+/// the same size cap as the conflict diagnostic.
+fn publish_consistency_json(
+    report: &ConsistencyReport,
+    task_id: i64,
+    epoch: i64,
+    attempt_no: i64,
+    entity_id: &str,
+    desired_hash: &str,
+) -> Result<String> {
+    let text = canonical_text(&serde_json::json!({
+        "code": CONSISTENCY_SCORE,
+        "task_id": task_id,
+        "epoch": epoch,
+        "attempt_no": attempt_no,
+        "entity_id": entity_id,
+        "desired_hash": desired_hash,
+        "score": report.score,
+        "compared_claims": report.compared_claims,
+        "candidate_count": report.candidate_count,
+        "findings": consistency_findings_json(report),
+    }))?;
+    if text.len() > MAX_CONSISTENCY_JSON_BYTES {
+        return Err(Error::Validation(format!(
+            "consistency diagnostic exceeds {MAX_CONSISTENCY_JSON_BYTES} bytes"
+        )));
+    }
+    Ok(text)
+}
+
+/// 审核行插入主体（D6：死信与一致性冲突共享 review_queue；仅可在调用方已持有
+/// 的 BEGIN IMMEDIATE 事务内调用）。`source_log_ids_json` 对编译审核固定为
+/// `[]`（§5.2）；`ON CONFLICT(domain,action,subject_json) DO NOTHING` 是幂等
+/// 保护（A10），返回实际插入行数（0 = 已存在被跳过）。
+/// The review-row insert body (D6: dead letters and consistency conflicts share
+/// review_queue; callable only inside a BEGIN IMMEDIATE transaction already held
+/// by the caller). `source_log_ids_json` is fixed to `[]` for compile audits
+/// (§5.2); `ON CONFLICT(domain,action,subject_json) DO NOTHING` is the
+/// idempotency guard (A10); returns the rows actually inserted (0 = skipped as
+/// existing).
+fn insert_review_on_conn(
+    tx: &mut SqliteConnection,
+    domain: &str,
+    action: &str,
+    subject_json: &str,
+    reason_json: &str,
+    compile_task_id: Option<i64>,
+    now: i64,
+) -> Result<usize> {
+    let affected = diesel::sql_query(
+        "INSERT INTO review_queue
+            (domain, action, source_log_ids_json, subject_json, reason_json, created_at,
+             compile_task_id)
+         VALUES (?, ?, '[]', ?, ?, ?, ?)
+         ON CONFLICT (domain, action, subject_json) DO NOTHING",
+    )
+    .bind::<diesel::sql_types::Text, _>(domain)
+    .bind::<diesel::sql_types::Text, _>(action)
+    .bind::<diesel::sql_types::Text, _>(subject_json)
+    .bind::<diesel::sql_types::Text, _>(reason_json)
+    .bind::<diesel::sql_types::BigInt, _>(now)
+    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(compile_task_id)
+    .execute(tx)?;
+    Ok(affected)
+}
+
+/// 死信入队（§6.3/D7 签名；仅可在调用方已持有的 BEGIN IMMEDIATE 事务内调用，
+/// 不得自行取连接/开事务——§8 的质量终态与回收终态共用外层事务）。
+/// Dead-letter enqueue (§6.3/D7 signature; callable only inside a BEGIN
+/// IMMEDIATE transaction already held by the caller — it never takes the
+/// connection or opens its own transaction, sharing the outer quality/recovery
+/// terminal transaction of §8).
+///
+/// subject 固定 `{"task_id":N}`；UNIQUE(domain,action,subject_json) + DO NOTHING
+/// 保证同 task 重复 finish/recover 只有一条（A10）；`compile_task_id` 回填
+/// （D7）。`epoch` 仅用于插入成功时的结构化日志（subject/reason 已含身份）。
+/// 返回实际插入行数（0 = 已存在被跳过；偏差 STEP8-025：spec §6.3 字面为
+/// `Result<()>`，为 `RecoveryStats.review_inserted` 精确计数改为 `Result<usize>`，
+/// 语义不变）。
+/// The subject is fixed `{"task_id":N}`; UNIQUE(domain,action,subject_json) with
+/// DO NOTHING keeps exactly one row across repeated finish/recover of the same
+/// task (A10); `compile_task_id` is backfilled (D7). `epoch` only feeds the
+/// structured log emitted on a fresh insert (subject/reason already carry the
+/// identity). Returns the rows actually inserted (0 = skipped as existing;
+/// deviation STEP8-025: spec §6.3 literally says `Result<()>`, widened to
+/// `Result<usize>` for an exact `RecoveryStats.review_inserted` count, semantics
+/// unchanged).
+pub(super) fn enqueue_dead_letter_on_conn(
+    tx: &mut SqliteConnection,
+    task_id: i64,
+    domain: &str,
+    epoch: i64,
+    reason_json: &str,
+    now: i64,
+) -> Result<usize> {
+    let subject = canonical_text(&serde_json::json!({ "task_id": task_id }))?;
+    let inserted = insert_review_on_conn(
+        tx,
+        domain,
+        "compile_dead_letter",
+        &subject,
+        reason_json,
+        Some(task_id),
+        now,
+    )?;
+    if inserted == 1 {
+        tracing::debug!(task_id, epoch, "compile dead letter enqueued");
+    }
+    Ok(inserted)
+}
+
+/// 从实体键解析 review 域（compile_tasks 无 domain 列；实体键
+/// `domain:type:slug` 的首段即域，解析失败 → Validation fail-closed）。
+/// Resolves the review domain from an entity key (compile_tasks has no domain
+/// column; the leading segment of `domain:type:slug` is the domain; a parse
+/// failure → Validation fail-closed).
+fn review_domain_of(entity_id: &str) -> Result<String> {
+    Ok(crate::types::EntityId::from_key(entity_id)?.domain)
 }
 
 /// 保守预留 B = system UTF8 bytes + input_json UTF8 bytes + 256 +
@@ -1054,13 +1346,21 @@ fn claim_in_transaction(
     }))
 }
 
-/// publish 事务主体（§8.2 接受事务步骤 1-10）。
-/// The publish transaction body (§8.2 accept transaction items 1-10).
+/// publish 事务主体（§8.2 接受事务步骤 1-10；Step8 批 B3：consistency 为
+/// `Some` 时在**同一事务**写 `page_quality.consistency` 与
+/// `compile_attempts.consistency_json`（`None` → SQL NULL / `'{}'`，Step8
+/// 「consistency 值与非 NULL consistency_json 在 publish 事务内写入」）。
+/// The publish transaction body (§8.2 accept transaction items 1-10; Step8
+/// batch B3: with a `Some` consistency the **same transaction** writes
+/// `page_quality.consistency` and `compile_attempts.consistency_json`
+/// (`None` → SQL NULL / `'{}'`, per Step8 "the consistency value and the
+/// non-NULL consistency_json are written inside the publish transaction").
 fn publish_in_transaction(
     tx: &mut SqliteConnection,
     lease: &TaskLease,
     page: &CompiledPage,
     report: &ScoreReport,
+    consistency: Option<&ConsistencyReport>,
     now: i64,
 ) -> Result<CommitOutcome> {
     let task: Option<PublishTaskRow> = diesel::sql_query(
@@ -1252,15 +1552,21 @@ fn publish_in_transaction(
             .execute(tx)?;
     }
 
-    // —— 步骤 6：upsert page_quality（四维实际值 + overall；consistency=NULL）。
-    // —— Item 6: upsert page_quality (actual four dimensions + overall;
-    //    consistency=NULL).
+    // —— 步骤 6：upsert page_quality（四维实际值 + overall + 一致性列；Step8：
+    //    一致性值以仲裁报告参数为权威源——score=None 或未仲裁 → SQL NULL，
+    //    Some(s) → 精确落库 0/1/分数，A6；executor 管线中该值与
+    //    report.quality.consistency 同源）。
+    // —— Item 6: upsert page_quality (actual four dimensions + overall + the
+    //    consistency column; Step8: the arbitration-report parameter is the
+    //    authoritative source of the consistency value — score=None or
+    //    un-arbitrated → SQL NULL, Some(s) → the exact 0/1/score, A6; in the
+    //    executor pipeline it mirrors report.quality.consistency).
     let quality_values = (
         page_quality_t::coverage.eq(f64::from(report.quality.coverage)),
         page_quality_t::citation.eq(f64::from(report.quality.citation)),
         page_quality_t::schema_compliance.eq(f64::from(report.quality.schema_compliance)),
         page_quality_t::density.eq(f64::from(report.quality.density)),
-        page_quality_t::consistency.eq(Option::<f64>::None),
+        page_quality_t::consistency.eq(consistency.and_then(|c| c.score).map(f64::from)),
         page_quality_t::overall.eq(f64::from(report.quality.overall())),
     );
     diesel::insert_into(page_quality_t::table)
@@ -1306,20 +1612,37 @@ fn publish_in_transaction(
     //    upsert already fired them inside this transaction.
 
     // —— 步骤 9：generations published → attempt completed/accepted → task
-    //    succeeded/accepted 清 lease。
+    //    succeeded/accepted 清 lease。Step8：consistency Some 时同一事务写
+    //    attempt 的 consistency_json（发布诊断：score/计数/findings 摘要；
+    //    None → 保持 '{}' 默认）。
     // —— Item 9: generations published → attempt completed/accepted → task
-    //    succeeded/accepted with lease cleared.
+    //    succeeded/accepted with lease cleared. Step8: with a Some consistency
+    //    the attempt's consistency_json is written in the same transaction (the
+    //    publish diagnostic: score/counts/findings summary; None keeps the
+    //    '{}' default).
+    let consistency_json = match consistency {
+        Some(c) => publish_consistency_json(
+            c,
+            lease.task_id,
+            lease.epoch,
+            i64::from(lease.attempt_no),
+            &t.entity_id,
+            &t.desired_hash,
+        )?,
+        None => "{}".to_string(),
+    };
     diesel::sql_query("UPDATE generations SET status = 'published' WHERE generation = ?")
         .bind::<diesel::sql_types::BigInt, _>(generation)
         .execute(tx)?;
     let affected = diesel::sql_query(
         "UPDATE compile_attempts
          SET status = 'completed', publish_status = 'accepted',
-             artifact_json = ?, quality_json = ?, finished_at = ?
+             artifact_json = ?, quality_json = ?, consistency_json = ?, finished_at = ?
          WHERE task_id = ? AND epoch = ? AND attempt_no = ? AND lease_token = ?",
     )
     .bind::<diesel::sql_types::Text, _>(&artifact_json)
     .bind::<diesel::sql_types::Text, _>(&quality_json)
+    .bind::<diesel::sql_types::Text, _>(&consistency_json)
     .bind::<diesel::sql_types::BigInt, _>(now)
     .bind::<diesel::sql_types::BigInt, _>(lease.task_id)
     .bind::<diesel::sql_types::BigInt, _>(lease.epoch)
@@ -1355,19 +1678,36 @@ fn publish_in_transaction(
     Ok(CommitOutcome::Accepted { generation })
 }
 
-/// 失败处置事务主体（§8.3）。
-/// The failure-disposition transaction body (§8.3).
+/// 失败处置事务主体（§8.3；Step8 批 B3：dead 终态与死信/一致性审核行同一
+/// 事务——§8 质量终态原子性，任一步失败整体回滚）。
+/// The failure-disposition transaction body (§8.3; Step8 batch B3: a dead
+/// terminal and its dead-letter/consistency review rows share one transaction —
+/// the §8 quality-terminal atomicity; any failure rolls everything back).
+///
+/// `consistency` 为本轮仲裁报告（executor 在 validate→score 之间产生）；仅当
+/// 报告携带 VALUE_DIVERGENCE findings 时视为「该轮有一致性冲突」：attempt 写入
+/// canonical 冲突诊断（consistency_json），刹车到顶的 dead 分支在同一事务插入
+/// compile_dead_letter + consistency_conflict 各一条（D5）；无冲突数据时
+/// consistency_json 保持 `'{}'`（§5.2「无可写数据时」）。
+/// `consistency` is this round's arbitration report (produced by the executor
+/// between validate and score); the round counts as "having a consistency
+/// conflict" only when the report carries VALUE_DIVERGENCE findings: the attempt
+/// stores the canonical conflict diagnostic (consistency_json), and the
+/// brake-exhausted dead branch inserts one compile_dead_letter plus one
+/// consistency_conflict in the same transaction (D5); without conflict data
+/// consistency_json stays `'{}'` (§5.2 "no writable data").
 fn finish_failure_in_transaction(
     tx: &mut SqliteConnection,
     lease: &TaskLease,
     failure: &CompileFailure,
     candidate: Option<&CompiledPage>,
     report: &ScoreReport,
+    consistency: Option<&ConsistencyReport>,
     now: i64,
 ) -> Result<FailureDisposition> {
     let task: Option<FailureTaskRow> = diesel::sql_query(
-        "SELECT epoch, status, lease_token, lease_expires_at, retry_count, max_retries,
-                recompile_count, dependencies_json
+        "SELECT entity_id, desired_hash, epoch, status, lease_token, lease_expires_at,
+                retry_count, max_retries, recompile_count, dependencies_json
          FROM compile_tasks WHERE task_id = ?",
     )
     .bind::<diesel::sql_types::BigInt, _>(lease.task_id)
@@ -1410,10 +1750,30 @@ fn finish_failure_in_transaction(
             };
             let issues_json = canonical_text(&report.issues)?;
             let quality_json = canonical_text(report)?;
+            // Step8 §5.2：该轮有 VALUE_DIVERGENCE findings 才生成冲突诊断，否则
+            // 保持 '{}'（无可写数据）；attempt 与死信 reason 复用同一份。
+            // Step8 §5.2: the conflict diagnostic is built only when this round
+            // carries VALUE_DIVERGENCE findings, otherwise '{}' (no writable
+            // data); the attempt and the dead-letter reason share one copy.
+            let conflict = consistency.filter(|c| !c.findings.is_empty());
+            let conflict_json = match conflict {
+                Some(c) => Some(consistency_diagnostic_json(
+                    CONSISTENCY_CONFLICT,
+                    lease.task_id,
+                    lease.epoch,
+                    i64::from(lease.attempt_no),
+                    &t.entity_id,
+                    &t.desired_hash,
+                    consistency_findings_json(c),
+                )?),
+                None => None,
+            };
+            let consistency_json = conflict_json.clone().unwrap_or_else(|| "{}".into());
             let affected = diesel::sql_query(
                 "UPDATE compile_attempts
                  SET status = 'completed', publish_status = ?, artifact_json = ?,
-                     quality_json = ?, issues_json = ?, error_code = ?, finished_at = ?
+                     quality_json = ?, issues_json = ?, error_code = ?, finished_at = ?,
+                     consistency_json = ?
                  WHERE task_id = ? AND epoch = ? AND attempt_no = ? AND lease_token = ?",
             )
             .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
@@ -1430,6 +1790,7 @@ fn finish_failure_in_transaction(
             .bind::<diesel::sql_types::Text, _>(&issues_json)
             .bind::<diesel::sql_types::Text, _>(code)
             .bind::<diesel::sql_types::BigInt, _>(now)
+            .bind::<diesel::sql_types::Text, _>(&consistency_json)
             .bind::<diesel::sql_types::BigInt, _>(lease.task_id)
             .bind::<diesel::sql_types::BigInt, _>(lease.epoch)
             .bind::<diesel::sql_types::BigInt, _>(i64::from(lease.attempt_no))
@@ -1463,6 +1824,44 @@ fn finish_failure_in_transaction(
                     return Err(Error::Internal(
                         "failure: task update lost the lease".into(),
                     ));
+                }
+                // —— Step8 D5/D7（A9/A10）：dead 终态与审核入队同一事务。死信恒
+                //    插（有冲突时 reason 即冲突诊断，code=CONSISTENCY_CONFLICT；
+                //    否则 code=失败码、findings 空）；consistency_conflict 行仅在
+                //    该轮确有 VALUE_DIVERGENCE 冲突时插入。DO NOTHING 幂等保证
+                //    重复 finish 不产生第二条（A10）。
+                // —— Step8 D5/D7 (A9/A10): the dead terminal and the review
+                //    inserts share one transaction. The dead letter always lands
+                //    (reason = the conflict diagnostic with
+                //    code=CONSISTENCY_CONFLICT when conflicting, otherwise the
+                //    failure code with empty findings); the consistency_conflict
+                //    row lands only when this round truly diverged. DO NOTHING
+                //    idempotency keeps repeated finishes at one row (A10).
+                let domain = review_domain_of(&t.entity_id)?;
+                let reason = match &conflict_json {
+                    Some(text) => text.clone(),
+                    None => consistency_diagnostic_json(
+                        code,
+                        lease.task_id,
+                        lease.epoch,
+                        i64::from(lease.attempt_no),
+                        &t.entity_id,
+                        &t.desired_hash,
+                        Vec::new(),
+                    )?,
+                };
+                enqueue_dead_letter_on_conn(tx, lease.task_id, &domain, lease.epoch, &reason, now)?;
+                if conflict.is_some() {
+                    let subject = canonical_text(&serde_json::json!({ "task_id": lease.task_id }))?;
+                    insert_review_on_conn(
+                        tx,
+                        &domain,
+                        "consistency_conflict",
+                        &subject,
+                        &reason,
+                        Some(lease.task_id),
+                        now,
+                    )?;
                 }
                 Ok(FailureDisposition::Quarantined)
             } else {
@@ -1542,6 +1941,22 @@ fn finish_failure_in_transaction(
                         "failure: task update lost the lease".into(),
                     ));
                 }
+                // —— Step8 D7（A10）：传输耗尽 dead 与死信入队同一事务（仅死信
+                //    一条；无一致性冲突行——该路径从未仲裁）。
+                // —— Step8 D7 (A10): the transport-exhausted dead terminal and
+                //    its dead letter share one transaction (a single dead letter
+                //    and no consistency row — this path never arbitrated).
+                let domain = review_domain_of(&t.entity_id)?;
+                let reason = consistency_diagnostic_json(
+                    code,
+                    lease.task_id,
+                    lease.epoch,
+                    i64::from(lease.attempt_no),
+                    &t.entity_id,
+                    &t.desired_hash,
+                    Vec::new(),
+                )?;
+                enqueue_dead_letter_on_conn(tx, lease.task_id, &domain, lease.epoch, &reason, now)?;
                 Ok(FailureDisposition::Failed)
             } else {
                 // Retry-After 钳制 0..=300 秒（§4）；无值用 min(2^(retry-1),60)（§8.3）。
@@ -1614,6 +2029,72 @@ fn finish_failure_in_transaction(
             Ok(FailureDisposition::Failed)
         }
     }
+}
+
+/// 按单行 pages 记录组装完整 CompiledPage（§8.1）：sections/qug_edges 逐页读取，
+/// evidence 从最新 accepted attempt 的 artifact_json 还原。quality 由调用方按各自
+/// 读取形状传入（load_accepted_pages 读四维、top_k_related_pages 额外读
+/// consistency 列）。
+/// Assembles a full CompiledPage from one pages row (§8.1): sections/qug_edges
+/// are read per page and evidence is restored from the newest accepted attempt's
+/// artifact_json. The caller supplies quality per its own read shape
+/// (load_accepted_pages reads the four dimensions; top_k_related_pages
+/// additionally reads the consistency column).
+fn assemble_compiled_page(
+    tx: &mut SqliteConnection,
+    row: AcceptedPageFullRow,
+    quality: QualityScore,
+) -> Result<CompiledPage> {
+    let entity_id = crate::types::EntityId::from_key(&row.entity_id)?;
+    let frontmatter: StoredFrontmatter =
+        serde_json::from_str(&row.frontmatter_json).unwrap_or_default();
+    let sections: Vec<SectionRow> = diesel::sql_query(
+        "SELECT heading, content FROM page_sections
+         WHERE page_id = ? ORDER BY section_index",
+    )
+    .bind::<diesel::sql_types::Text, _>(&row.page_id)
+    .load(tx)?;
+    let edges: Vec<EdgeJsonRow> =
+        diesel::sql_query("SELECT edge_json FROM qug_edges WHERE page_id = ? ORDER BY edge_hash")
+            .bind::<diesel::sql_types::Text, _>(&row.page_id)
+            .load(tx)?;
+    let qug_edges: Vec<QugEdge> = edges
+        .iter()
+        .map(|e| serde_json::from_str(&e.edge_json))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let evidence = load_page_evidence(
+        tx,
+        &row.entity_id,
+        row.source_revision,
+        &row.domain_pack_version,
+    )?;
+    Ok(CompiledPage {
+        wiki: WikiPage {
+            page_id: row.page_id,
+            entity_id,
+            title: row.title,
+            content: row.content,
+            sections: sections
+                .into_iter()
+                .map(|s| Section {
+                    heading: s.heading,
+                    content: s.content,
+                })
+                .collect(),
+            metadata: PageMetadata {
+                domain_pack_version: row.domain_pack_version,
+                compiled_at: row.compiled_at,
+                model_version: row.model_version,
+                embedding_model: row.embedding_model,
+            },
+            aliases: frontmatter.aliases,
+            tags: frontmatter.tags,
+        },
+        quality,
+        qug_edges,
+        content_hash: row.content_hash,
+        evidence,
+    })
 }
 
 /// 从最新 accepted attempt 的 artifact_json 还原 evidence（§8.1：pages 只存
@@ -1728,16 +2209,24 @@ impl SqliteKernel {
         Ok(affected == 1)
     }
 
-    /// 过期租约回收（§8.3）：扫描 `running AND lease_expires_at<=now`，事务内以旧
-    /// token CAS 将 reserved attempt 置 abandoned、retry_count+1（保留全部 token
-    /// 预留）、清 lease；新 source head → succeeded/superseded；超限 → dead/failed；
-    /// 否则 pending/退避。重复回收不重复计数。
-    /// Expired-lease recovery (§8.3): scans `running AND lease_expires_at<=now`,
-    /// then per task inside one transaction: the reserved attempt is abandoned via
+    /// 过期租约回收（§8.3；Step8 §6.3/D8 返回结构化 [`RecoveryStats`]）：扫描
+    /// `running AND lease_expires_at<=now`，事务内以旧 token CAS 将 reserved
+    /// attempt 置 abandoned、retry_count+1（保留全部 token 预留）、清 lease；
+    /// 新 source head → succeeded/superseded；超限 → dead/failed 且同一事务死信
+    /// 入队（Step8 D7/A10）；否则 pending/退避。重复回收不重复计数、不重复插行。
+    /// 五分支计数（recovered_pending/dead_failed/dead_quarantined/superseded/
+    /// review_inserted）+ 扫描数随 [`RecoveryStats`] 返回。
+    /// Expired-lease recovery (§8.3; Step8 §6.3/D8 returns the structured
+    /// [`RecoveryStats`]): scans `running AND lease_expires_at<=now`, then per
+    /// task inside one transaction: the reserved attempt is abandoned via
     /// old-token CAS, retry_count+1 (all token reservations kept), lease cleared;
-    /// a moved source head → succeeded/superseded; retries exhausted → dead/failed;
-    /// otherwise pending with backoff. Repeated recovery never double-counts.
-    pub fn recover_compile_leases(&self, now: i64) -> Result<u64> {
+    /// a moved source head → succeeded/superseded; retries exhausted → dead/failed
+    /// with a dead letter enqueued in the same transaction (Step8 D7/A10);
+    /// otherwise pending with backoff. Repeated recovery never double-counts nor
+    /// double-inserts. The five per-branch counters (recovered_pending/
+    /// dead_failed/dead_quarantined/superseded/review_inserted) plus the scan
+    /// count are returned via [`RecoveryStats`].
+    pub fn recover_compile_leases(&self, now: i64) -> Result<RecoveryStats> {
         let mut conn = self.lock_conn()?;
         conn.immediate_transaction(|tx| {
             let rows: Vec<ExpiredLeaseRow> = diesel::sql_query(
@@ -1749,8 +2238,9 @@ impl SqliteKernel {
             )
             .bind::<diesel::sql_types::BigInt, _>(now)
             .load(tx)?;
-            let mut recovered = 0u64;
+            let mut stats = RecoveryStats::default();
             for t in rows {
+                stats.scanned += 1;
                 // reserved attempt → abandoned（保留 reserved_tokens，不退还，§8.3）。
                 // Reserved attempt → abandoned (reserved_tokens kept, §8.3).
                 diesel::sql_query(
@@ -1779,6 +2269,10 @@ impl SqliteKernel {
                     .retry_count
                     .checked_add(1)
                     .ok_or_else(|| Error::Internal("retry_count overflow".into()))?;
+                // 本行 dead 分支实际插入的审核行数（仅 dead 分支入队，Step8 D7）。
+                // Review rows actually inserted by this row's dead branch (only the
+                // dead branch enqueues, Step8 D7).
+                let mut review_rows = 0u64;
                 let affected = if superseded {
                     diesel::sql_query(
                         "UPDATE compile_tasks
@@ -1791,7 +2285,7 @@ impl SqliteKernel {
                     .bind::<diesel::sql_types::Text, _>(&t.lease_token)
                     .execute(tx)?
                 } else if new_retry >= t.max_retries {
-                    diesel::sql_query(
+                    let affected = diesel::sql_query(
                         "UPDATE compile_tasks
                          SET status = 'dead', result = 'failed', retry_count = ?,
                              lease_token = NULL, lease_expires_at = 0,
@@ -1802,7 +2296,30 @@ impl SqliteKernel {
                     .bind::<diesel::sql_types::BigInt, _>(now)
                     .bind::<diesel::sql_types::BigInt, _>(t.task_id)
                     .bind::<diesel::sql_types::Text, _>(&t.lease_token)
-                    .execute(tx)?
+                    .execute(tx)?;
+                    // —— Step8 D7（A10）：回收 dead 终态与死信入队同一事务
+                    //    （§8 回收终态原子性）；DO NOTHING 保证重复回收不重复
+                    //    插行。attempt_no 记被弃的预留 attempt。
+                    // —— Step8 D7 (A10): the recovery dead terminal and its dead
+                    //    letter share one transaction (the §8 recovery-terminal
+                    //    atomicity); DO NOTHING keeps repeated recoveries at one
+                    //    row. attempt_no records the abandoned reserved attempt.
+                    if affected == 1 {
+                        let domain = review_domain_of(&t.entity_id)?;
+                        let reason = consistency_diagnostic_json(
+                            "LEASE_EXPIRED_RETRY_EXHAUSTED",
+                            t.task_id,
+                            t.epoch,
+                            t.attempt_count,
+                            &t.entity_id,
+                            &t.desired_hash,
+                            Vec::new(),
+                        )?;
+                        review_rows += enqueue_dead_letter_on_conn(
+                            tx, t.task_id, &domain, t.epoch, &reason, now,
+                        )? as u64;
+                    }
+                    affected
                 } else {
                     let at = now + backoff_seconds(new_retry);
                     diesel::sql_query(
@@ -1818,54 +2335,77 @@ impl SqliteKernel {
                     .bind::<diesel::sql_types::Text, _>(&t.lease_token)
                     .execute(tx)?
                 };
-                // WHERE lease_token=旧 token：重复回收不重复计数（§8.3）。
+                // WHERE lease_token=旧 token：重复回收不重复计数（§8.3）；Step8
+                // §6.3 按分支落 RecoveryStats 计数。
                 // WHERE lease_token=<old token>: repeated recovery never
-                // double-counts (§8.3).
+                // double-counts (§8.3); Step8 §6.3 lands the per-branch
+                // RecoveryStats counters.
                 if affected == 1 {
-                    recovered += 1;
+                    if superseded {
+                        stats.superseded += 1;
+                    } else if new_retry >= t.max_retries {
+                        stats.dead_failed += 1;
+                        stats.review_inserted += review_rows;
+                    } else {
+                        stats.recovered_pending += 1;
+                    }
                 }
             }
-            Ok(recovered)
+            Ok(stats)
         })
     }
 
     /// 接受事务（§8.2 步骤 1-10）：校验 tuple 与 head → 插 generations building →
     /// upsert pages/sections/quality/edges（FTS 由 trigger 同步）→ published →
     /// attempt completed/accepted → task succeeded/accepted；任一步失败整事务
-    /// 回滚；幂等重放返回既有 generation。
+    /// 回滚；幂等重放返回既有 generation。Step8 批 B3：`consistency` 为 Some 时
+    /// 同一事务写 `page_quality.consistency` 与 attempt 的 `consistency_json`。
     /// The accept transaction (§8.2 items 1-10): validate tuple and head → insert
     /// a building generation → upsert pages/sections/quality/edges (FTS synced by
     /// triggers) → published → attempt completed/accepted → task succeeded/
     /// accepted; any failure rolls everything back; idempotent replay returns the
-    /// existing generation.
+    /// existing generation. Step8 batch B3: with a `Some` consistency the same
+    /// transaction writes `page_quality.consistency` and the attempt's
+    /// `consistency_json`.
     pub fn publish_compile(
         &self,
         lease: &TaskLease,
         page: &CompiledPage,
         report: &ScoreReport,
+        consistency: Option<&ConsistencyReport>,
         now: i64,
     ) -> Result<CommitOutcome> {
         let mut conn = self.lock_conn()?;
-        conn.immediate_transaction(|tx| publish_in_transaction(tx, lease, page, report, now))
+        conn.immediate_transaction(|tx| {
+            publish_in_transaction(tx, lease, page, report, consistency, now)
+        })
     }
 
-    /// 失败处置事务（§8.3）：质量类消耗 recompile_count、传输类消耗 retry_count、
-    /// 永久错误直接终态；所有更新绑定 lease tuple（fencing），不动发布面。
-    /// The failure-disposition transaction (§8.3): quality failures consume
-    /// recompile_count, transport failures retry_count, permanent errors terminate;
-    /// every update binds the lease tuple (fencing) and never touches the publish
-    /// surface.
+    /// 失败处置事务（§8.3；Step8 批 B3）：质量类消耗 recompile_count、传输类消耗
+    /// retry_count、永久错误直接终态；所有更新绑定 lease tuple（fencing），不动
+    /// 发布面。dead 终态（页级刹车/传输耗尽）在同一事务死信入队（D7），刹车到顶
+    /// 且本轮有 VALUE_DIVERGENCE 冲突时另插一条 consistency_conflict（D5）；
+    /// attempt 按 §5.2 写 consistency_json（无冲突数据保持 '{}'）。
+    /// The failure-disposition transaction (§8.3; Step8 batch B3): quality
+    /// failures consume recompile_count, transport failures retry_count,
+    /// permanent errors terminate; every update binds the lease tuple (fencing)
+    /// and never touches the publish surface. A dead terminal (page brake /
+    /// transport exhaustion) enqueues its dead letter in the same transaction
+    /// (D7), and a brake exhaustion whose round truly diverged additionally
+    /// inserts one consistency_conflict row (D5); the attempt stores
+    /// consistency_json per §5.2 (staying '{}' without conflict data).
     pub fn finish_compile_failure(
         &self,
         lease: &TaskLease,
         failure: &CompileFailure,
         candidate: Option<&CompiledPage>,
         report: &ScoreReport,
+        consistency: Option<&ConsistencyReport>,
         now: i64,
     ) -> Result<FailureDisposition> {
         let mut conn = self.lock_conn()?;
         conn.immediate_transaction(|tx| {
-            finish_failure_in_transaction(tx, lease, failure, candidate, report, now)
+            finish_failure_in_transaction(tx, lease, failure, candidate, report, consistency, now)
         })
     }
 
@@ -1936,12 +2476,14 @@ impl SqliteKernel {
     }
 
     /// 读取某 domain 全部 accepted 页（§8.2）：按 page_id 序组装 CompiledPage
-    /// （quality 四维 + overall，consistency=NULL）；evidence 从该任务最新
-    /// accepted attempt 的 artifact_json 还原——legacy/seed 页无 attempt 载荷，
-    /// evidence 为 None（§10：不能伪造回填）。
+    /// （quality 四维 + overall + 一致性列——Step8 批 B3 起该列由 publish 写入，
+    /// 旧行/未仲裁行为 NULL）；evidence 从该任务最新 accepted attempt 的
+    /// artifact_json 还原——legacy/seed 页无 attempt 载荷，evidence 为 None
+    /// （§10：不能伪造回填）。
     /// Reads every accepted page of a domain (§8.2), assembling CompiledPage in
-    /// page_id order (quality four dimensions + overall, consistency=NULL);
-    /// evidence is restored from the task's newest accepted attempt's
+    /// page_id order (quality four dimensions + overall + the consistency column,
+    /// written by publish since Step8 batch B3 and NULL for legacy/un-arbitrated
+    /// rows); evidence is restored from the task's newest accepted attempt's
     /// artifact_json — legacy/seed pages have no attempt payload, so their
     /// evidence is None (§10: never fabricated back).
     pub fn load_accepted_pages(&self, domain: &str) -> Result<Vec<CompiledPage>> {
@@ -1960,11 +2502,8 @@ impl SqliteKernel {
 
             let mut out = Vec::with_capacity(rows.len());
             for r in rows {
-                let entity_id = crate::types::EntityId::from_key(&r.entity_id)?;
-                let frontmatter: StoredFrontmatter =
-                    serde_json::from_str(&r.frontmatter_json).unwrap_or_default();
                 let quality: Option<QualityRow> = diesel::sql_query(
-                    "SELECT coverage, citation, schema_compliance, density
+                    "SELECT coverage, citation, schema_compliance, density, consistency
                      FROM page_quality WHERE page_id = ?",
                 )
                 .bind::<diesel::sql_types::Text, _>(&r.page_id)
@@ -1976,7 +2515,7 @@ impl SqliteKernel {
                         citation: q.citation as f32,
                         schema_compliance: q.schema_compliance as f32,
                         density: q.density as f32,
-                        consistency: None,
+                        consistency: q.consistency.map(|c| c as f32),
                     })
                     .unwrap_or(QualityScore {
                         coverage: 0.0,
@@ -1985,54 +2524,90 @@ impl SqliteKernel {
                         density: 0.0,
                         consistency: None,
                     });
-                let sections: Vec<SectionRow> = diesel::sql_query(
-                    "SELECT heading, content FROM page_sections
-                     WHERE page_id = ? ORDER BY section_index",
+                out.push(assemble_compiled_page(tx, r, quality)?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// 一致性相关页有界召回（Step8 §6.1 provider 段）：FTS 命中的 accepted 页按
+    /// bm25、page_id 稳定排序并 LIMIT `limit`，随后只装载这些页的载荷（绝不先
+    /// 全量 SELECT 再内存截断）。`exclude_page_id` 为候选页自身（其旧 generation
+    /// 行也不得计入，A8）；SQL 构造（含引号转义）全部落 kernel，锁一次不跨 await。
+    /// Bounded related-page recall for consistency (Step8 §6.1 provider
+    /// paragraph): FTS-matched accepted pages, stably ordered by bm25/page_id and
+    /// LIMIT `limit`; only those pages' payloads are loaded (never a full SELECT
+    /// followed by in-memory truncation). `exclude_page_id` is the candidate
+    /// itself (its old-generation row must not count either, A8); SQL construction
+    /// (with quote escaping) lives entirely in the kernel — one lock, never across
+    /// await.
+    ///
+    /// `terms` 为空或 `limit == 0` 直接返回空集合，不发起 SQL；`limit` 再钳制到
+    /// 1..=32（A4 防御边界，与 provider 侧一致）。
+    /// Empty `terms` or `limit == 0` returns an empty set without SQL; `limit` is
+    /// additionally clamped to 1..=32 (the A4 defensive edge, matching the
+    /// provider side).
+    pub fn top_k_related_pages(
+        &self,
+        terms: &[String],
+        exclude_page_id: &str,
+        limit: u32,
+    ) -> Result<Vec<CompiledPage>> {
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, crate::compile::consistency::MAX_CONSISTENCY_TOP_K) as i64;
+        // MATCH 词组双引号转义（与 kernel search 的 FTS 惯例一致），OR 连接多词。
+        // Double-quote escaping for MATCH phrases (same FTS convention as the
+        // kernel search), multiple terms joined with OR.
+        let match_expr = terms
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let mut conn = self.lock_conn()?;
+        conn.immediate_transaction(|tx| {
+            let rows: Vec<AcceptedPageFullRow> = diesel::sql_query(
+                "SELECT p.page_id, p.entity_id, p.source_revision, p.title, p.content,
+                        p.content_hash, p.domain_pack_version, p.compiled_at,
+                        p.model_version, p.embedding_model, p.frontmatter_json,
+                        -bm25(pages_fts) AS score
+                 FROM pages_fts f
+                 JOIN pages p ON p.page_id = f.page_id
+                 WHERE f.pages_fts MATCH ? AND p.status = 'accepted' AND p.page_id != ?
+                 ORDER BY score DESC, p.page_id ASC
+                 LIMIT ?",
+            )
+            .bind::<diesel::sql_types::Text, _>(&match_expr)
+            .bind::<diesel::sql_types::Text, _>(exclude_page_id)
+            .bind::<diesel::sql_types::BigInt, _>(limit)
+            .load(tx)?;
+
+            let mut out = Vec::with_capacity(rows.len());
+            for r in rows {
+                let quality: Option<RelatedQualityRow> = diesel::sql_query(
+                    "SELECT coverage, citation, schema_compliance, density, consistency
+                     FROM page_quality WHERE page_id = ?",
                 )
                 .bind::<diesel::sql_types::Text, _>(&r.page_id)
-                .load(tx)?;
-                let edges: Vec<EdgeJsonRow> = diesel::sql_query(
-                    "SELECT edge_json FROM qug_edges WHERE page_id = ? ORDER BY edge_hash",
-                )
-                .bind::<diesel::sql_types::Text, _>(&r.page_id)
-                .load(tx)?;
-                let qug_edges: Vec<QugEdge> = edges
-                    .iter()
-                    .map(|e| serde_json::from_str(&e.edge_json))
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                let evidence = load_page_evidence(
-                    tx,
-                    &r.entity_id,
-                    r.source_revision,
-                    &r.domain_pack_version,
-                )?;
-                out.push(CompiledPage {
-                    wiki: WikiPage {
-                        page_id: r.page_id,
-                        entity_id,
-                        title: r.title,
-                        content: r.content,
-                        sections: sections
-                            .into_iter()
-                            .map(|s| Section {
-                                heading: s.heading,
-                                content: s.content,
-                            })
-                            .collect(),
-                        metadata: PageMetadata {
-                            domain_pack_version: r.domain_pack_version,
-                            compiled_at: r.compiled_at,
-                            model_version: r.model_version,
-                            embedding_model: r.embedding_model,
-                        },
-                        aliases: frontmatter.aliases,
-                        tags: frontmatter.tags,
-                    },
-                    quality,
-                    qug_edges,
-                    content_hash: r.content_hash,
-                    evidence,
-                });
+                .get_result(tx)
+                .optional()?;
+                let quality = quality
+                    .map(|q| QualityScore {
+                        coverage: q.coverage as f32,
+                        citation: q.citation as f32,
+                        schema_compliance: q.schema_compliance as f32,
+                        density: q.density as f32,
+                        consistency: q.consistency.map(|c| c as f32),
+                    })
+                    .unwrap_or(QualityScore {
+                        coverage: 0.0,
+                        citation: 0.0,
+                        schema_compliance: 0.0,
+                        density: 0.0,
+                        consistency: None,
+                    });
+                out.push(assemble_compiled_page(tx, r, quality)?);
             }
             Ok(out)
         })
@@ -2119,12 +2694,152 @@ impl SqliteKernel {
         .load(&mut *conn)?;
         Ok(rows.into_iter().map(|r| r.page_id).collect())
     }
+
+    // ===== Step8 批 B5：兼容 preflight 读取面（§6.4/D10/D11；只读）=====
+    // ===== Step8 batch B5: compatibility-preflight read surface (§6.4/D10/D11;
+    // read-only) =====
+
+    /// 兼容 preflight：读取某 domain 全部 accepted 页的身份四列（§6.4；纯
+    /// SELECT，一次连接锁、无事务、无写入）。`page_id` 序稳定，报告确定性。
+    /// Compatibility preflight: reads the four identity columns of every
+    /// accepted page of a domain (§6.4; a pure SELECT — one connection lock, no
+    /// transaction, no writes). Stable `page_id` order keeps reports
+    /// deterministic.
+    pub fn compatibility_page_identities(
+        &self,
+        domain: &str,
+    ) -> Result<Vec<PersistedPageIdentity>> {
+        let mut conn = self.lock_conn()?;
+        let rows: Vec<CompatPageRow> = diesel::sql_query(
+            "SELECT page_id, domain_pack_version, artifact_version, frontmatter_json
+             FROM pages
+             WHERE domain = ? AND status = 'accepted'
+             ORDER BY page_id",
+        )
+        .bind::<diesel::sql_types::Text, _>(domain)
+        .load(&mut *conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PersistedPageIdentity {
+                page_id: r.page_id,
+                domain_pack_version: r.domain_pack_version,
+                artifact_version: r.artifact_version,
+                frontmatter_json: r.frontmatter_json,
+            })
+            .collect())
+    }
+
+    /// 兼容 preflight：读取全部 pending/running/dead 任务的 dependencies_json
+    /// 快照（§6.4「所有 pending/running/dead tasks 的 dependencies_json 快照」；
+    /// succeeded/superseded 历史不算当前产物）。compile_tasks 无 domain 列
+    /// （Step4 先例），域过滤由 checker 按实体键首段精确比较，不做 LIKE 通配
+    /// 转义。task_id 序稳定。
+    /// Compatibility preflight: reads every pending/running/dead task's
+    /// dependencies_json snapshot (§6.4 "all pending/running/dead tasks'
+    /// dependencies_json snapshots"; succeeded/superseded history is not a
+    /// current artifact). compile_tasks has no domain column (a Step4
+    /// precedent), so the checker scopes the domain by exact comparison of the
+    /// entity key's leading segment instead of LIKE-escape juggling. Stable
+    /// task_id order.
+    pub fn compatibility_task_snapshots(&self) -> Result<Vec<PersistedTaskSnapshot>> {
+        let mut conn = self.lock_conn()?;
+        let rows: Vec<CompatTaskRow> = diesel::sql_query(
+            "SELECT task_id, entity_id, dependencies_json
+             FROM compile_tasks
+             WHERE status IN ('pending', 'running', 'dead')
+             ORDER BY task_id",
+        )
+        .load(&mut *conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PersistedTaskSnapshot {
+                task_id: r.task_id,
+                entity_id: r.entity_id,
+                dependencies_json: r.dependencies_json,
+            })
+            .collect())
+    }
+
+    /// `--skip-compatibility-check` 的 fail-closed 判定（§7）：数据库是否存在旧
+    /// artifact——任意 domain 的 accepted 页，或任意 pending/running/dead 任务。
+    /// 「空数据库」按字面全局口径：任何旧数据都拒绝跳过（A15 fail-closed）。
+    /// 只读，一次连接锁。
+    /// The fail-closed decision behind `--skip-compatibility-check` (§7): does
+    /// the database hold any old artifact — an accepted page of any domain, or
+    /// any pending/running/dead task. "Empty database" is taken literally and
+    /// globally: any old data refuses the skip (A15 fail-closed). Read-only, one
+    /// connection lock.
+    pub fn has_existing_compile_data(&self) -> Result<bool> {
+        let mut conn = self.lock_conn()?;
+        let row: CountRow = diesel::sql_query(
+            "SELECT CASE
+                 WHEN EXISTS(SELECT 1 FROM pages WHERE status = 'accepted') THEN 1
+                 WHEN EXISTS(SELECT 1 FROM compile_tasks
+                             WHERE status IN ('pending', 'running', 'dead')) THEN 1
+                 ELSE 0 END AS n",
+        )
+        .get_result(&mut *conn)?;
+        Ok(row.n > 0)
+    }
+
+    /// 兼容告警入队（§5.2/§6.4/D11/A16）：独立 BEGIN IMMEDIATE 写事务——
+    /// `subject_json`/`reason_json` 必须为 JSON 对象（B3 宽松校验同纪律），表内
+    /// `UNIQUE(domain,action,subject_json)` 冲突 `DO NOTHING` 幂等跳过；返回实际
+    /// 插入行数（0 = 已存在被跳过，重复 run 不新增告警）。`compile_task_id`
+    /// 恒为 NULL（admission 被拒，无任务可回填）。
+    /// Compatibility-alert enqueue (§5.2/§6.4/D11/A16): one standalone BEGIN
+    /// IMMEDIATE write transaction — `subject_json`/`reason_json` must be JSON
+    /// objects (the same relaxed B3 validation), and the table's
+    /// `UNIQUE(domain,action,subject_json)` conflict is idempotently skipped via
+    /// `DO NOTHING`; returns the rows actually inserted (0 = skipped as
+    /// existing, so repeated runs never add alerts). `compile_task_id` stays
+    /// NULL (admission was refused — no task to backfill).
+    pub fn insert_compatibility_conflict_review(
+        &self,
+        domain: &str,
+        subject_json: &str,
+        reason_json: &str,
+        now: i64,
+    ) -> Result<usize> {
+        // 纯校验先于写锁（任一非法 → Validation，不取锁、不落行）。
+        // Pure validation precedes the write lock (any illegal input →
+        // Validation, no lock taken, no rows written).
+        let subject_is_object = serde_json::from_str::<serde_json::Value>(subject_json)
+            .map(|v| v.is_object())
+            .unwrap_or(false);
+        if !subject_is_object {
+            return Err(Error::Validation(
+                "compatibility_conflict subject_json must be a JSON object".into(),
+            ));
+        }
+        if serde_json::from_str::<serde_json::Value>(reason_json).is_err() {
+            return Err(Error::Validation(
+                "compatibility_conflict reason_json must be parseable JSON".into(),
+            ));
+        }
+        let mut conn = self.lock_conn()?;
+        conn.immediate_transaction(|tx| {
+            insert_review_on_conn(
+                tx,
+                domain,
+                "compatibility_conflict",
+                subject_json,
+                reason_json,
+                None,
+                now,
+            )
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compile::config::prepare_source;
+    use crate::compile::compatibility::{
+        CompatibilityChecker, StandardCompatibilityChecker, COMPATIBILITY_ARTIFACT_NOT_ALLOWED,
+        COMPATIBILITY_CORRUPT_SNAPSHOT, COMPATIBILITY_VERSION_MISSING, COMPATIBILITY_VERSION_RANGE,
+    };
+    use crate::compile::config::{prepare_source, CompatibilitySpec, DomainIdentity};
     use crate::compile::contract::{
         render_canonical_markdown, Assertion, DefaultSourceRefValidator, EvidenceSection,
         OutputWiki, SourceRef, SourceRefValidator,
@@ -2172,6 +2887,8 @@ mod tests {
             embedding_model: "none".into(),
             quality_threshold: 0.75,
             require_source_refs: true,
+            schema_version: None,
+            prompt_version: None,
         }
     }
 
@@ -2454,7 +3171,7 @@ mod tests {
 
         let (page, report) = accepted_page(&p);
         let outcome = kernel
-            .publish_compile(&lease, &page, &report, 1000)
+            .publish_compile(&lease, &page, &report, None, 1000)
             .unwrap();
         let generation = match outcome {
             CommitOutcome::Accepted { generation } => generation,
@@ -2487,7 +3204,7 @@ mod tests {
         // Idempotent replay: re-publishing with the same lease returns the existing
         // generation (A16).
         let replay = kernel
-            .publish_compile(&lease, &page, &report, 1001)
+            .publish_compile(&lease, &page, &report, None, 1001)
             .unwrap();
         assert_eq!(replay, CommitOutcome::Accepted { generation });
         assert_eq!(
@@ -2545,7 +3262,9 @@ mod tests {
             .unwrap();
         // worker A 停摆到租约过期（1000+300）。
         // Worker A stalls past its lease (1000+300).
-        assert_eq!(kernel.recover_compile_leases(1301).unwrap(), 1);
+        let recovery = kernel.recover_compile_leases(1301).unwrap();
+        assert_eq!(recovery.recovered_pending, 1);
+        assert_eq!(recovery.scanned, 1);
         let t = task_state(&kernel, task_id);
         assert_eq!(t.status, "pending");
         assert_eq!(t.retry_count, 1);
@@ -2554,7 +3273,10 @@ mod tests {
 
         // 反复回收不重复计数（§8.3）。
         // Repeated recovery never double-counts (§8.3).
-        assert_eq!(kernel.recover_compile_leases(1301).unwrap(), 0);
+        assert_eq!(
+            kernel.recover_compile_leases(1301).unwrap(),
+            RecoveryStats::default()
+        );
         assert_eq!(task_state(&kernel, task_id).retry_count, 1);
         // 预留不退还（§8.3/§8.4）。
         // Reservations are never refunded (§8.3/§8.4).
@@ -2577,7 +3299,7 @@ mod tests {
         let (page, report) = accepted_page(&p);
         assert_eq!(
             kernel
-                .publish_compile(&lease_a, &page, &report, 1302)
+                .publish_compile(&lease_a, &page, &report, None, 1302)
                 .unwrap(),
             CommitOutcome::Stale
         );
@@ -2591,6 +3313,7 @@ mod tests {
                     &CompileFailure::invalid("LOW", "{}"),
                     Some(&low),
                     &low_report,
+                    None,
                     1302
                 )
                 .unwrap(),
@@ -2616,10 +3339,120 @@ mod tests {
         // B publishes successfully.
         assert_eq!(
             kernel
-                .publish_compile(&lease_b, &page, &report, 1302)
+                .publish_compile(&lease_b, &page, &report, None, 1302)
                 .unwrap(),
             CommitOutcome::Accepted { generation: 1 }
         );
+    }
+
+    // A12（Step8 批 B4）：心跳续租——claim 后多次心跳推进注入时间，租约窗口
+    // 跨过 300s 仍恒为 now+300（未来）；status/计数不被心跳改动。
+    // A12 (Step8 batch B4): heartbeat renewal — multiple heartbeats advance the
+    // injected time past the claim; the lease window stays now+300 (in the
+    // future) across the 300s mark; status/counters are untouched by the
+    // heartbeat.
+    #[test]
+    fn a12_heartbeat_renewal_keeps_lease_alive_past_window() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let p = prepared(1);
+        let task_id = queued(&kernel, &p);
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+
+        // 心跳跨两个窗口推进：expires 恒 = 本次心跳 now+300（A12「等待超过
+        // 300 秒仍保持 lease」的 kernel 面）。
+        // Heartbeats advance across two windows: expires stays = this heartbeat's
+        // now+300 (the kernel face of A12 "waiting past 300 seconds keeps the
+        // lease").
+        for now in [1200i64, 1400, 1600] {
+            assert!(kernel.heartbeat_compile(&lease, now).unwrap());
+            let expires = scalar_i64(
+                &kernel,
+                &format!(
+                    "SELECT lease_expires_at AS n FROM compile_tasks WHERE task_id = {task_id}"
+                ),
+            );
+            assert_eq!(expires, now + 300, "heartbeat at {now}");
+            assert!(expires > now);
+        }
+
+        // 心跳只续租：状态、attempt/retry/recompile 计数全部不变。
+        // The heartbeat only renews: status and attempt/retry/recompile counters
+        // all unchanged.
+        let t = task_state(&kernel, task_id);
+        assert_eq!(t.status, "running");
+        assert_eq!(t.attempt_count, 1);
+        assert_eq!(t.retry_count, 0);
+        assert_eq!(t.recompile_count, 0);
+    }
+
+    // A12（Step8 批 B4）：新 epoch 接管 fencing——另一 worker 经 force admission
+    // 抬升 epoch 并领取后，worker A 的旧租约不能续约/发布/改计数（affected=0）。
+    // A12 (Step8 batch B4): new-epoch takeover fencing — after another worker
+    // bumps the epoch via a force admission and claims, worker A's stale lease can
+    // neither renew, publish, nor mutate counters (affected=0).
+    #[test]
+    fn a12_epoch_takeover_blocks_stale_worker_writes() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let p = prepared(1);
+        let task_id = queued(&kernel, &p);
+        let lease_a = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease_a.epoch, 1);
+
+        // force admission：同 hash 强制重排 → epoch+1、计数归零、旧租约清空。
+        // Force admission: a forced requeue on the same hash → epoch+1, counters
+        // reset, old lease cleared.
+        let _ = queued_with(&kernel, &p, &policy(), true);
+        let lease_b = kernel
+            .claim_compile(&[task_id], "run-1", 1001)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease_b.epoch, 2, "takeover worker runs on the new epoch");
+        assert_ne!(lease_b.lease_token, lease_a.lease_token);
+
+        // A 旧租约：不能续约。
+        // A's stale lease: cannot renew.
+        assert!(!kernel.heartbeat_compile(&lease_a, 1100).unwrap());
+        // 不能发布（Stale），且不留任何发布痕迹。
+        // Cannot publish (Stale), leaving no publish traces.
+        let (page, report) = accepted_page(&p);
+        assert_eq!(
+            kernel
+                .publish_compile(&lease_a, &page, &report, None, 1100)
+                .unwrap(),
+            CommitOutcome::Stale
+        );
+        // 不能改计数（failure 走 stale 路径返回 Failed）。
+        // Cannot mutate counters (failure takes the stale path, returning Failed).
+        let (low, low_report) = low_quality_page(&p, &policy());
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease_a,
+                    &CompileFailure::invalid("LOW", "{}"),
+                    Some(&low),
+                    &low_report,
+                    None,
+                    1100
+                )
+                .unwrap(),
+            FailureDisposition::Failed
+        );
+
+        // 计数只反映接管 worker B：attempt=1、retry=0、recompile=0；无页发布。
+        // Counters reflect only the takeover worker B: attempt=1, retry=0,
+        // recompile=0; no page published.
+        let after = task_state(&kernel, task_id);
+        assert_eq!(after.attempt_count, 1);
+        assert_eq!(after.retry_count, 0);
+        assert_eq!(after.recompile_count, 0);
+        assert_eq!(count(&kernel, "pages"), 0);
+        assert_eq!(count(&kernel, "generations"), 0);
     }
 
     // A16：原子发布 —— 注入失败（hash 不匹配 / artifact 超限）无半套写入；重试
@@ -2643,7 +3476,7 @@ mod tests {
         let mut bad = page.clone();
         bad.content_hash = "deadbeef".into();
         assert!(matches!(
-            kernel.publish_compile(&lease, &bad, &report, 1000),
+            kernel.publish_compile(&lease, &bad, &report, None, 1000),
             Err(Error::ContentHashMismatch { .. })
         ));
         assert_no_partial_publish(&kernel);
@@ -2654,7 +3487,7 @@ mod tests {
         big.wiki.content = "长".repeat(90_000);
         big.wiki.sections[0].content = big.wiki.content.clone();
         assert!(matches!(
-            kernel.publish_compile(&lease, &big, &report, 1000),
+            kernel.publish_compile(&lease, &big, &report, None, 1000),
             Err(Error::Compilation(_))
         ));
         assert_no_partial_publish(&kernel);
@@ -2663,13 +3496,13 @@ mod tests {
         // Normal publish → generation=1; replay reuses the same generation.
         assert_eq!(
             kernel
-                .publish_compile(&lease, &page, &report, 1000)
+                .publish_compile(&lease, &page, &report, None, 1000)
                 .unwrap(),
             CommitOutcome::Accepted { generation: 1 }
         );
         assert_eq!(
             kernel
-                .publish_compile(&lease, &page, &report, 1001)
+                .publish_compile(&lease, &page, &report, None, 1001)
                 .unwrap(),
             CommitOutcome::Accepted { generation: 1 }
         );
@@ -2715,7 +3548,7 @@ mod tests {
         let (page, report) = accepted_page(&p);
         assert_eq!(
             kernel
-                .publish_compile(&lease1, &page, &report, 1000)
+                .publish_compile(&lease1, &page, &report, None, 1000)
                 .unwrap(),
             CommitOutcome::Accepted { generation: 1 }
         );
@@ -2748,6 +3581,7 @@ mod tests {
                     &CompileFailure::invalid("LOW_DENSITY", "{}"),
                     Some(&low),
                     &low_report,
+                    None,
                     1000
                 )
                 .unwrap(),
@@ -2769,6 +3603,7 @@ mod tests {
                     &CompileFailure::invalid("LOW_DENSITY", "{}"),
                     Some(&low),
                     &low_report,
+                    None,
                     1001
                 )
                 .unwrap(),
@@ -2785,6 +3620,7 @@ mod tests {
                     &CompileFailure::invalid("LOW_DENSITY", "{}"),
                     Some(&low),
                     &low_report,
+                    None,
                     1002
                 )
                 .unwrap(),
@@ -2913,7 +3749,7 @@ mod tests {
         let (page, report) = accepted_page_with(&p2v2, &policy2);
         assert_eq!(
             kernel
-                .publish_compile(&lease_old, &page, &report, 1000)
+                .publish_compile(&lease_old, &page, &report, None, 1000)
                 .unwrap(),
             CommitOutcome::Stale
         );
@@ -2923,7 +3759,7 @@ mod tests {
         assert_eq!(lease_new.epoch, 2);
         assert_eq!(
             kernel
-                .publish_compile(&lease_new, &page, &report, 1000)
+                .publish_compile(&lease_new, &page, &report, None, 1000)
                 .unwrap(),
             CommitOutcome::Accepted { generation: 1 }
         );
@@ -3054,7 +3890,8 @@ mod tests {
         let p2 = prepared_with(2, &policy2);
         let _ = queued_with(&kernel, &p2, &policy2, false);
 
-        assert_eq!(kernel.recover_compile_leases(1301).unwrap(), 1);
+        let recovery = kernel.recover_compile_leases(1301).unwrap();
+        assert_eq!(recovery.superseded, 1);
         let t = task_state(&kernel, task_id);
         assert_eq!(t.status, "succeeded");
         assert_eq!(t.result.as_deref(), Some("superseded"));
@@ -3099,6 +3936,7 @@ mod tests {
                         issues: vec![],
                         accepted: false,
                     },
+                    None,
                     now,
                 )
                 .unwrap();
@@ -3144,6 +3982,7 @@ mod tests {
                         issues: vec![],
                         accepted: false,
                     },
+                    None,
                     2000,
                 )
                 .unwrap(),
@@ -3152,5 +3991,993 @@ mod tests {
         let t2 = task_state(&kernel, task2);
         assert_eq!(t2.status, "failed");
         assert_eq!(t2.result.as_deref(), Some("failed"));
+    }
+
+    // ===== Step8 批 B3：A9/A10（死信与一致性审核原子接入）=====
+    // ===== Step8 batch B3: A9/A10 (atomic dead-letter and consistency-review
+    // wiring) =====
+
+    use crate::compile::consistency::{
+        ClaimKey, ConsistencyFinding, CONSISTENCY_CONFLICT, CONSISTENCY_SCORE, VALUE_DIVERGENCE,
+    };
+
+    #[derive(QueryableByName)]
+    struct ReviewProbe {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        subject_json: String,
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        reason_json: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+        compile_task_id: Option<i64>,
+    }
+
+    fn reviews(kernel: &SqliteKernel, action: &str) -> Vec<ReviewProbe> {
+        let mut conn = kernel.lock_conn().unwrap();
+        diesel::sql_query(
+            "SELECT review_id, subject_json, reason_json, compile_task_id
+             FROM review_queue WHERE action = ? ORDER BY review_id",
+        )
+        .bind::<diesel::sql_types::Text, _>(action)
+        .load(&mut *conn)
+        .unwrap()
+    }
+
+    fn attempt_consistency_json(kernel: &SqliteKernel, task_id: i64, attempt_no: i64) -> String {
+        let mut conn = kernel.lock_conn().unwrap();
+        diesel::sql_query(
+            "SELECT consistency_json AS value FROM compile_attempts
+             WHERE task_id = ? AND attempt_no = ? ORDER BY epoch DESC LIMIT 1",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(task_id)
+        .bind::<diesel::sql_types::BigInt, _>(attempt_no)
+        .get_result::<TextOnlyRow>(&mut *conn)
+        .unwrap()
+        .value
+    }
+
+    /// 一条 VALUE_DIVERGENCE 冲突报告（哈希为固定 64 位 hex 占位）。
+    /// One VALUE_DIVERGENCE conflict report (fixed 64-char hex hash placeholders).
+    fn conflict_report() -> ConsistencyReport {
+        ConsistencyReport {
+            score: Some(0.0),
+            compared_claims: 1,
+            findings: vec![ConsistencyFinding {
+                code: VALUE_DIVERGENCE.into(),
+                key: ClaimKey {
+                    entity_id: "milk-tea:ingredient:pearl".into(),
+                    pointer: "/fields/name".into(),
+                },
+                candidate_value_hash: "a".repeat(64),
+                evidence_value_hash: "b".repeat(64),
+            }],
+            candidate_count: 1,
+        }
+    }
+
+    // A9：max_recompiles=0 首个低质候选即刹车到顶 → dead/quarantined；同一事务
+    // 一条 compile_dead_letter（subject 恰为 {"task_id":N}、compile_task_id 回填）
+    // + 一条 consistency_conflict；attempt consistency_json 与死信 reason 为同一
+    // 份 canonical 冲突诊断（§5.2：code/task 身份/findings[key={entity_id,pointer},
+    // old_hash=证据摘要,new_hash=候选摘要]）。
+    // A9: with max_recompiles=0 the first low-quality candidate trips the brake →
+    // dead/quarantined; the same transaction holds one compile_dead_letter
+    // (subject exactly {"task_id":N}, compile_task_id backfilled) plus one
+    // consistency_conflict; the attempt's consistency_json and the dead-letter
+    // reason are the same canonical conflict diagnostic (§5.2:
+    // code/task-identity/findings[key={entity_id,pointer},
+    // old_hash=evidence digest, new_hash=candidate digest]).
+    #[test]
+    fn a9_conflict_brake_enqueues_dead_letter_and_consistency_review_atomically() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let mut p0 = policy();
+        p0.max_recompiles = 0;
+        let p = prepared_with(1, &p0);
+        let task_id = queued_with(&kernel, &p, &p0, false);
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let (low, low_report) = low_quality_page(&p, &p0);
+        let conflict = conflict_report();
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease,
+                    &CompileFailure::invalid("LOW_DENSITY", "{}"),
+                    Some(&low),
+                    &low_report,
+                    Some(&conflict),
+                    1000
+                )
+                .unwrap(),
+            FailureDisposition::Quarantined
+        );
+        let t = task_state(&kernel, task_id);
+        assert_eq!(t.status, "dead");
+        assert_eq!(t.result.as_deref(), Some("quarantined"));
+
+        // —— A9：一条死信 + 一条一致性冲突审核，subject/回填精确 ——
+        // —— A9: one dead letter + one consistency-conflict review with exact
+        //    subject/backfill ——
+        let dead = reviews(&kernel, "compile_dead_letter");
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].subject_json, format!(r#"{{"task_id":{task_id}}}"#));
+        assert_eq!(dead[0].compile_task_id, Some(task_id));
+        let conflict_rows = reviews(&kernel, "consistency_conflict");
+        assert_eq!(conflict_rows.len(), 1);
+        assert_eq!(conflict_rows[0].compile_task_id, Some(task_id));
+
+        // reason = canonical 冲突诊断（§5.2 形状；旧/新值仅哈希）。
+        // reason = the canonical conflict diagnostic (§5.2 shape; digests only).
+        let reason: serde_json::Value =
+            serde_json::from_str(&conflict_rows[0].reason_json).unwrap();
+        assert_eq!(reason["code"], CONSISTENCY_CONFLICT);
+        assert_eq!(reason["task_id"], task_id);
+        assert_eq!(reason["epoch"], 1);
+        assert_eq!(reason["attempt_no"], 1);
+        assert_eq!(reason["entity_id"], "milk-tea:drink:boba");
+        let finding = &reason["findings"][0];
+        assert_eq!(finding["key"]["entity_id"], "milk-tea:ingredient:pearl");
+        assert_eq!(finding["key"]["pointer"], "/fields/name");
+        assert_eq!(finding["old_hash"], "b".repeat(64));
+        assert_eq!(finding["new_hash"], "a".repeat(64));
+        assert_eq!(conflict_rows[0].reason_json, dead[0].reason_json);
+
+        // attempt consistency_json 与 reason 同一份；无 64 KiB 越界。
+        // The attempt consistency_json equals the reason; within the 64 KiB cap.
+        assert_eq!(
+            attempt_consistency_json(&kernel, task_id, 1),
+            conflict_rows[0].reason_json
+        );
+
+        // —— A10：同 lease 重复 finish 被 fencing 拦截 → 不产生第二行 ——
+        // —— A10: a repeated finish with the same lease is fenced → no second
+        //    row ——
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease,
+                    &CompileFailure::invalid("LOW_DENSITY", "{}"),
+                    Some(&low),
+                    &low_report,
+                    Some(&conflict),
+                    1001
+                )
+                .unwrap(),
+            FailureDisposition::Failed
+        );
+        assert_eq!(reviews(&kernel, "compile_dead_letter").len(), 1);
+        assert_eq!(reviews(&kernel, "consistency_conflict").len(), 1);
+    }
+
+    // A9（无冲突对照）：刹车到顶但本轮无一致性 findings → 仅死信一条（reason
+    // code = 失败码、findings 空），无 consistency_conflict 行；attempt
+    // consistency_json 保持 '{}'。
+    // A9 (no-conflict control): brake exhausted without this round's consistency
+    // findings → exactly one dead letter (reason code = the failure code with
+    // empty findings), no consistency_conflict row; the attempt's
+    // consistency_json stays '{}'.
+    #[test]
+    fn a9_brake_without_conflict_enqueues_dead_letter_only() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let mut p0 = policy();
+        p0.max_recompiles = 0;
+        let p = prepared_with(1, &p0);
+        let task_id = queued_with(&kernel, &p, &p0, false);
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let (low, low_report) = low_quality_page(&p, &p0);
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease,
+                    &CompileFailure::invalid("LOW_DENSITY", "{}"),
+                    Some(&low),
+                    &low_report,
+                    None,
+                    1000
+                )
+                .unwrap(),
+            FailureDisposition::Quarantined
+        );
+        let dead = reviews(&kernel, "compile_dead_letter");
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].compile_task_id, Some(task_id));
+        let reason: serde_json::Value = serde_json::from_str(&dead[0].reason_json).unwrap();
+        assert_eq!(reason["code"], "LOW_DENSITY");
+        assert_eq!(reason["task_id"], task_id);
+        assert_eq!(reason["findings"], serde_json::json!([]));
+        assert!(reviews(&kernel, "consistency_conflict").is_empty());
+        assert_eq!(attempt_consistency_json(&kernel, task_id, 1), "{}");
+    }
+
+    // A10：传输耗尽（max_retries=1）→ dead/failed + 一条死信（code=传输错误码）；
+    // 重复 finish 不加行；enqueue_dead_letter_on_conn 直接连插两次 DO NOTHING 仍
+    // 一行；回收 dead 分支同样一条死信且重复回收（0 行）不重复插。
+    // A10: transport exhaustion (max_retries=1) → dead/failed with one dead
+    // letter (code = the transport code); repeated finishes add no rows; calling
+    // enqueue_dead_letter_on_conn twice directly still yields one row via
+    // DO NOTHING; the recovery dead branch likewise enqueues once and repeated
+    // recovery (0 rows) never re-inserts.
+    #[test]
+    fn a10_dead_letter_is_idempotent_across_finish_enqueue_and_recover() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+
+        // —— 传输耗尽 → 死信一条 ——
+        // —— Transport exhaustion → one dead letter ——
+        let mut p0 = policy();
+        p0.max_retries = 1;
+        let p = prepared_with(1, &p0);
+        let task_id = queued_with(&kernel, &p, &p0, false);
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease,
+                    &CompileFailure::Retryable {
+                        code: "TIMEOUT".into(),
+                        retry_after_seconds: None,
+                    },
+                    None,
+                    &ScoreReport {
+                        quality: QualityScore {
+                            coverage: 0.0,
+                            citation: 0.0,
+                            schema_compliance: 0.0,
+                            density: 0.0,
+                            consistency: None,
+                        },
+                        issues: vec![],
+                        accepted: false,
+                    },
+                    None,
+                    1000
+                )
+                .unwrap(),
+            FailureDisposition::Failed
+        );
+        assert_eq!(task_state(&kernel, task_id).status, "dead");
+        let dead = reviews(&kernel, "compile_dead_letter");
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].subject_json, format!(r#"{{"task_id":{task_id}}}"#));
+        assert_eq!(dead[0].compile_task_id, Some(task_id));
+        let reason: serde_json::Value = serde_json::from_str(&dead[0].reason_json).unwrap();
+        assert_eq!(reason["code"], "TIMEOUT");
+        assert!(reviews(&kernel, "consistency_conflict").is_empty());
+
+        // 重复 finish（fencing）不加行。
+        // A repeated finish (fenced) adds no rows.
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease,
+                    &CompileFailure::Retryable {
+                        code: "TIMEOUT".into(),
+                        retry_after_seconds: None,
+                    },
+                    None,
+                    &ScoreReport {
+                        quality: QualityScore {
+                            coverage: 0.0,
+                            citation: 0.0,
+                            schema_compliance: 0.0,
+                            density: 0.0,
+                            consistency: None,
+                        },
+                        issues: vec![],
+                        accepted: false,
+                    },
+                    None,
+                    1001
+                )
+                .unwrap(),
+            FailureDisposition::Failed
+        );
+        assert_eq!(reviews(&kernel, "compile_dead_letter").len(), 1);
+
+        // DO NOTHING 直证：同 (domain,action,subject) 连插两次仍一行。
+        // Direct DO NOTHING proof: two back-to-back inserts on the same
+        // (domain,action,subject) still yield one row.
+        {
+            let mut conn = kernel.lock_conn().unwrap();
+            conn.immediate_transaction(|tx| {
+                enqueue_dead_letter_on_conn(tx, task_id, "milk-tea", 1, r#"{"code":"X"}"#, 2000)?;
+                enqueue_dead_letter_on_conn(tx, task_id, "milk-tea", 1, r#"{"code":"X"}"#, 2000)
+            })
+            .unwrap();
+        }
+        assert_eq!(reviews(&kernel, "compile_dead_letter").len(), 1);
+
+        // —— 回收 dead 分支：一条死信；重复回收不重复插 ——
+        // —— The recovery dead branch: one dead letter; repeated recovery never
+        //    re-inserts ——
+        let mut p1 = policy();
+        p1.max_retries = 1;
+        let p2 = prepared_with(2, &p1);
+        let task2 = queued_with(&kernel, &p2, &p1, false);
+        let _ = kernel
+            .claim_compile(&[task2], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let recovery = kernel.recover_compile_leases(1301).unwrap();
+        assert_eq!(recovery.dead_failed, 1);
+        assert_eq!(recovery.review_inserted, 1);
+        assert_eq!(task_state(&kernel, task2).status, "dead");
+        let dead_after_recover = reviews(&kernel, "compile_dead_letter");
+        assert_eq!(dead_after_recover.len(), 2, "one row per dead task");
+        let recovered = dead_after_recover
+            .iter()
+            .find(|r| r.compile_task_id == Some(task2))
+            .unwrap();
+        assert_eq!(recovered.subject_json, format!(r#"{{"task_id":{task2}}}"#));
+        let reason2: serde_json::Value = serde_json::from_str(&recovered.reason_json).unwrap();
+        assert_eq!(reason2["code"], "LEASE_EXPIRED_RETRY_EXHAUSTED");
+        assert_eq!(
+            kernel.recover_compile_leases(1301).unwrap(),
+            RecoveryStats::default()
+        );
+        assert_eq!(reviews(&kernel, "compile_dead_letter").len(), 2);
+    }
+
+    // Step8 批 B3（publish 侧）：consistency Some → page_quality.consistency 精确
+    // 落库、attempt consistency_json 为发布诊断（code=CONSISTENCY_SCORE + 计数）、
+    // load_accepted_pages 往返读回；consistency None → SQL NULL + '{}'。
+    // Step8 batch B3 (publish side): a Some consistency lands the exact
+    // page_quality.consistency value, the attempt consistency_json carries the
+    // publish diagnostic (code=CONSISTENCY_SCORE plus counts), and
+    // load_accepted_pages round-trips it; None → SQL NULL + '{}'.
+    #[test]
+    fn publish_writes_consistency_value_and_json() {
+        // —— Some(1.0)：五维值与发布诊断精确落库 ——
+        // —— Some(1.0): the five-dim value and publish diagnostic land exactly ——
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let p = prepared(1);
+        let task_id = queued(&kernel, &p);
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let (page, _) = accepted_page(&p);
+        let consistency = ConsistencyReport {
+            score: Some(1.0),
+            compared_claims: 2,
+            findings: vec![],
+            candidate_count: 3,
+        };
+        // 报告经五维组合器产生（与 executor 管线同源：quality.consistency =
+        // 仲裁得分，accepted=true）。
+        // The report comes from the five-dim combiner (same source as the
+        // executor pipeline: quality.consistency = the arbitration score,
+        // accepted=true).
+        let refs =
+            DefaultSourceRefValidator.validate(&p.knowledge, page.evidence.as_ref().unwrap(), true);
+        let report = RuleBasedScorer.score_with_consistency(
+            &p.knowledge,
+            Some(&page),
+            &refs,
+            true,
+            &consistency,
+            &ctx(),
+            &policy(),
+        );
+        assert!(report.accepted, "fixture page must be accepted");
+        assert_eq!(
+            kernel
+                .publish_compile(&lease, &page, &report, Some(&consistency), 1000)
+                .unwrap(),
+            CommitOutcome::Accepted { generation: 1 }
+        );
+        assert_eq!(
+            scalar_i64(
+                &kernel,
+                "SELECT CAST(consistency * 1000000 AS INTEGER) AS n FROM page_quality
+                 WHERE page_id = 'milk-tea:drink:boba'"
+            ),
+            1_000_000,
+            "the consistency value lands exactly"
+        );
+        let published: serde_json::Value =
+            serde_json::from_str(&attempt_consistency_json(&kernel, task_id, 1)).unwrap();
+        assert_eq!(published["code"], CONSISTENCY_SCORE);
+        assert_eq!(published["task_id"], task_id);
+        assert_eq!(published["score"], 1.0);
+        assert_eq!(published["compared_claims"], 2);
+        assert_eq!(published["candidate_count"], 3);
+        assert_eq!(
+            kernel.load_accepted_pages("milk-tea").unwrap()[0]
+                .quality
+                .consistency,
+            Some(1.0),
+            "the value round-trips through load_accepted_pages"
+        );
+
+        // —— None：SQL NULL + '{}'（既有 Step4 行为不变）——
+        // —— None: SQL NULL + '{}' (the existing Step4 behavior unchanged) ——
+        let kernel2 = SqliteKernel::open_in_memory().unwrap();
+        let p2 = prepared(1);
+        let task2 = queued(&kernel2, &p2);
+        let lease2 = kernel2
+            .claim_compile(&[task2], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let (page2, report2) = accepted_page(&p2);
+        assert_eq!(
+            kernel2
+                .publish_compile(&lease2, &page2, &report2, None, 1000)
+                .unwrap(),
+            CommitOutcome::Accepted { generation: 1 }
+        );
+        assert_eq!(
+            scalar_i64(
+                &kernel2,
+                "SELECT COUNT(*) AS n FROM page_quality WHERE consistency IS NULL"
+            ),
+            1,
+            "None stays SQL NULL"
+        );
+        assert_eq!(attempt_consistency_json(&kernel2, task2, 1), "{}");
+        assert_eq!(
+            kernel2.load_accepted_pages("milk-tea").unwrap()[0]
+                .quality
+                .consistency,
+            None
+        );
+    }
+
+    // ===== Step8 批 B5（A13/A14/A15 前置）：兼容 preflight 读取面 =====
+    // ===== Step8 batch B5 (A13/A14/A15 prerequisites): the
+    // compatibility-preflight read surface =====
+
+    /// B5 矩阵：§5.1 示例形状（artifact 只认 wiki-v2）。
+    /// The B5 matrix: the §5.1 sample shape (artifact admits wiki-v2 only).
+    fn b5_spec() -> CompatibilitySpec {
+        serde_yaml_ng::from_str(
+            "domain_pack: \">=1.0.0,<2.0.0\"\n\
+             schema: \">=2.0.0,<3.0.0\"\n\
+             prompt: \">=3.0.0,<4.0.0\"\n\
+             artifact: [\"wiki-v2\"]",
+        )
+        .unwrap()
+    }
+
+    /// 直插 accepted/candidate/quarantined 页（绕过发布管线，聚焦读取面过滤）。
+    /// Plants a page directly (bypassing the publish pipeline, focusing the read
+    /// surface's filters).
+    fn plant_page(
+        kernel: &SqliteKernel,
+        page_id: &str,
+        domain: &str,
+        status: &str,
+        domain_pack_version: &str,
+        artifact_version: &str,
+        frontmatter_json: &str,
+    ) {
+        let mut conn = kernel.lock_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO pages (page_id, entity_id, domain, entity_type, title, content,
+                                content_hash, generation, status, domain_pack_version,
+                                compiled_at, model_version, embedding_model,
+                                artifact_version, frontmatter_json, created_at, updated_at)
+             VALUES (?, ?, ?, 'drink', 't', 'c', 'h', 1, ?, ?, 0, 'mock-v1', 'none', ?, ?, 0, 0)",
+        )
+        .bind::<diesel::sql_types::Text, _>(page_id)
+        .bind::<diesel::sql_types::Text, _>(format!("{domain}:drink:x"))
+        .bind::<diesel::sql_types::Text, _>(domain)
+        .bind::<diesel::sql_types::Text, _>(status)
+        .bind::<diesel::sql_types::Text, _>(domain_pack_version)
+        .bind::<diesel::sql_types::Text, _>(artifact_version)
+        .bind::<diesel::sql_types::Text, _>(frontmatter_json)
+        .execute(&mut *conn)
+        .unwrap();
+    }
+
+    /// 直插任务行（依赖快照由调用方给足；status 默认 pending）。
+    /// Plants a task row directly (the caller supplies the dependency snapshot;
+    /// status defaults to pending).
+    fn plant_task(kernel: &SqliteKernel, entity_id: &str, deps_json: &str) -> i64 {
+        let mut conn = kernel.lock_conn().unwrap();
+        diesel::sql_query(
+            "INSERT INTO compile_tasks
+                (entity_id, source_revision, domain_pack_version, dependencies_json,
+                 created_at, updated_at)
+             VALUES (?, 1, '1.2.0', ?, 0, 0)
+             RETURNING task_id",
+        )
+        .bind::<diesel::sql_types::Text, _>(entity_id)
+        .bind::<diesel::sql_types::Text, _>(deps_json)
+        .get_result::<TaskIdRow>(&mut *conn)
+        .unwrap()
+        .task_id
+    }
+
+    fn set_task_status(kernel: &SqliteKernel, task_id: i64, status: &str) {
+        let mut conn = kernel.lock_conn().unwrap();
+        diesel::sql_query("UPDATE compile_tasks SET status = ? WHERE task_id = ?")
+            .bind::<diesel::sql_types::Text, _>(status)
+            .bind::<diesel::sql_types::BigInt, _>(task_id)
+            .execute(&mut *conn)
+            .unwrap();
+    }
+
+    /// 与 compatibility.rs 测试同一 deps 形状（context/policy 双段；B1 旧形状
+    /// policy，serde default 兜底 Step8 字段）。
+    /// The same deps shape as the compatibility.rs tests (both the context and
+    /// policy sections; a B1 legacy-shape policy whose Step8 fields fall back to
+    /// serde defaults).
+    fn b5_deps_json(
+        domain_pack_version: &str,
+        schema_version: Option<&str>,
+        prompt_version: Option<&str>,
+        artifact_version: &str,
+    ) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "context": {
+                "domain_pack_version": domain_pack_version,
+                "prompt_template": "SYSTEM",
+                "model_version": "mock-v1",
+                "embedding_model": "none",
+                "quality_threshold": 0.75,
+                "require_source_refs": true,
+                "schema_version": schema_version,
+                "prompt_version": prompt_version,
+            },
+            "policy": {
+                "compiler_version": "compile-v1",
+                "artifact_version": artifact_version,
+                "scorer_version": "rules-v1",
+                "knowledge_fields": [],
+                "sensitive_fields": [],
+                "required_headings": ["概述"],
+                "min_coverage": 0.6,
+                "min_density": 0.4,
+                "max_recompiles": 2,
+                "max_retries": 3,
+                "task_token_budget": 65536,
+                "batch_token_budget": 262144,
+                "daily_token_budget": null,
+                "max_output_tokens": 2048,
+                "lease_seconds": 300,
+                "heartbeat_seconds": 30,
+            },
+        }))
+        .unwrap()
+    }
+
+    // 读取面：页按 domain+accepted 过滤；任务按 pending/running/dead 过滤；
+    // has_existing_compile_data 的全局 fail-closed 判定（§7 skip 语义前置）。
+    // Read surfaces: pages filtered by domain+accepted; tasks filtered by
+    // pending/running/dead; the global fail-closed verdict of
+    // has_existing_compile_data (the §7 skip-semantics prerequisite).
+    #[test]
+    fn b5_read_surfaces_scope_and_status_filters() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        // 空库：无旧 artifact，has_existing=false（§7 skip 允许面）。
+        // Empty database: no old artifact, has_existing=false (the §7 skip
+        // allowance).
+        assert!(!kernel.has_existing_compile_data().unwrap());
+        assert!(kernel
+            .compatibility_page_identities("milk-tea")
+            .unwrap()
+            .is_empty());
+        assert!(kernel.compatibility_task_snapshots().unwrap().is_empty());
+
+        plant_page(
+            &kernel,
+            "p-own",
+            "milk-tea",
+            "accepted",
+            "1.2.0",
+            "wiki-v2",
+            r#"{"quality_policy":{"artifact_version":"wiki-v2"}}"#,
+        );
+        plant_page(
+            &kernel,
+            "p-other",
+            "other-tea",
+            "accepted",
+            "9.9.9",
+            "wiki-x",
+            "{}",
+        );
+        // quarantined 页不是当前产物，不入检查面。
+        // A quarantined page is not a current artifact and stays outside the
+        // check surface.
+        plant_page(
+            &kernel,
+            "p-quarantined",
+            "milk-tea",
+            "quarantined",
+            "9.9.9",
+            "wiki-x",
+            "{}",
+        );
+        let pages = kernel.compatibility_page_identities("milk-tea").unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].page_id, "p-own");
+        assert_eq!(pages[0].domain_pack_version, "1.2.0");
+        assert_eq!(pages[0].artifact_version, "wiki-v2");
+        assert!(pages[0].frontmatter_json.contains("quality_policy"));
+        // 任意 accepted 页存在 → has_existing=true（全局口径）。
+        // Any accepted page → has_existing=true (the global reading).
+        assert!(kernel.has_existing_compile_data().unwrap());
+
+        // 任务：pending/running/dead 都在面内；succeeded/他域不算当前产物。
+        // Tasks: pending/running/dead are all in-surface; succeeded/other-domain
+        // are not current artifacts.
+        let t1 = plant_task(
+            &kernel,
+            "milk-tea:drink:boba",
+            &b5_deps_json("1.2.0", Some("2.1.0"), Some("3.0.0"), "wiki-v2"),
+        );
+        let t2 = plant_task(
+            &kernel,
+            "milk-tea:drink:lemon",
+            &b5_deps_json("1.2.0", Some("2.1.0"), Some("3.0.0"), "wiki-v2"),
+        );
+        let t3 = plant_task(
+            &kernel,
+            "milk-tea:drink:cheese",
+            &b5_deps_json("1.2.0", Some("2.1.0"), Some("3.0.0"), "wiki-v2"),
+        );
+        let t4 = plant_task(
+            &kernel,
+            "milk-tea:drink:cocoa",
+            &b5_deps_json("1.2.0", Some("2.1.0"), Some("3.0.0"), "wiki-v2"),
+        );
+        let other = plant_task(
+            &kernel,
+            "other-tea:drink:boba",
+            &b5_deps_json("0.1.0", None, None, "seed-v1"),
+        );
+        set_task_status(&kernel, t2, "running");
+        set_task_status(&kernel, t3, "dead");
+        set_task_status(&kernel, t4, "succeeded");
+        let tasks = kernel.compatibility_task_snapshots().unwrap();
+        let mut ids: Vec<i64> = tasks.iter().map(|t| t.task_id).collect();
+        ids.sort_unstable();
+        // succeeded 出面；他域 live 行保留在快照面内（域过滤在 checker 侧）。
+        // succeeded leaves the surface; other-domain live rows stay in the
+        // snapshot surface (domain filtering happens checker-side).
+        assert_eq!(ids, vec![t1, t2, t3, other]);
+        assert!(tasks
+            .iter()
+            .all(|t| t.dependencies_json.contains("context")));
+    }
+
+    // 检查器全量扫描（A14）：本域页/任务违规全部出现、计数准确、损坏 JSON 为
+    // violation（不静默跳过）、他域行不进本域检查面。
+    // Checker full scan (A14): every in-domain page/task violation appears,
+    // counts are exact, corrupt JSON is a violation (never silently skipped),
+    // and other-domain rows stay outside this domain's check surface.
+    #[test]
+    fn b5_checker_full_scan_violations_counts_and_domain_scope() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        // 本域页：dpv 越界 + artifact 列外 + 无 quality_policy → 3 条违规。
+        // In-domain page: dpv out of range + artifact outside the list + no
+        // quality_policy → 3 violations.
+        plant_page(
+            &kernel, "p-1", "milk-tea", "accepted", "0.9.9", "seed-v1", "{}",
+        );
+        // 他域页不进本域检查面。
+        // Other-domain pages stay outside this domain's check surface.
+        plant_page(
+            &kernel,
+            "p-2",
+            "other-tea",
+            "accepted",
+            "0.9.9",
+            "seed-v1",
+            "{}",
+        );
+        // 本域 pending 任务：legacy deps（schema/prompt 缺失）→ 2 条 MISSING。
+        // In-domain pending task: legacy deps (schema/prompt absent) → 2
+        // MISSING violations.
+        plant_task(
+            &kernel,
+            "milk-tea:drink:boba",
+            &b5_deps_json("1.2.0", None, None, "wiki-v2"),
+        );
+        // 损坏快照 → CORRUPT_SNAPSHOT（A14 不静默跳过）。
+        // A corrupt snapshot → CORRUPT_SNAPSHOT (A14: never silently skipped).
+        plant_task(&kernel, "milk-tea:drink:cheese", "not json at all");
+        // 他域任务（缺版本也不报）——矩阵按域生效。
+        // An other-domain task (its missing versions are not reported) — the
+        // matrix applies per domain.
+        plant_task(
+            &kernel,
+            "other-tea:drink:boba",
+            &b5_deps_json("0.1.0", None, None, "seed-v1"),
+        );
+
+        let identity =
+            DomainIdentity::parse("milk-tea", "1.2.0", Some("2.1.0"), Some("3.0.0"), "wiki-v2")
+                .unwrap();
+        let report = StandardCompatibilityChecker::new()
+            .check(&identity, &b5_spec(), &kernel)
+            .unwrap();
+        assert!(!report.compatible);
+        assert_eq!(report.checked_pages, 1, "only this domain's accepted pages");
+        assert_eq!(
+            report.checked_tasks, 2,
+            "only this domain's live/dead tasks"
+        );
+        let mut hits: Vec<(&str, &str)> = report
+            .violations
+            .iter()
+            .map(|v| (v.field.as_str(), v.code.as_str()))
+            .collect();
+        hits.sort_unstable();
+        assert_eq!(
+            hits,
+            vec![
+                ("artifact_version", COMPATIBILITY_ARTIFACT_NOT_ALLOWED),
+                ("dependencies_json", COMPATIBILITY_CORRUPT_SNAPSHOT),
+                ("domain_pack_version", COMPATIBILITY_VERSION_RANGE),
+                ("prompt_version", COMPATIBILITY_VERSION_MISSING),
+                (
+                    "quality_policy.artifact_version",
+                    COMPATIBILITY_VERSION_MISSING
+                ),
+                ("schema_version", COMPATIBILITY_VERSION_MISSING),
+            ]
+        );
+    }
+
+    // 兼容告警入队（A16 前置）：UNIQUE(domain,action,subject_json) DO NOTHING
+    // 幂等；compile_task_id 恒 NULL；非对象 subject / 非法 reason → Validation
+    // 零行落库。
+    // Compatibility-alert enqueue (the A16 prerequisite): UNIQUE
+    // (domain,action,subject_json) DO NOTHING idempotency; compile_task_id stays
+    // NULL; a non-object subject / illegal reason → Validation with zero rows.
+    #[test]
+    fn b5_compatibility_conflict_review_is_idempotent_and_validated() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let subject = r#"{"domain":"milk-tea","domain_pack_version":"1.2.0"}"#;
+        let inserted = kernel
+            .insert_compatibility_conflict_review("milk-tea", subject, r#"{"code":"X"}"#, 7)
+            .unwrap();
+        assert_eq!(inserted, 1);
+        let again = kernel
+            .insert_compatibility_conflict_review("milk-tea", subject, r#"{"code":"X"}"#, 8)
+            .unwrap();
+        assert_eq!(again, 0, "repeated runs never add a second alert");
+        let other = kernel
+            .insert_compatibility_conflict_review(
+                "milk-tea",
+                r#"{"domain":"milk-tea","domain_pack_version":"2.0.0"}"#,
+                r#"{"code":"X"}"#,
+                9,
+            )
+            .unwrap();
+        assert_eq!(other, 1, "a new subject is a new alert");
+
+        let rows = reviews(&kernel, "compatibility_conflict");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.compile_task_id.is_none()));
+
+        // 非 JSON 对象 subject → Validation（零行落库）。
+        // A non-object subject → Validation (zero rows written).
+        let err = kernel
+            .insert_compatibility_conflict_review("milk-tea", "[]", r#"{}"#, 10)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+        assert_eq!(reviews(&kernel, "compatibility_conflict").len(), 2);
+        // 非法 reason JSON → Validation。
+        // An illegal reason JSON → Validation.
+        let err = kernel
+            .insert_compatibility_conflict_review("milk-tea", r#"{}"#, "not json", 11)
+            .unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    // ===== Step8 批 B7：故障注入（§8 事务原子性）=====
+    // ===== Step8 batch B7: fault injection (§8 transaction atomicity) =====
+    //
+    // 注入手段：SQL 级 RAISE(ABORT) 触发器，不引入故障开关库。触发器中段制造
+    // 语句失败 → diesel 的 immediate_transaction 整体回滚；断言前置写入零残留。
+    // Injection means: SQL-level RAISE(ABORT) triggers, no fault-toggle library.
+    // A mid-transaction statement failure makes diesel's immediate_transaction
+    // roll the whole thing back; the assertions prove zero residue from earlier
+    // writes in the same transaction.
+
+    // §8/§7 admit 原子性：admit = 「facts CAS → 三元任务 upsert → source head
+    // upsert」多步写事务。注入最后一步（head upsert）失败：facts/fact_refs/
+    // tasks/heads 全部零残留——前置步骤不得提前提交或泄漏。
+    // §8/§7 admit atomicity: admit is the multi-step write transaction "facts
+    // CAS → triple task upsert → source head upsert". Injecting a failure at the
+    // last step (the head upsert) leaves zero residue on facts/fact_refs/tasks/
+    // heads — earlier steps never commit or leak.
+    #[test]
+    fn admit_mid_transaction_failure_rolls_back_everything() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        kernel
+            .execute_batch(
+                "CREATE TRIGGER inject_head_fail AFTER INSERT ON compile_source_heads
+                 WHEN NEW.entity_id = 'milk-tea:drink:boba'
+                 BEGIN SELECT RAISE(ABORT, 'injected: head upsert failure'); END;",
+            )
+            .unwrap();
+        let p = prepared(1);
+        let outcome = kernel.admit_compile(&p, &ctx(), &policy(), &schema(), false);
+        assert!(
+            outcome.is_err(),
+            "a head-upsert failure must propagate, got {outcome:?}"
+        );
+        assert_eq!(count(&kernel, "compile_tasks"), 0);
+        assert_eq!(count(&kernel, "compile_source_heads"), 0);
+        assert_eq!(count(&kernel, "facts"), 0);
+        assert_eq!(count(&kernel, "fact_refs"), 0);
+
+        // 拆除注入后同一 admit 成功——核对故障确实来自注入点而非其它路径。
+        // The same admit succeeds after dropping the injection — proving the
+        // fault came from the injection point, not another path.
+        kernel
+            .execute_batch("DROP TRIGGER inject_head_fail;")
+            .unwrap();
+        assert!(queued(&kernel, &p) > 0);
+    }
+
+    // §8 质量终态原子性：finish_compile_failure 的 dead 分支 = 「attempt marks
+    // completed → task dead/quarantined → 死信 + 一致性冲突审核」同一事务。注入
+    // 死信插入失败：attempt 不完成、任务不终态、审核零行（两条审核一起回滚）。
+    // §8 quality-terminal atomicity: the dead branch of finish_compile_failure is
+    // one transaction over "attempt completed → task dead/quarantined → dead
+    // letter + consistency-conflict reviews". Injecting a dead-letter insert
+    // failure: the attempt does not complete, the task never reaches a terminal,
+    // and zero review rows survive (both reviews roll back together).
+    #[test]
+    fn finish_failure_dead_branch_failure_rolls_back_terminal_atomically() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        kernel
+            .execute_batch(
+                "CREATE TRIGGER inject_dead_letter_fail AFTER INSERT ON review_queue
+                 WHEN NEW.action = 'compile_dead_letter'
+                 BEGIN SELECT RAISE(ABORT, 'injected: dead-letter insert failure'); END;",
+            )
+            .unwrap();
+        let mut p0 = policy();
+        p0.max_recompiles = 0;
+        let p = prepared_with(1, &p0);
+        let task_id = queued_with(&kernel, &p, &p0, false);
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let (low, low_report) = low_quality_page(&p, &p0);
+        let conflict = conflict_report();
+        let err = kernel
+            .finish_compile_failure(
+                &lease,
+                &CompileFailure::invalid("LOW_DENSITY", "{}"),
+                Some(&low),
+                &low_report,
+                Some(&conflict),
+                1000,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Database(_) | Error::Internal(_)),
+            "got {err:?}"
+        );
+        // 整事务回滚：任务保持 running + 原 lease、attempt 仍 reserved、审核零行。
+        // The whole transaction rolled back: the task stays running with its
+        // original lease, the attempt stays reserved, zero review rows.
+        let t = task_state(&kernel, task_id);
+        assert_eq!(t.status, "running");
+        assert!(t.lease_token.is_some(), "lease must be retained");
+        assert_eq!(count(&kernel, "review_queue"), 0);
+        assert_eq!(
+            scalar_i64(
+                &kernel,
+                "SELECT COUNT(*) AS n FROM compile_attempts WHERE status = 'reserved'"
+            ),
+            1
+        );
+
+        // 拆除注入后正常失败：dead 终态 + 一条死信 + 一条一致性冲突（对照）。
+        // After dropping the injection the normal failure lands: dead terminal +
+        // one dead letter + one consistency conflict (the control case).
+        kernel
+            .execute_batch("DROP TRIGGER inject_dead_letter_fail;")
+            .unwrap();
+        assert_eq!(
+            kernel
+                .finish_compile_failure(
+                    &lease,
+                    &CompileFailure::invalid("LOW_DENSITY", "{}"),
+                    Some(&low),
+                    &low_report,
+                    Some(&conflict),
+                    1000,
+                )
+                .unwrap(),
+            FailureDisposition::Quarantined
+        );
+        assert_eq!(task_state(&kernel, task_id).status, "dead");
+        assert_eq!(reviews(&kernel, "compile_dead_letter").len(), 1);
+        assert_eq!(reviews(&kernel, "consistency_conflict").len(), 1);
+    }
+
+    // §8 回收终态原子性：recover 的每个过期任务在同一 BEGIN IMMEDIATE 内处理
+    // （abandon → dead/pending + 死信）。注入死信插入失败：整个 pass 回滚——
+    // 其它任务已做的 pending/退避更新也一并撤销，两个任务保持 running、原
+    // lease/retry_count/attempt 计数全不变、零审核行。
+    // §8 recovery-terminal atomicity: every expired task is handled inside the
+    // same BEGIN IMMEDIATE (abandon → dead/pending + dead letter). Injecting a
+    // dead-letter insert failure rolls back the whole pass — pending/backoff
+    // updates for other tasks are undone too; both tasks stay running with their
+    // original lease/retry_count/attempt counts and zero review rows.
+    #[test]
+    fn recover_mid_pass_failure_rolls_back_whole_pass_atomically() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        kernel
+            .execute_batch(
+                "CREATE TRIGGER inject_recover_dead_fail AFTER INSERT ON review_queue
+                 WHEN NEW.action = 'compile_dead_letter'
+                 BEGIN SELECT RAISE(ABORT, 'injected: recovery dead-letter failure'); END;",
+            )
+            .unwrap();
+        // 任务 A：max_retries=1 → 回收走 dead/failed + 死信入队（触发注入）。
+        // Task A: max_retries=1 → recovery takes the dead/failed branch with the
+        // dead-letter insert (the injected trigger).
+        let mut p_a = policy();
+        p_a.max_retries = 1;
+        let a = prepared_with(2, &p_a);
+        let task_a = queued_with(&kernel, &a, &p_a, false);
+        kernel
+            .claim_compile(&[task_a], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        // 任务 B：默认 max_retries=3 → 回收走 pending/退避分支（无审核插入）。
+        // Task B: default max_retries=3 → recovery takes the pending/backoff
+        // branch (no review insert).
+        let b = prepared_with(3, &policy());
+        let task_b = queued(&kernel, &b);
+        kernel
+            .claim_compile(&[task_b], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+
+        // 注入下回收（租约 1000+300=1300 已过期）→ 整个 pass 回滚。
+        // Recovery under injection (leases expired at 1300) → the whole pass
+        // rolls back.
+        let err = kernel.recover_compile_leases(1301).unwrap_err();
+        assert!(
+            matches!(err, Error::Database(_) | Error::Internal(_)),
+            "got {err:?}"
+        );
+        for id in [task_a, task_b] {
+            let t = task_state(&kernel, id);
+            assert_eq!(t.status, "running", "task {id} must stay running");
+            assert!(t.lease_token.is_some(), "task {id} lease must be retained");
+            assert_eq!(t.retry_count, 0, "task {id} retry must not be bumped");
+        }
+        assert_eq!(count(&kernel, "review_queue"), 0);
+        assert_eq!(
+            scalar_i64(
+                &kernel,
+                "SELECT COUNT(*) AS n FROM compile_attempts WHERE status = 'reserved'"
+            ),
+            2
+        );
+
+        // 拆除注入后正常回收：A dead/failed + 一条死信，B pending/退避。
+        // After dropping the injection: A ends dead/failed with one dead letter,
+        // B goes pending with backoff.
+        kernel
+            .execute_batch("DROP TRIGGER inject_recover_dead_fail;")
+            .unwrap();
+        let recovery = kernel.recover_compile_leases(1301).unwrap();
+        assert_eq!(recovery.dead_failed, 1);
+        assert_eq!(recovery.recovered_pending, 1);
+        assert_eq!(recovery.review_inserted, 1);
+        assert_eq!(task_state(&kernel, task_a).status, "dead");
+        assert_eq!(task_state(&kernel, task_b).status, "pending");
+        assert_eq!(count(&kernel, "review_queue"), 1);
     }
 }

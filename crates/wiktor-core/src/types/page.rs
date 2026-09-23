@@ -62,8 +62,9 @@ pub struct PageMetadata {
     pub embedding_model: String,
 }
 
-/// 质量评分：四规则维度 + 一致性（LLM 仲裁，可空）。
-/// Quality score: four rule-based dimensions plus consistency (optional LLM arbitration).
+/// 质量评分：四规则维度 + 一致性（仲裁报告得分，可空）。
+/// Quality score: four rule-based dimensions plus consistency (arbitration
+/// score, optional).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct QualityScore {
     pub coverage: f32,
@@ -74,10 +75,20 @@ pub struct QualityScore {
 }
 
 impl QualityScore {
-    /// 综合得分 = 四规则维度平均，一致性单独处理。
-    /// Overall score = average of the four rule-based dimensions; consistency is handled separately.
+    /// 综合得分（Step8 §6.2/D4）：consistency=None 时为四维平均（Step4 语义
+    /// 逐字节不变）；`Some(s)` 时为五维等权平均
+    /// `(coverage+citation+schema+density+s)/5`。
+    /// Overall score (Step8 §6.2/D4): with consistency=None it is the four-dim
+    /// average (Step4 semantics byte-identical); with `Some(s)` it is the
+    /// five-dim equal-weight average
+    /// `(coverage+citation+schema+density+s)/5`.
     pub fn overall(&self) -> f32 {
-        (self.coverage + self.citation + self.schema_compliance + self.density) / 4.0
+        match self.consistency {
+            None => (self.coverage + self.citation + self.schema_compliance + self.density) / 4.0,
+            Some(s) => {
+                (self.coverage + self.citation + self.schema_compliance + self.density + s) / 5.0
+            }
+        }
     }
 
     /// 是否通过质量阈值。
@@ -119,4 +130,16 @@ pub struct CompileContext {
     pub embedding_model: String,
     pub quality_threshold: f32,
     pub require_source_refs: bool,
+    // Step 8 §5.1/§6.2：schema/prompt 版本身份进入 content_hash（载体偏差记录
+    // 为 STEP8-011），并随 dependencies_json 快照持久化供 B5 兼容 preflight
+    // 读取历史版本；`#[serde(default)]` 保证 Step4/6 旧行可读（缺省 None）。
+    // Step 8 §5.1/§6.2: the schema/prompt version identity enters the
+    // content_hash (carrier deviation recorded as STEP8-011) and is persisted
+    // with the dependencies_json snapshot so B5's compatibility preflight can
+    // read historical versions; `#[serde(default)]` keeps Step4/6 rows readable
+    // (defaulting to None).
+    #[serde(default)]
+    pub schema_version: Option<String>,
+    #[serde(default)]
+    pub prompt_version: Option<String>,
 }

@@ -1,7 +1,8 @@
-use crate::compile::config::CompilePolicy;
+use crate::compile::config::{CompatibilitySpec, CompilePolicy, ConsistencyPolicy, DomainIdentity};
 use crate::traits::{Compiler, QugBuilder, Reranker};
 use crate::types::error::{Error, Result};
 use crate::types::{FieldDefinition, FieldType, Filters};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -43,13 +44,22 @@ pub trait DomainPack: Send + Sync {
 /// qug 与 compile_policy；缺少 `qug` 段时使用 Step 2 兼容默认值（enabled=false）。
 /// 缺少整个 `compile` 段时必须实际产生阈值 0.75 / max_recompiles=2（修正历史
 /// derive(Default) 零值 bug），`compile` 段内部严格拒绝未知字段。
+/// Step 8 起解析 `compile.consistency` / `compile.artifact_version` /
+/// `compatibility` 段（§5.1），且 `version` / `schema_version` /
+/// `prompt_version` 必须是 strict semver（解析期 fail-closed，A13 纯解析部分；
+/// 缺失的 schema/prompt 记 None = legacy 只读容忍，真实 compile 的强制在 B5）。
 /// A custom `Deserialize` flattens the nested `compile` / `query` / `qug` sections
 /// into this struct, keeping existing fields (quality_threshold / max_recompiles)
 /// unchanged and adding query_filters, qug and compile_policy; a missing `qug`
 /// section falls back to Step 2-compatible defaults (enabled=false). A missing
 /// `compile` section must actually yield threshold 0.75 / max_recompiles=2
 /// (fixing the historical derive(Default) zero-value bug); the `compile` section
-/// strictly rejects unknown fields.
+/// strictly rejects unknown fields. Since Step 8 the `compile.consistency` /
+/// `compile.artifact_version` / `compatibility` sections are parsed (§5.1) and
+/// `version` / `schema_version` / `prompt_version` must be strict semver
+/// (fail-closed at parse time, the A13 pure-parsing part; missing schema/prompt
+/// are recorded as None = legacy read-only tolerance, enforcement for real
+/// compiles lands in B5).
 #[derive(Debug, Clone)]
 pub struct DomainConfig {
     pub name: String,
@@ -73,6 +83,12 @@ pub struct DomainConfig {
     /// `qug` 段（Step 3：QUG 开关/深度/候选倍率/意图模板文件）。
     /// The `qug` section (Step 3: QUG toggle/depth/candidate multiplier/intent template file).
     pub qug: QugConfig,
+    /// Step 8 §5.1：strict semver 的 schema 版本（缺省 None = legacy 容忍）。
+    /// Step 8 §5.1: the strict-semver schema version (None = legacy tolerance).
+    pub schema_version: Option<Version>,
+    /// Step 8 §5.1：strict semver 的 prompt 版本（缺省 None = legacy 容忍）。
+    /// Step 8 §5.1: the strict-semver prompt version (None = legacy tolerance).
+    pub prompt_version: Option<Version>,
 }
 
 impl<'de> Deserialize<'de> for DomainConfig {
@@ -118,6 +134,17 @@ impl<'de> Deserialize<'de> for DomainConfig {
             daily_token_budget: Option<u64>,
             #[serde(default = "default_max_output_tokens")]
             max_output_tokens: u32,
+            // Step 8 §5.1 新增：一致性策略 / 产物版本 / 回收间隔 / preflight 开关。
+            // Added in Step 8 §5.1: consistency policy / artifact version /
+            // reaper interval / preflight toggle.
+            #[serde(default)]
+            artifact_version: Option<String>,
+            #[serde(default)]
+            consistency: ConsistencyPolicy,
+            #[serde(default = "default_lease_reaper_interval")]
+            lease_reaper_interval_seconds: u32,
+            #[serde(default = "default_compatibility_preflight")]
+            compatibility_preflight: bool,
         }
         impl Default for CompileSection {
             /// 缺省 compile 段（历史 bug：derive(Default) 产生零值；§3.1 修正为
@@ -142,6 +169,10 @@ impl<'de> Deserialize<'de> for DomainConfig {
                     batch_token_budget: default_batch_token_budget(),
                     daily_token_budget: None,
                     max_output_tokens: default_max_output_tokens(),
+                    artifact_version: None,
+                    consistency: ConsistencyPolicy::default(),
+                    lease_reaper_interval_seconds: default_lease_reaper_interval(),
+                    compatibility_preflight: default_compatibility_preflight(),
                 }
             }
         }
@@ -164,6 +195,15 @@ impl<'de> Deserialize<'de> for DomainConfig {
             query: QuerySection,
             #[serde(default)]
             qug: QugConfig,
+            // Step 8 §5.1：strict semver 身份版本与兼容矩阵段（均可缺省）。
+            // Step 8 §5.1: strict-semver identity versions and the
+            // compatibility section (all optional).
+            #[serde(default)]
+            schema_version: Option<String>,
+            #[serde(default)]
+            prompt_version: Option<String>,
+            #[serde(default)]
+            compatibility: Option<CompatibilitySpec>,
         }
         fn default_threshold() -> f32 {
             0.75
@@ -198,6 +238,12 @@ impl<'de> Deserialize<'de> for DomainConfig {
         fn default_max_output_tokens() -> u32 {
             CompilePolicy::default().max_output_tokens
         }
+        fn default_lease_reaper_interval() -> u32 {
+            crate::compile::config::DEFAULT_LEASE_REAPER_INTERVAL_SECONDS
+        }
+        fn default_compatibility_preflight() -> bool {
+            true
+        }
 
         let r = Repr::deserialize(deserializer)?;
         // max_recompiles 保持公开字段为 usize（Step 2 兼容），策略内为 u32；
@@ -218,8 +264,37 @@ impl<'de> Deserialize<'de> for DomainConfig {
             batch_token_budget: r.compile.batch_token_budget,
             daily_token_budget: r.compile.daily_token_budget,
             max_output_tokens: r.compile.max_output_tokens,
+            // Step 8 §5.1：artifact_version 缺省沿用策略默认 wiki-v1；一致性、
+            // 回收间隔、preflight 开关与兼容矩阵快照照抄 YAML。
+            // Step 8 §5.1: artifact_version falls back to the policy default
+            // wiki-v1; consistency, reaper interval, preflight toggle and the
+            // compatibility snapshot are copied verbatim from the YAML.
+            artifact_version: r
+                .compile
+                .artifact_version
+                .unwrap_or_else(|| CompilePolicy::default().artifact_version),
+            consistency: r.compile.consistency,
+            lease_reaper_interval_seconds: r.compile.lease_reaper_interval_seconds,
+            compatibility_preflight: r.compile.compatibility_preflight,
+            compatibility: r.compatibility,
             ..CompilePolicy::default()
         };
+        // Step 8 §5.1：version/schema_version/prompt_version 必须 strict semver
+        // （解析期 fail-closed，A13）；artifact_version 用策略解析后的值，保证
+        // 身份五元组与策略一致。缺失 schema/prompt 记 None（legacy 只读容忍）。
+        // Step 8 §5.1: version/schema_version/prompt_version must be strict
+        // semver (fail-closed at parse time, A13); artifact_version uses the
+        // resolved policy value so the identity five-tuple and the policy agree.
+        // Missing schema/prompt are recorded as None (legacy read-only
+        // tolerance).
+        let identity = DomainIdentity::parse(
+            &r.name,
+            &r.version,
+            r.schema_version.as_deref(),
+            r.prompt_version.as_deref(),
+            &compile_policy.artifact_version,
+        )
+        .map_err(serde::de::Error::custom)?;
         Ok(DomainConfig {
             name: r.name,
             version: r.version,
@@ -231,6 +306,8 @@ impl<'de> Deserialize<'de> for DomainConfig {
             compile_output_contract: r.compile.output_contract,
             query_filters: r.query.filters,
             qug: r.qug,
+            schema_version: identity.schema_version,
+            prompt_version: identity.prompt_version,
         })
     }
 }
@@ -244,6 +321,28 @@ impl DomainConfig {
             .flat_map(|e| e.fields.iter())
             .find(|f| f.name == name)
             .map(|f| f.field_type)
+    }
+
+    /// 构造领域身份五元组（Step8 §6.4；B5 兼容 preflight 与 CLI 消费）。
+    /// YAML 路径的 version/schema/prompt 已在解析期验证 strict semver；非 YAML
+    /// 直接构造的配置（测试夹具）若 version 非法在此报 `InvalidConfig`。
+    /// artifact_version 与 compile 策略同源，保证身份与哈希输入一致。
+    /// Builds the domain-identity five-tuple (Step8 §6.4; consumed by B5's
+    /// compatibility preflight and the CLI). YAML-parsed configs already
+    /// validated version/schema/prompt as strict semver at parse time; configs
+    /// built directly (test fixtures) fail with `InvalidConfig` here when
+    /// version is invalid. artifact_version shares its source with the compile
+    /// policy, keeping the identity and the hash inputs consistent.
+    pub fn identity(&self) -> Result<DomainIdentity> {
+        let schema = self.schema_version.as_ref().map(ToString::to_string);
+        let prompt = self.prompt_version.as_ref().map(ToString::to_string);
+        DomainIdentity::parse(
+            &self.name,
+            &self.version,
+            schema.as_deref(),
+            prompt.as_deref(),
+            &self.compile_policy.artifact_version,
+        )
     }
 }
 
@@ -515,5 +614,109 @@ mod tests {
         // Existing sections do not reject unknown fields (Step 2/3 compatibility).
         let yaml = "name: d\nversion: \"0.1.0\"\nquery:\n  legacy_key: 1\nqug:\n  legacy_key: 1\n";
         assert!(serde_yaml_ng::from_str::<DomainConfig>(yaml).is_ok());
+    }
+
+    // Step8 §5.1（A13 纯解析）：consistency/artifact_version 段解析进策略；
+    // 缺省时一致性关闭、artifact_version 取策略默认。
+    // Step8 §5.1 (A13 pure parsing): the consistency/artifact_version sections
+    // feed the policy; defaults keep consistency disabled and artifact_version
+    // at the policy default.
+    #[test]
+    fn compile_section_step8_fields_parse_into_policy() {
+        let yaml = "name: d\nversion: \"0.1.0\"\n";
+        let config: DomainConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert!(!config.compile_policy.consistency.enabled);
+        assert_eq!(config.compile_policy.artifact_version, "wiki-v1");
+        assert_eq!(config.compile_policy.lease_reaper_interval_seconds, 30);
+        assert!(config.compile_policy.compatibility_preflight);
+        assert!(config.compile_policy.compatibility.is_none());
+        assert!(config.schema_version.is_none());
+        assert!(config.prompt_version.is_none());
+
+        let yaml = concat!(
+            "name: d\n",
+            "version: \"1.2.0\"\n",
+            "schema_version: \"2.1.0\"\n",
+            "prompt_version: \"3.0.0\"\n",
+            "compile:\n",
+            "  artifact_version: wiki-v2\n",
+            "  lease_reaper_interval_seconds: 15\n",
+            "  compatibility_preflight: false\n",
+            "  consistency:\n",
+            "    enabled: true\n",
+            "    top_k: 16\n",
+            "    min_consistency: 0.9\n",
+            "    compare_pointers: [\"/fields/name\", \"/fields/description\"]\n",
+            "compatibility:\n",
+            "  domain_pack: \">=1.0.0,<2.0.0\"\n",
+            "  schema: \">=2.0.0,<3.0.0\"\n",
+            "  prompt: \">=3.0.0,<4.0.0\"\n",
+            "  artifact: [\"wiki-v1\", \"wiki-v2\"]\n",
+        );
+        let config: DomainConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        let policy = &config.compile_policy;
+        assert_eq!(policy.artifact_version, "wiki-v2");
+        assert!(policy.consistency.enabled);
+        assert_eq!(policy.consistency.top_k, 16);
+        assert!((policy.consistency.min_consistency - 0.9).abs() < 1e-6);
+        assert_eq!(
+            policy.consistency.compare_pointers,
+            vec![
+                "/fields/name".to_string(),
+                "/fields/description".to_string()
+            ]
+        );
+        assert_eq!(policy.lease_reaper_interval_seconds, 15);
+        assert!(!policy.compatibility_preflight);
+        let spec = policy.compatibility.as_ref().unwrap();
+        assert_eq!(spec.artifact.len(), 2);
+        assert!(policy.validate().is_ok());
+        // 身份五元组：strict semver + 与策略同源的 artifact_version。
+        // Identity five-tuple: strict semver with policy-sourced
+        // artifact_version.
+        let identity = config.identity().unwrap();
+        assert_eq!(identity.domain, "d");
+        assert_eq!(identity.version.to_string(), "1.2.0");
+        assert_eq!(
+            identity.schema_version.as_ref().unwrap().to_string(),
+            "2.1.0"
+        );
+        assert_eq!(
+            identity.prompt_version.as_ref().unwrap().to_string(),
+            "3.0.0"
+        );
+        assert_eq!(identity.artifact_version, "wiki-v2");
+    }
+
+    // Step8 §5.1（A13）：version/schema_version/prompt_version 非 strict semver
+    // 在解析期拒绝；compile 段未知字段（含 consistency 内部）仍严格拒绝。
+    // Step8 §5.1 (A13): non-strict-semver version/schema_version/
+    // prompt_version is rejected at parse time; unknown fields (including
+    // inside consistency) remain strictly rejected.
+    #[test]
+    fn step8_identity_versions_are_strict_semver() {
+        assert!(
+            serde_yaml_ng::from_str::<DomainConfig>("name: d\nversion: \"test-v1\"\n").is_err()
+        );
+        assert!(serde_yaml_ng::from_str::<DomainConfig>(
+            "name: d\nversion: \"0.1.0\"\nschema_version: \"2.0\"\n"
+        )
+        .is_err());
+        assert!(serde_yaml_ng::from_str::<DomainConfig>(
+            "name: d\nversion: \"0.1.0\"\nprompt_version: \"\"\n"
+        )
+        .is_err());
+        // consistency 段未知字段拒绝。
+        // Unknown consistency fields are rejected.
+        assert!(serde_yaml_ng::from_str::<DomainConfig>(
+            "name: d\nversion: \"0.1.0\"\ncompile:\n  consistency:\n    topk: 8\n"
+        )
+        .is_err());
+        // compatibility 段未知字段拒绝。
+        // Unknown compatibility fields are rejected.
+        assert!(serde_yaml_ng::from_str::<DomainConfig>(
+            "name: d\nversion: \"0.1.0\"\ncompatibility:\n  domain: \">=1.0.0\"\n"
+        )
+        .is_err());
     }
 }

@@ -41,6 +41,14 @@ pub mod qug_store;
 pub mod feedback_store;
 mod sqlite;
 
+// Step8 批 B4：recover_compile_leases 的结构化返回（§6.3 RecoveryStats）在
+// kernel 层再导出——compile_store 是 pub(crate) 模块，公开方法
+// SqliteKernel::recover_compile_leases 的返回类型必须可命名。
+// Step8 batch B4: the structured return of recover_compile_leases (§6.3
+// RecoveryStats) is re-exported at kernel level — compile_store is a pub(crate)
+// module, so the return type of the public method
+// SqliteKernel::recover_compile_leases must be nameable.
+pub use compile_store::RecoveryStats;
 pub use mock_vector::MockVectorStore;
 pub use qug_store::{build_and_publish_qug, load_active_qug, QugStore, QUG_STALE_PREFIX};
 pub use sqlite::SqliteKernel;

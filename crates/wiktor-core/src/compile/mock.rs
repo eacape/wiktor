@@ -340,7 +340,9 @@ mod tests {
     }
 
     fn ctx() -> CompileContext {
-        crate::compile::config::build_context("test-v1", "S", "mock-v1", "none", 0.75, true)
+        crate::compile::config::build_context(
+            "test-v1", "S", "mock-v1", "none", 0.75, true, None, None,
+        )
     }
 
     // Mock 与 decode 自洽：合法 envelope 解出证据，usage=None，canonical 正文，

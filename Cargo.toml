@@ -38,6 +38,15 @@ qdrant-client = { version = "1.19", default-features = false }
 blake3 = "1.5"
 uuid = { version = "1.10", features = ["v4", "serde"] }
 
+# 版本比较（Step8 §5.1/§6.4：strict semver 解析与兼容范围比较；禁止手写版本
+# 排序/比较，serde feature 供 domain.yaml compatibility 段与 dependencies_json
+# 快照直接序列化）。
+# Version comparison (Step8 §5.1/§6.4: strict semver parsing and compatibility
+# range checks; hand-rolled version ordering/comparison is forbidden. The serde
+# feature lets the domain.yaml compatibility section and dependencies_json
+# snapshots round-trip directly).
+semver = { version = "1.0", features = ["serde"] }
+
 # 错误处理
 thiserror = "1.0"
 anyhow = "1.0"
@@ -49,6 +58,15 @@ petgraph = "0.6"
 # 日志（QueryEngine 统一写查询日志，日志写入失败用 tracing 报告）
 # Logging (QueryEngine writes query logs centrally; tracing reports log-write failures)
 tracing = "0.1"
+
+# 协作取消（Step8 §6.3/D8/D9：LeaseReaper 与心跳任务用
+# tokio_util::sync::CancellationToken；仓库原无取消原语惯例，取 spec 字面类型，
+# default-features=false 最小引入——sync 模块无需任何 feature）。
+# Cooperative cancellation (Step8 §6.3/D8/D9: the LeaseReaper and heartbeat tasks
+# use tokio_util::sync::CancellationToken; the repo had no cancellation primitive
+# convention, so the spec-literal type wins — default-features=false keeps it
+# minimal, the sync module needs no feature).
+tokio-util = { version = "0.7", default-features = false }
 
 # CLI 人类日志输出到 stderr（Step 4 §9：--json 时 stdout 只有一份 JSON）
 # CLI human logs go to stderr (Step 4 §9: with --json stdout carries only one JSON)

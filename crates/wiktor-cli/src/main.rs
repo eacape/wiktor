@@ -116,6 +116,12 @@ enum Command {
         #[command(subcommand)]
         command: commands::feedback::FeedbackCommand,
     },
+    /// Domain-pack operations (Step 8): read-only compatibility preflight.
+    /// 领域包操作（Step 8）：只读兼容 preflight。
+    Domain {
+        #[command(subcommand)]
+        command: commands::domain::DomainCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -204,6 +210,7 @@ async fn main() -> Result<()> {
         },
         Command::Eval(args) => finish(commands::eval::run(args).await?)?,
         Command::Feedback { command } => finish(commands::feedback::run(command).await?)?,
+        Command::Domain { command } => finish(commands::domain::run(command).await?)?,
     }
     Ok(())
 }

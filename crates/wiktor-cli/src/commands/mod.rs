@@ -40,6 +40,7 @@
 //! ([`SOURCE_CHANGED_PREFIX`]/[`QUG_STALE_PREFIX`]) and the rest of the
 //! message is never parsed.
 
+pub mod domain;
 pub mod eval;
 pub mod feedback;
 pub mod qug;

@@ -5,9 +5,10 @@ use diesel::sqlite::SqliteConnection;
 use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
 
 /// 嵌入的 SQLite 迁移（0001 两平面 + FTS5 基础，0002 FTS trigram，0003 编译管线，
-/// 0004 QUG 持久化，0005 反馈闭环）。
+/// 0004 QUG 持久化，0005 反馈闭环，0006 Step8 一致性/死信审核/兼容检查）。
 /// Embedded SQLite migrations (0001: two planes + FTS5 basics; 0002: FTS trigram;
-/// 0003: compile pipeline; 0004: QUG persistence; 0005: feedback loop).
+/// 0003: compile pipeline; 0004: QUG persistence; 0005: feedback loop; 0006:
+/// Step8 consistency/dead-letter review/compatibility checks).
 ///
 /// 迁移文件位于 `crates/wiktor-core/migrations/<version>_<name>/up.sql`，
 /// 由 diesel 在单个事务内应用；版本跟踪表 `__diesel_schema_migrations`。
@@ -90,13 +91,13 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let mut c = conn();
-        // A22/A2：0005 后 schema 版本为 5。
-        // A22/A2: schema version is 5 after 0005.
-        assert_eq!(schema_version(&mut c).unwrap(), 5);
+        // A22/A2：0006 后 schema 版本为 6（Step8 A1）。
+        // A22/A2: schema version is 6 after 0006 (Step8 A1).
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
         // 重跑无副作用
         // Re-running is side-effect free
         migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 5);
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
         let _ = std::fs::remove_dir_all(
             std::env::temp_dir().join(format!("wiktor_mig_test_{}", std::process::id())),
         );
@@ -278,7 +279,7 @@ mod tests {
         .unwrap();
 
         crate::schema::migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 5);
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
 
         // FTS 仅剩 accepted legacy 页（迁移清空 + accepted 回填）。
         // FTS keeps only the accepted legacy page (cleared then accepted backfill).
@@ -314,9 +315,8 @@ mod tests {
         );
     }
 
-    // A22：down 迁移链 —— feedback_events/qug_builds/compile_attempts 非空时
-    // 拒绝破坏性降级；空新表才允许回退，且回退后 schema 回到 0002 语义、再次
-    // migrate 可达 5。
+    // A22：down 迁移链 —— Step8/反馈/qug/compile_attempts 数据非空时拒绝破坏性
+    // 降级；空新表才允许回退，且回退后 schema 回到 0002 语义、再次 migrate 可达 6。
     // A22: the down-migration chain — non-empty feedback_events/qug_builds/
     // compile_attempts refuse destructive downgrades; empty new tables allow
     // rollback, after which the schema is back to 0002 semantics and
@@ -325,14 +325,16 @@ mod tests {
     fn migration_0003_down_guarded_by_attempts() {
         use diesel_migrations::MigrationHarness;
 
-        // 空 feedback_events/qug_builds/attempts：可回退（guard 表插入 0 不违反
-        // CHECK）。先回退 0005（反馈表空）→ 4，再回退 0004（qug_builds 空）→ 3，
-        // 最后回退 0003（attempts 空）→ 2。
-        // Empty feedback_events/qug_builds/attempts: revertible (the guard
-        // inserts 0, CHECK holds). First revert 0005 (empty feedback tables)
-        // → 4, then 0004 (empty qug_builds) → 3, finally 0003 (empty attempts)
-        // → 2.
+        // 空 Step6/Step8/legacy 审计数据：可回退（guard 表插入 0 不违反 CHECK）。
+        // 先回退 0006（Step8 数据空）→ 5，再回退 0005（反馈表空）→ 4，再回退
+        // 0004（qug_builds 空）→ 3，最后回退 0003（attempts 空）→ 2。
+        // Empty Step6/Step8/legacy audit data: revertible (the guard inserts 0,
+        // CHECK holds). First revert 0006 (empty Step8 data) → 5, then 0005
+        // (empty feedback tables) → 4, then 0004 (empty qug_builds) → 3,
+        // finally 0003 (empty attempts) → 2.
         let mut c = conn();
+        c.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 5);
         c.revert_last_migration(MIGRATIONS).unwrap();
         assert_eq!(schema_version(&mut c).unwrap(), 4);
         c.revert_last_migration(MIGRATIONS).unwrap();
@@ -351,19 +353,21 @@ mod tests {
         .execute(&mut c)
         .unwrap();
         assert_eq!(count(&mut c, "pages_fts"), 1);
-        // 再升级回 0005：candidate 被清出 FTS。
-        // Upgrade to 0005 again: the candidate is pushed out of FTS.
+        // 再升级回 0006：candidate 被清出 FTS。
+        // Upgrade to 0006 again: the candidate is pushed out of FTS.
         crate::schema::migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 5);
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
         assert_eq!(count(&mut c, "pages_fts"), 0);
 
         // 非空 attempts：guard CHECK 失败 → revert 报错，不静默丢审计（§8.1）。
-        // revert_last_migration 先回退 0005（反馈表空 → 成功）→ 4，再回退 0004
-        // （qug_builds 空 → 成功）→ 3，第三次 revert 触发 0003 守卫失败，版本停在 3。
+        // revert_last_migration 先回退 0006（Step8 数据空 → 成功）→ 5，再回退
+        // 0005（反馈表空 → 成功）→ 4，再回退 0004（qug_builds 空 → 成功）→ 3，
+        // 第四次 revert 触发 0003 守卫失败，版本停在 3。
         // Non-empty attempts: the guard CHECK fails → revert errors, audit never
-        // silently dropped (§8.1). revert_last_migration first reverts 0005
-        // (empty feedback tables → OK) → 4, then 0004 (empty qug_builds → OK)
-        // → 3; the third revert trips the 0003 guard and the version stays 3.
+        // silently dropped (§8.1). revert_last_migration first reverts 0006
+        // (empty Step8 data → OK) → 5, then 0005 (empty feedback tables → OK)
+        // → 4, then 0004 (empty qug_builds → OK) → 3; the fourth revert trips
+        // the 0003 guard and the version stays 3.
         diesel::sql_query("DELETE FROM pages")
             .execute(&mut c)
             .unwrap();
@@ -397,6 +401,7 @@ mod tests {
         .unwrap();
         c.revert_last_migration(MIGRATIONS).unwrap();
         c.revert_last_migration(MIGRATIONS).unwrap();
+        c.revert_last_migration(MIGRATIONS).unwrap();
         assert!(c.revert_last_migration(MIGRATIONS).is_err());
         assert_eq!(schema_version(&mut c).unwrap(), 3);
     }
@@ -411,9 +416,13 @@ mod tests {
         use diesel_migrations::MigrationHarness;
 
         let mut c = conn();
-        // 先回退 0005（反馈表空 → 成功）到 4，使 revert_last_migration 指向 0004。
-        // First revert 0005 (empty feedback tables → OK) down to 4 so
-        // revert_last_migration targets 0004.
+        // 先回退 0006（Step8 数据空 → 成功）到 5，再回退 0005（反馈表空 → 成功）
+        // 到 4，使 revert_last_migration 指向 0004。
+        // First revert 0006 (empty Step8 data → OK) down to 5, then revert 0005
+        // (empty feedback tables → OK) down to 4 so revert_last_migration
+        // targets 0004.
+        c.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 5);
         c.revert_last_migration(MIGRATIONS).unwrap();
         assert_eq!(schema_version(&mut c).unwrap(), 4);
         // building 行不占 active published 唯一索引，可独立插入。
@@ -523,7 +532,7 @@ mod tests {
         .unwrap();
 
         crate::schema::migrate(&mut c).unwrap();
-        assert_eq!(schema_version(&mut c).unwrap(), 5);
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
 
         let rows: Vec<SqlRow> = diesel::sql_query(
             "SELECT domain || '/' || candidate_empty_initial || '/' ||
@@ -550,16 +559,21 @@ mod tests {
 
     // A2/A3：0005 down —— feedback_events/review_queue 非空时拒绝回退（不丢反馈
     // /审核审计）；清空后回退成功，0005 新表与 query_logs 新列一并移除，再迁移
-    // 可达 5。
+    // 可达 6。
     // A2/A3: the 0005 down — non-empty feedback_events/review_queue refuse the
     // downgrade (feedback/review audit is never dropped); once cleared, the
     // downgrade succeeds, the 0005 tables and the query_logs columns go away,
-    // and re-migrating reaches 5 again.
+    // and re-migrating reaches 6 again.
     #[test]
     fn migration_0005_down_guarded_by_feedback() {
         use diesel_migrations::MigrationHarness;
 
         let mut c = conn();
+        // 先回退 0006（Step8 数据空 → 成功）到 5，使 revert_last_migration 指向 0005。
+        // First revert 0006 (empty Step8 data → OK) down to 5 so
+        // revert_last_migration targets 0005.
+        c.revert_last_migration(MIGRATIONS).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 5);
         // 塞一条合法反馈事件（先有 query_logs 行供 FK）。
         // Seed one valid feedback event (a query_logs row first, for the FK).
         diesel::sql_query(
@@ -615,10 +629,287 @@ mod tests {
         .unwrap();
         assert!(cols.is_empty(), "0005 query_logs columns must be dropped");
 
-        // 再迁移回 5（up/down 幂等往返）。
-        // Re-migrate to 5 again (the up/down round trip is idempotent).
+        // 再迁移回 6（up/down 幂等往返）。
+        // Re-migrate to 6 again (the up/down round trip is idempotent).
         crate::schema::migrate(&mut c).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
+    }
+
+    /// 搭一个 0001..0005 的库（含版本行），供 0006 真实升级路径测试。
+    /// Builds a 0001..0005 database (with version rows) for the real 0006
+    /// upgrade-path test.
+    fn conn_at_0005(dir_name: &str) -> SqliteConnection {
+        use diesel::connection::SimpleConnection;
+        let dir =
+            std::env::temp_dir().join(format!("wiktor_mig_v5_{}_{}", std::process::id(), dir_name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v5.db");
+        let mut c = SqliteConnection::establish(path.to_str().unwrap()).unwrap();
+        c.batch_execute(include_str!("../../migrations/0001_create_core/up.sql"))
+            .unwrap();
+        c.batch_execute(include_str!("../../migrations/0002_fts_trigram/up.sql"))
+            .unwrap();
+        c.batch_execute(include_str!(
+            "../../migrations/0003_compile_pipeline/up.sql"
+        ))
+        .unwrap();
+        c.batch_execute(include_str!("../../migrations/0004_qug_persistence/up.sql"))
+            .unwrap();
+        c.batch_execute(include_str!("../../migrations/0005_feedback_loop/up.sql"))
+            .unwrap();
+        c.batch_execute(
+            "CREATE TABLE __diesel_schema_migrations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                version TEXT NOT NULL,
+                run_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        // 版本行从全新 migrate 的库里取（按版本序前 5 行即 0001..0005）。
+        // Version rows come from a freshly migrated DB (the first 5 in version
+        // order are 0001..0005).
+        let mut fresh = conn();
+        let versions: Vec<SqlRow> = diesel::sql_query(
+            "SELECT version AS value FROM __diesel_schema_migrations ORDER BY version",
+        )
+        .load(&mut fresh)
+        .unwrap();
+        for v in &versions[..5] {
+            diesel::sql_query("INSERT INTO __diesel_schema_migrations (version) VALUES (?)")
+                .bind::<diesel::sql_types::Text, _>(&v.value)
+                .execute(&mut c)
+                .unwrap();
+        }
+        c
+    }
+
+    // A1（Step8）：0001–0005 数据库升级到 6 —— 既有三种 review action 行
+    // （含 compile_task_id FK）原样保留，0006 新列取确定默认
+    // （'unchecked' / '{}'），四个索引就位，放宽后的 CHECK 接受新动作。
+    // A1 (Step8): a 0001–0005 database upgrades to 6 — existing rows with the
+    // three legacy review actions (including the compile_task_id FK) are kept
+    // verbatim, the 0006 columns take deterministic defaults ('unchecked' /
+    // '{}'), the four indexes exist, and the widened CHECK accepts the new
+    // actions.
+    #[test]
+    fn migration_0006_upgrade_keeps_legacy_reviews() {
+        let mut c = conn_at_0005("s8upgrade");
+        diesel::sql_query(
+            "INSERT INTO compile_tasks (entity_id, source_revision, domain_pack_version,
+                status, retry_count, max_retries, created_at, updated_at,
+                desired_hash, epoch, source_json, dependencies_json, snapshot_hash,
+                next_attempt_at, task_token_budget)
+             VALUES ('milk-tea:drink:boba', 1, '0.1.0', 'dead', 0, 3, 1, 1,
+                'h', 1, '{}', '{}', 's', 0, 65536)",
+        )
+        .execute(&mut c)
+        .unwrap();
+        let task_id: i64 = diesel::sql_query("SELECT task_id AS n FROM compile_tasks")
+            .get_result::<CountRow>(&mut c)
+            .unwrap()
+            .n;
+        // 0005 形状的 review_queue 行：legacy 三动作之一 + compile_task_id 回填。
+        // A 0005-shape review_queue row: a legacy action plus a filled
+        // compile_task_id.
+        diesel::sql_query(
+            "INSERT INTO review_queue (domain, action, status, source_log_ids_json,
+                    subject_json, reason_json, created_at, compile_task_id)
+             VALUES ('milk-tea', 'query_template', 'pending', '[]', '{\"id\":1}',
+                     '{\"note\":\"legacy\"}', 10, ?)",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(task_id)
+        .execute(&mut c)
+        .unwrap();
+
+        crate::schema::migrate(&mut c).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
+
+        // 既有审核行原样保留（review_id/action/subject/FK 全部不变）。
+        // The existing review row is preserved verbatim (review_id/action/
+        // subject/FK unchanged).
+        let rows: Vec<SqlRow> = diesel::sql_query(
+            "SELECT action || '/' || status || '/' || subject_json || '/' ||
+                    CAST(compile_task_id AS TEXT) AS value FROM review_queue",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert_eq!(
+            rows[0].value,
+            format!("query_template/pending/{{\"id\":1}}/{task_id}"),
+            "legacy review rows survive the rebuild"
+        );
+
+        // 0006 新列取确定默认。
+        // The 0006 columns take deterministic defaults.
+        let rows: Vec<SqlRow> = diesel::sql_query(
+            "SELECT consistency_status || '/' || compatibility_status AS value
+             FROM compile_tasks",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert_eq!(rows[0].value, "unchecked/unchecked");
+
+        // 四个索引就位（含部分索引 idx_review_task 与重建的 idx_review_status）。
+        // The four indexes exist (including the partial idx_review_task and the
+        // rebuilt idx_review_status).
+        let idx: Vec<SqlRow> = diesel::sql_query(
+            "SELECT name AS value FROM sqlite_master WHERE type = 'index'
+             AND name IN ('idx_compile_tasks_dead_review','idx_compile_tasks_preflight',
+                          'idx_review_task','idx_review_status')
+             ORDER BY name",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert_eq!(idx.len(), 4, "0006 indexes must exist");
+
+        // 放宽后的 CHECK 接受三个新动作。
+        // The widened CHECK accepts the three new actions.
+        diesel::sql_query(
+            "INSERT INTO review_queue (domain, action, status, source_log_ids_json,
+                    subject_json, reason_json, created_at, compile_task_id)
+             VALUES ('milk-tea', 'compile_dead_letter', 'pending', '[]',
+                     '{\"task_id\":1}', '{}', 20, ?)",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(task_id)
+        .execute(&mut c)
+        .unwrap();
+
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("wiktor_mig_v5_{}_s8upgrade", std::process::id())),
+        );
+    }
+
+    // A2（Step8/D12）：0006 down 守卫 —— 任一 Step 8 审计非空（新动作审核行、
+    // 非默认一致性/兼容状态、非空诊断 JSON）即拒绝回退且行不变；全部清空后
+    // 恢复 0005 三动作 CHECK 与索引/列，再迁移可达 6。
+    // A2 (Step8/D12): the 0006 down guard — any non-empty Step 8 audit (a new
+    // action review row, a non-default consistency/compatibility status, a
+    // non-empty diagnostic JSON) refuses the downgrade with rows untouched;
+    // once everything is cleared the 0005 three-action CHECK and the indexes/
+    // columns are restored, and re-migrating reaches 6.
+    #[test]
+    fn migration_0006_down_guarded_by_step8_data() {
+        use diesel_migrations::MigrationHarness;
+
+        let mut c = conn();
+
+        // 守卫 1：Step 8 新动作审核行非空 → 拒绝回退，版本停在 6。
+        // Guard 1: a non-empty Step 8 action review row refuses the downgrade;
+        // the version stays 6.
+        diesel::sql_query(
+            "INSERT INTO compile_tasks (entity_id, source_revision, domain_pack_version,
+                status, retry_count, max_retries, created_at, updated_at,
+                desired_hash, epoch, source_json, dependencies_json, snapshot_hash,
+                next_attempt_at, task_token_budget)
+             VALUES ('milk-tea:drink:boba', 1, '0.1.0', 'dead', 0, 3, 1, 1,
+                'h', 1, '{}', '{}', 's', 0, 65536)",
+        )
+        .execute(&mut c)
+        .unwrap();
+        let task_id: i64 = diesel::sql_query("SELECT task_id AS n FROM compile_tasks")
+            .get_result::<CountRow>(&mut c)
+            .unwrap()
+            .n;
+        diesel::sql_query(
+            "INSERT INTO review_queue (domain, action, status, source_log_ids_json,
+                    subject_json, reason_json, created_at, compile_task_id)
+             VALUES ('milk-tea', 'compile_dead_letter', 'pending', '[]',
+                     '{\"task_id\":1}', '{}', 20, ?)",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(task_id)
+        .execute(&mut c)
+        .unwrap();
+        assert!(c.revert_last_migration(MIGRATIONS).is_err());
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
+
+        // 守卫 2：consistency_status 非默认 → 拒绝回退。
+        // Guard 2: a non-default consistency_status refuses the downgrade.
+        diesel::sql_query("DELETE FROM review_queue")
+            .execute(&mut c)
+            .unwrap();
+        diesel::sql_query("UPDATE compile_tasks SET consistency_status = 'conflict'")
+            .execute(&mut c)
+            .unwrap();
+        assert!(c.revert_last_migration(MIGRATIONS).is_err());
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
+
+        // 守卫 3：compile_attempts 诊断 JSON 非空 → 拒绝回退。
+        // Guard 3: a non-empty compile_attempts diagnostic JSON refuses the
+        // downgrade.
+        diesel::sql_query("UPDATE compile_tasks SET consistency_status = 'unchecked'")
+            .execute(&mut c)
+            .unwrap();
+        diesel::sql_query(
+            "INSERT INTO compile_runs (run_id, token_limit, reserved_tokens, created_at)
+             VALUES ('run-1', 1000, 0, 1)",
+        )
+        .execute(&mut c)
+        .unwrap();
+        diesel::sql_query(
+            "INSERT INTO compile_attempts (task_id, epoch, attempt_no, lease_token, status,
+                run_id, utc_day, issues_json, reserved_tokens, created_at,
+                consistency_json)
+             VALUES (?, 1, 1, 'tok', 'completed', 'run-1', 0, '[]', 10, 1,
+                     '{\"code\":\"VALUE_DIVERGENCE\"}')",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(task_id)
+        .execute(&mut c)
+        .unwrap();
+        assert!(c.revert_last_migration(MIGRATIONS).is_err());
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
+
+        // 全部清空 → 回退成功：0006 新列消失，review_queue 恢复三动作 CHECK
+        // （新动作被拒、旧动作可用），0006 索引消失，再迁移可达 6。
+        // Once everything is cleared → the downgrade succeeds: the 0006 columns
+        // vanish, review_queue is back to the three-action CHECK (new actions
+        // rejected, legacy actions fine), the 0006 indexes are gone, and
+        // re-migrating reaches 6.
+        diesel::sql_query("DELETE FROM compile_attempts")
+            .execute(&mut c)
+            .unwrap();
+        diesel::sql_query("DELETE FROM compile_tasks")
+            .execute(&mut c)
+            .unwrap();
+        c.revert_last_migration(MIGRATIONS).unwrap();
         assert_eq!(schema_version(&mut c).unwrap(), 5);
+        let cols: Vec<SqlRow> = diesel::sql_query(
+            "SELECT name AS value FROM pragma_table_info('compile_tasks')
+             WHERE name IN ('consistency_status','compatibility_status')
+             UNION ALL
+             SELECT name FROM pragma_table_info('compile_attempts')
+             WHERE name IN ('consistency_json','compatibility_json')",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert!(cols.is_empty(), "0006 columns must be dropped");
+        let idx: Vec<SqlRow> = diesel::sql_query(
+            "SELECT name AS value FROM sqlite_master WHERE type = 'index'
+             AND name IN ('idx_compile_tasks_dead_review','idx_compile_tasks_preflight',
+                          'idx_review_task')",
+        )
+        .load(&mut c)
+        .unwrap();
+        assert!(idx.is_empty(), "0006 indexes must be dropped");
+        // 0005 三动作 CHECK 恢复：compile_dead_letter 被拒、旧动作可用。
+        // The 0005 three-action CHECK is restored: compile_dead_letter is
+        // rejected while legacy actions insert fine.
+        assert!(diesel::sql_query(
+            "INSERT INTO review_queue (domain, action, status, source_log_ids_json,
+                    subject_json, reason_json, created_at)
+             VALUES ('milk-tea', 'compile_dead_letter', 'pending', '[]', '{}', '{}', 1)"
+        )
+        .execute(&mut c)
+        .is_err());
+        diesel::sql_query(
+            "INSERT INTO review_queue (domain, action, status, source_log_ids_json,
+                    subject_json, reason_json, created_at)
+             VALUES ('milk-tea', 'query_template', 'pending', '[]', '{}', '{}', 1)",
+        )
+        .execute(&mut c)
+        .unwrap();
+
+        crate::schema::migrate(&mut c).unwrap();
+        assert_eq!(schema_version(&mut c).unwrap(), 6);
     }
 }
 

@@ -32,6 +32,19 @@
 //!   成功回填 compile_task_id + status='approved' + 审计字段，admission 未真正
 //!   排队或任一步失败整体回滚（review 保持 pending、无孤儿任务）；action=query_
 //!   template 仅写 status='approved' + 审计字段，不碰 compile_tasks（A16）；
+//! - `approve_review`（Step8 批 B6，D6/D11/§7/§8，A16/A17）追加三个 fail-closed
+//!   分支：`compile_dead_letter` 解析 canonical subject `{"task_id":N}` → 任务
+//!   必须存在且 status='dead' → head 快照一致性守卫 → 以**原任务快照**
+//!   （source_json/dependencies_json/存档 snapshot_hash）显式 `force=true` 复用
+//!   `admit_compile_on_conn` 新建 epoch admission（UNIQUE 三元保证重排的就是原
+//!   任务行，epoch+1）→ review CAS approved + 回填 task_id；任何失败整体回滚。
+//!   `consistency_conflict` 只能批准为一次新的 supplemental_compile 审核转换：
+//!   从任务快照恢复五字段 subject（无法恢复 → Validation 回滚），插入一条
+//!   supplemental_compile 建议（reason 原样保留）并同事务批准 + force admission，
+//!   原 consistency_conflict 行置 approved——不能直接发布。`compatibility_`
+//!   `conflict` 仅审计批准（approved + 审计字段），不建任务、不能绕过 preflight。
+//!   三者均可 `ignore_review`（置 ignored + 审计字段）；目标 action 之外的未知
+//!   action 一律 Validation（协议错误/数据库损坏，绝不静默当 ignore）。
 //! - `ignore_review`（批4）：pending → status='ignored' + 审计字段的纯审计转换，
 //!   不校验 subject、不触碰 compile_tasks；非 pending 拒绝。
 //!
@@ -87,12 +100,14 @@
 //! contract types can only live in core.
 
 use super::compile_store::{admit_compile_on_conn, StoredDependencies};
-use crate::compile::config::{prepare_source, Admission};
+use crate::compile::config::{prepare_source, Admission, PreparedSource};
 use crate::compile::hash::schema_from_value;
+use crate::traits::EntitySchema;
 use crate::types::error::{Error, Result};
-use crate::types::RawEntity;
+use crate::types::{Facts, RawEntity};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ===== 输入预算常量（spec §5/§7：数据模型层规则，kernel 先行校验，HTTP 层复述）=====
 // ===== Input-budget constants (spec §5/§7: data-model rules; the kernel
@@ -303,9 +318,13 @@ pub struct ReviewItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewSuggestionInput {
-    /// DDL 三个合法值之一：`supplemental_compile` / `query_template` / `ignore`。
-    /// One of the three legal DDL values: `supplemental_compile` /
-    /// `query_template` / `ignore`.
+    /// 合法 action：Step6 三动作 `supplemental_compile` / `query_template` /
+    /// `ignore`，或 0006 新增三动作 `compile_dead_letter` /
+    /// `consistency_conflict` / `compatibility_conflict`（Step8 D6）。
+    /// Legal actions: the three Step6 values `supplemental_compile` /
+    /// `query_template` / `ignore`, or the three 0006 additions
+    /// `compile_dead_letter` / `consistency_conflict` / `compatibility_conflict`
+    /// (Step8 D6).
     pub action: String,
     /// 来源 query log id 的 JSON 数组串（如 `"[1,3]"`；trace 用途）。
     /// JSON array string of source query-log ids (e.g. `"[1,3]"`; for trace).
@@ -450,12 +469,16 @@ fn validate_feedback_input(input: &FeedbackEventInput) -> Result<()> {
     Ok(())
 }
 
-/// 审核建议合法性（批3；非法输入 → Validation，DB CHECK 仅兜底）：domain 边界、
-/// action 枚举、三个 JSON 字段必须可解析（CHECK 无法验证 JSON 形状，应用层先行）。
-/// Review-suggestion legality (batch 3; illegal input → Validation, the DB CHECK
-/// stays a backstop): domain bounds, the action enum, and the three JSON fields
-/// must parse (CHECKs cannot verify JSON shape, so the application layer goes
-/// first).
+/// 审核建议合法性（批3 + Step8 批 B3；非法输入 → Validation，DB CHECK 仅兜底）：
+/// domain 边界、action 枚举（Step6 三动作 + Step8 三新动作）、三个 JSON 字段必须
+/// 可解析；`compile_dead_letter` 的 subject 额外强制 D7 canonical 形状
+/// `{"task_id":N}`（task 存在性由 insert 事务校验——纯函数无连接）。
+/// Review-suggestion legality (batch 3 + Step8 batch B3; illegal input →
+/// Validation, the DB CHECK stays a backstop): domain bounds, the action enum
+/// (the three Step6 values plus the three Step8 additions), and the three JSON
+/// fields must parse; a `compile_dead_letter` subject additionally enforces the
+/// D7 canonical shape `{"task_id":N}` (task existence is validated inside the
+/// insert transaction — the pure function has no connection).
 fn validate_review_suggestion(domain: &str, suggestion: &ReviewSuggestionInput) -> Result<()> {
     let domain_chars = domain.chars().count();
     if domain_chars == 0 || domain_chars > MAX_DOMAIN_CHARS {
@@ -465,10 +488,37 @@ fn validate_review_suggestion(domain: &str, suggestion: &ReviewSuggestionInput) 
     }
     match suggestion.action.as_str() {
         "supplemental_compile" | "query_template" | "ignore" => {}
+        // D7：死信 subject 必须精确为 canonical {"task_id":N}（本批仅入库/列表；
+        // approve 语义属 B6）。
+        // D7: a dead-letter subject must be exactly the canonical {"task_id":N}
+        // (this batch only inserts/lists; approve semantics belong to B6).
+        "compile_dead_letter" => {
+            parse_dead_letter_task_id(&suggestion.subject_json)?;
+        }
+        // 宽松化（上层拍板）：compatibility_conflict 的 subject 形状 B5 落地时
+        // 再强制；consistency_conflict 的 kernel 内部生成形状即 {"task_id":N}，
+        // 这里只要求 JSON 对象，不锁死键集。
+        // Relaxed per the upstream ruling: the compatibility_conflict subject
+        // shape is enforced when B5 lands; the kernel-generated
+        // consistency_conflict subject is already {"task_id":N}, so here only a
+        // JSON object is required without pinning the key set.
+        "consistency_conflict" | "compatibility_conflict" => {
+            let ok = serde_json::from_str::<serde_json::Value>(&suggestion.subject_json)
+                .ok()
+                .and_then(|v| v.as_object().map(|_| ()))
+                .is_some();
+            if !ok {
+                return Err(Error::Validation(format!(
+                    "review suggestion subject for {} must be a JSON object",
+                    suggestion.action
+                )));
+            }
+        }
         other => {
             return Err(Error::Validation(format!(
-                "review suggestion action must be one of \
-                 supplemental_compile/query_template/ignore (got {other:?})"
+                "review suggestion action must be one of supplemental_compile/query_template/\
+                 ignore/compile_dead_letter/consistency_conflict/compatibility_conflict \
+                 (got {other:?})"
             )));
         }
     }
@@ -484,6 +534,47 @@ fn validate_review_suggestion(domain: &str, suggestion: &ReviewSuggestionInput) 
         }
     }
     Ok(())
+}
+
+/// 解析并严格校验 `compile_dead_letter` 的 subject（D7/A10）：必须恰好为 canonical
+/// 紧凑形式 `{"task_id":N}`——单键、整数值、N>0、无空白/键序差异（UNIQUE 键是原
+/// 串，非 canonical 变体会破坏按 task 去重）。返回 task_id。
+/// Parses and strictly validates a `compile_dead_letter` subject (D7/A10): it
+/// must be exactly the canonical compact `{"task_id":N}` — one key, an integer
+/// value, N>0, no whitespace/key-order drift (the UNIQUE key is the raw string,
+/// so non-canonical variants would break per-task dedup). Returns the task_id.
+fn parse_dead_letter_task_id(subject_json: &str) -> Result<i64> {
+    const EXPECTED: &str = r#"{"task_id":N}"#;
+    let value: serde_json::Value = serde_json::from_str(subject_json).map_err(|_| {
+        Error::Validation(format!(
+            "compile_dead_letter subject must be exactly {EXPECTED}"
+        ))
+    })?;
+    let obj = value.as_object().ok_or_else(|| {
+        Error::Validation(format!(
+            "compile_dead_letter subject must be exactly {EXPECTED}"
+        ))
+    })?;
+    let task_id = obj.get("task_id").and_then(|v| v.as_i64()).ok_or_else(|| {
+        Error::Validation(format!(
+            "compile_dead_letter subject must be exactly {EXPECTED} with an integer task_id"
+        ))
+    })?;
+    if obj.len() != 1 || task_id <= 0 {
+        return Err(Error::Validation(format!(
+            "compile_dead_letter subject must be exactly {EXPECTED} with a positive task_id"
+        )));
+    }
+    // canonical 紧凑形式逐字节比对（serde_json BTreeMap 保键序 → 唯一输出）。
+    // Byte-exact canonical compact comparison (serde_json BTreeMap keeps key
+    // order → a unique output).
+    let canonical = serde_json::to_string(&value)?;
+    if canonical != subject_json {
+        return Err(Error::Validation(format!(
+            "compile_dead_letter subject must be canonical compact JSON {EXPECTED}"
+        )));
+    }
+    Ok(task_id)
 }
 
 // ===== 批4：审核转换的纯校验（spec §8 口径；CHECK 约束为兜底背书）=====
@@ -784,6 +875,213 @@ impl ReviewRow {
             compile_task_id: self.compile_task_id,
         })
     }
+}
+
+// ===== Step8 批 B6：死信批准 / 一致性转换的任务快照读取与重建（A16/A17）=====
+// ===== Step8 batch B6: task-snapshot reads and rebuilds for dead-letter
+// approval / consistency conversion (A16/A17) =====
+
+/// 死任务/既有任务快照行（B6 两个新 approve 分支共用）：admission 时落库的
+/// source_json（知识投影）、dependencies_json（冻结依赖）与 snapshot_hash 是
+/// 「原任务快照」的全部载体——完整源实体不在任务快照内（敏感字段不落任务，
+/// §3.1），因此重放沿存档 snapshot_hash 走，绝不重投影重算哈希。
+/// Dead/existing task-snapshot row (shared by the two new B6 approve arms): the
+/// source_json (knowledge projection), dependencies_json (frozen dependencies)
+/// and snapshot_hash persisted at admission are the entire "original task
+/// snapshot" — the full raw entity is not part of the task snapshot (sensitive
+/// fields never enter it, §3.1), so the replay rides the archived snapshot_hash
+/// and never re-projects/re-hashes.
+#[derive(QueryableByName)]
+struct TaskSnapshotRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    task_id: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    source_revision: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    domain_pack_version: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    snapshot_hash: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    source_json: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    dependencies_json: String,
+}
+
+/// compile_source_heads 探针行（head 快照一致性守卫用）。
+/// A compile_source_heads probe row (for the head-snapshot coherence guard).
+#[derive(QueryableByName)]
+struct HeadProbeRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    source_revision: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    snapshot_hash: String,
+}
+
+/// 从实体键解析任务所属域（compile_tasks 无 domain 列；与 compile_store 的
+/// review_domain_of 同一推导——实体键 `domain:type:slug` 首段即域，解析失败 →
+/// Validation fail-closed）。
+/// Resolves a task's domain from its entity key (compile_tasks has no domain
+/// column; the same derivation as compile_store's review_domain_of — the leading
+/// segment of `domain:type:slug` is the domain; a parse failure → Validation
+/// fail-closed).
+fn task_entity_domain(entity_id: &str) -> Result<String> {
+    Ok(crate::types::EntityId::from_key(entity_id)?.domain)
+}
+
+/// 读取任务快照行（B6 事务体内使用；任务不存在 → Validation，不猜造）。
+/// Loads the task-snapshot row (used inside B6 transaction bodies; a missing
+/// task → Validation, never fabricated).
+fn load_task_snapshot_on_conn(tx: &mut SqliteConnection, task_id: i64) -> Result<TaskSnapshotRow> {
+    diesel::sql_query(
+        "SELECT task_id, entity_id, source_revision, domain_pack_version, status,
+                snapshot_hash, source_json, dependencies_json
+         FROM compile_tasks WHERE task_id = ?",
+    )
+    .bind::<diesel::sql_types::BigInt, _>(task_id)
+    .get_result(tx)
+    .optional()?
+    .ok_or_else(|| Error::Validation(format!("compile task {task_id} does not exist")))
+}
+
+/// head 快照一致性守卫（B6）：head 必须存在且 (revision, snapshot_hash) 与任务
+/// 快照逐字一致。admission 只在「同 revision 同 snapshot」重放路径下绝不写
+/// facts——守卫成立时 admit 的 facts CAS 分支不可达，重建输入里的空 facts 永不
+/// 落库；head 缺失或漂移 = 数据损坏/源已前移，一律 Validation 回滚（review 保
+/// 持 pending，任务原样）。
+/// The head-snapshot coherence guard (B6): the head must exist and its
+/// (revision, snapshot_hash) must match the task snapshot verbatim. Admission
+/// never writes facts on the "same revision, same snapshot" replay path — with
+/// the guard holding, admit's facts-CAS branch is unreachable and the empty
+/// facts of the rebuilt input can never land. A missing or drifted head means
+/// corruption or an advanced source — always Validation + rollback (the review
+/// stays pending, the task untouched).
+fn guard_head_matches_task(tx: &mut SqliteConnection, task: &TaskSnapshotRow) -> Result<()> {
+    let head: Option<HeadProbeRow> = diesel::sql_query(
+        "SELECT source_revision, snapshot_hash
+         FROM compile_source_heads WHERE entity_id = ?",
+    )
+    .bind::<diesel::sql_types::Text, _>(&task.entity_id)
+    .get_result(tx)
+    .optional()?;
+    let Some(head) = head else {
+        return Err(Error::Validation(format!(
+            "compile task {} has no source head for entity {:?}; refusing snapshot replay",
+            task.task_id, task.entity_id
+        )));
+    };
+    if head.source_revision != task.source_revision {
+        return Err(Error::Validation(format!(
+            "compile task {} revision {} is stale against source head revision {}; \
+             re-admission refused",
+            task.task_id, task.source_revision, head.source_revision
+        )));
+    }
+    if head.snapshot_hash != task.snapshot_hash {
+        return Err(Error::Validation(format!(
+            "compile task {} snapshot_hash drifted from the source head; re-admission refused",
+            task.task_id
+        )));
+    }
+    Ok(())
+}
+
+/// 从任务快照重建 admission 输入（B6）：knowledge = source_json（admission 时
+/// 的知识投影）、deps/schema = dependencies_json 解析、snapshot_hash 沿用任务
+/// 行存档值（保证 admit 的 head CAS 命中「同 revision 同 snapshot」重放路径）。
+/// full 与 knowledge 同体；facts 恒为空——head 守卫保证同 revision 重放不触发
+/// facts CAS 写入，空值仅为满足 PreparedSource 形状，绝不落库。快照声明与
+/// source_json/deps 矛盾（实体/revision/domain_pack_version 任一不一致）= 数据
+/// 损坏 → Validation。
+/// Rebuilds the admission input from a task snapshot (B6): knowledge =
+/// source_json (the knowledge projection at admission time), deps/schema parsed
+/// from dependencies_json, snapshot_hash reused verbatim from the archived task
+/// row (so admit's head CAS lands on the "same revision, same snapshot" replay
+/// path). full mirrors knowledge; facts are always empty — the head guard keeps
+/// the same-revision replay from ever reaching the facts-CAS write, so the empty
+/// value only satisfies the PreparedSource shape and never lands. A snapshot
+/// contradicting source_json/deps (entity/revision/domain_pack_version) means
+/// corruption → Validation.
+fn rebuild_prepared_from_task(
+    task: &TaskSnapshotRow,
+) -> Result<(PreparedSource, StoredDependencies, EntitySchema)> {
+    if task.source_revision <= 0 {
+        return Err(Error::Internal(format!(
+            "corrupt compile_tasks.source_revision {} for task {}",
+            task.source_revision, task.task_id
+        )));
+    }
+    let knowledge: RawEntity = serde_json::from_str(&task.source_json).map_err(|e| {
+        Error::Validation(format!(
+            "task {} source_json does not parse as a RawEntity: {e}",
+            task.task_id
+        ))
+    })?;
+    let deps: StoredDependencies = serde_json::from_str(&task.dependencies_json).map_err(|e| {
+        Error::Validation(format!(
+            "task {} dependencies_json does not parse as {{context, policy, schema}}: {e}",
+            task.task_id
+        ))
+    })?;
+    let schema = schema_from_value(&deps.schema)?;
+
+    // 快照自洽交叉校验（fail-closed，镜像 parse_supplemental_subject 的三查）。
+    // Snapshot coherence cross-checks (fail-closed, mirroring the three checks
+    // of parse_supplemental_subject).
+    if knowledge.id.to_key() != task.entity_id {
+        return Err(Error::Validation(format!(
+            "task {} entity_id {:?} does not match source_json entity {:?}",
+            task.task_id,
+            task.entity_id,
+            knowledge.id.to_key()
+        )));
+    }
+    if knowledge.source_revision != task.source_revision as u64 {
+        return Err(Error::Validation(format!(
+            "task {} source_revision {} does not match source_revision {} in source_json",
+            task.task_id, task.source_revision, knowledge.source_revision
+        )));
+    }
+    if deps.context.domain_pack_version != task.domain_pack_version {
+        return Err(Error::Validation(format!(
+            "task {} domain_pack_version {:?} does not match dependencies_json context {:?}",
+            task.task_id, task.domain_pack_version, deps.context.domain_pack_version
+        )));
+    }
+
+    let prepared = PreparedSource {
+        full: knowledge.clone(),
+        knowledge,
+        facts: Facts {
+            entity_id: crate::types::EntityId::from_key(&task.entity_id)?,
+            fields: BTreeMap::new(),
+            source_revision: task.source_revision as u64,
+        },
+        snapshot_hash: task.snapshot_hash.clone(),
+    };
+    Ok((prepared, deps, schema))
+}
+
+/// 从任务快照恢复 supplemental_compile 建议的五字段 subject（D6/§7 一致性转换；
+/// canonical 紧凑 JSON，键序稳定——与 Step6 批4 subject 形状逐字段一致，approve
+/// supplemental 主体验照单全收）。五字段全部取自任务行，任务行即权威快照。
+/// Recovers the five-field supplemental_compile subject from a task snapshot
+/// (the D6/§7 consistency conversion; canonical compact JSON with a stable key
+/// order — field-for-field the Step6 batch-4 subject shape, consumed verbatim by
+/// the supplemental approve arm). All five fields come from the task row, which
+/// is the authoritative snapshot.
+fn supplemental_subject_from_task(task: &TaskSnapshotRow) -> Result<String> {
+    let value = serde_json::json!({
+        "entity_id": task.entity_id,
+        "source_revision": task.source_revision,
+        "domain_pack_version": task.domain_pack_version,
+        "source_json": task.source_json,
+        "dependencies_json": task.dependencies_json,
+    });
+    Ok(serde_json::to_string(&value)?)
 }
 
 impl super::sqlite::SqliteKernel {
@@ -1157,11 +1455,22 @@ impl super::sqlite::SqliteKernel {
     /// 语义：UNIQUE(domain, action, subject_json) 冲突跳过不报错（重复分析幂
     /// 等，spec §6），只返回**实际新插入**行的 review_id（输入序；被跳过的输入
     /// 不产生 id，因此返回长度 ≤ 输入长度）。批内重复同样只插入第一份。
+    /// Step8 批 B3：`compile_dead_letter` 输入（D6/D7）在校验 canonical subject
+    /// 形状之外，还在本事务内强制 task 存在（fail-closed，整体回滚）并回填
+    /// `compile_task_id`；`consistency_conflict`/`compatibility_conflict` 仅
+    /// 要求 JSON 对象 subject，`compile_task_id` 保持 NULL（kernel 内部入队路
+    /// 径才负责回填）。
     /// 建议 semantics: UNIQUE(domain, action, subject_json) conflicts are
     /// skipped without error (repeated analysis is idempotent, spec §6), and
     /// only the review_ids of **actually newly inserted** rows are returned
     /// (input order; skipped inputs yield no id, so the returned length is ≤
     /// the input length). Within-batch duplicates likewise insert only once.
+    /// Step8 batch B3: beyond validating the canonical subject shape of a
+    /// `compile_dead_letter` input (D6/D7), this transaction also enforces task
+    /// existence (fail-closed, rolling everything back) and backfills
+    /// `compile_task_id`; `consistency_conflict`/`compatibility_conflict` only
+    /// require an object subject and keep `compile_task_id` NULL (the kernel's
+    /// internal enqueue path owns the backfill).
     ///
     /// 锁纪律：全部输入先做纯校验（任一非法 → Validation，不取写锁、不落任何
     /// 行），再取 conn Mutex 一次，`immediate_transaction`（BEGIN IMMEDIATE）
@@ -1190,10 +1499,31 @@ impl super::sqlite::SqliteKernel {
         conn.immediate_transaction(|tx| {
             let mut inserted_ids = Vec::with_capacity(suggestions.len());
             for suggestion in suggestions {
+                // D7：死信行在本事务内校验 task 存在并回填 compile_task_id。
+                // D7: dead-letter rows verify task existence in-transaction and
+                // backfill compile_task_id.
+                let compile_task_id = if suggestion.action == "compile_dead_letter" {
+                    let task_id = parse_dead_letter_task_id(&suggestion.subject_json)?;
+                    let exists: Option<IdRow> = diesel::sql_query(
+                        "SELECT task_id AS n FROM compile_tasks WHERE task_id = ?",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(task_id)
+                    .get_result(tx)
+                    .optional()?;
+                    if exists.is_none() {
+                        return Err(Error::Validation(format!(
+                            "compile_dead_letter subject task {task_id} does not exist"
+                        )));
+                    }
+                    Some(task_id)
+                } else {
+                    None
+                };
                 let inserted = diesel::sql_query(
                     "INSERT INTO review_queue
-                        (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
-                     VALUES (?, ?, ?, ?, ?, ?)
+                        (domain, action, source_log_ids_json, subject_json, reason_json,
+                         created_at, compile_task_id)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
                      ON CONFLICT (domain, action, subject_json) DO NOTHING",
                 )
                 .bind::<diesel::sql_types::Text, _>(domain)
@@ -1202,6 +1532,7 @@ impl super::sqlite::SqliteKernel {
                 .bind::<diesel::sql_types::Text, _>(&suggestion.subject_json)
                 .bind::<diesel::sql_types::Text, _>(&suggestion.reason_json)
                 .bind::<diesel::sql_types::BigInt, _>(suggestion.created_at)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(compile_task_id)
                 .execute(tx)?;
                 if inserted == 1 {
                     // 新行：review_id 取本连接 last_insert_rowid（事务内同连接有效）。
@@ -1233,6 +1564,40 @@ impl super::sqlite::SqliteKernel {
     /// query_template 仅写 approved + 审计字段（A16：不写 compile_tasks、不改
     /// QUG/配置）；action=ignore 的建议不可 approve（fail-closed，请用
     /// `ignore_review`）。取 conn Mutex 一次，不持锁跨 await。
+    /// Step8 批 B6（§7/§8/D6/A16/A17）追加三个分支，全部沿用同一事务与 CAS
+    /// 惯例：`compile_dead_letter` 解析 canonical subject 的 task_id，任务必须
+    /// status='dead'，head 快照守卫通过后以**原任务快照**（存档 snapshot_hash，
+    /// 不重投影）显式 `force=true` 复用 `admit_compile_on_conn` 新建 epoch
+    /// admission（UNIQUE 三元保证重排的就是原任务行），随后 review CAS
+    /// approved + 回填 task_id；`consistency_conflict` 只能批准为一次新的
+    /// supplemental_compile 审核转换——五字段 subject 从任务快照恢复（无法恢复
+    /// → Validation 回滚），插入一条 supplemental_compile 建议（reason 原样保留）
+    /// 并在同事务内 force admission + 批准，原 conflict 行置 approved，绝不直接
+    /// 发布；`compatibility_conflict` 仅审计批准（不建任务、不能绕过 preflight）；
+    /// 其余/未知 action 一律 Validation（协议错误，绝不静默当 ignore）。任一步
+    /// 失败整体回滚：review 保持 pending、任务/快照/新建议行零残留。
+    /// query_template only writes approved plus audit fields (A16: no
+    /// compile_tasks writes, no QUG/config changes); suggestions with action=ignore
+    /// are not approvable (fail-closed; use `ignore_review`). The conn Mutex is
+    /// taken once, never held across await.
+    /// Step8 batch B6 (§7/§8/D6/A16/A17) adds three arms on the same transaction
+    /// and CAS conventions: `compile_dead_letter` parses the canonical subject's
+    /// task_id, requires the task to be status='dead', and — after the head
+    /// snapshot guard — reuses `admit_compile_on_conn` with the **original task
+    /// snapshot** (archived snapshot_hash, never re-projected) and an explicit
+    /// `force=true` to create a new-epoch admission (the UNIQUE triple guarantees
+    /// the requeued row is the original task), then CASes the review to approved
+    /// and backfills the task_id; `consistency_conflict` can only be approved as
+    /// one new supplemental_compile review conversion — the five-field subject is
+    /// recovered from the task snapshot (recovery failure → Validation rollback),
+    /// a supplemental_compile suggestion is inserted (reason preserved verbatim)
+    /// and approved with a force admission in the same transaction, and the
+    /// original conflict row flips to approved — never a direct publish;
+    /// `compatibility_conflict` is an audit-only approval (no task, no preflight
+    /// bypass); every other/unknown action → Validation (a protocol error, never
+    /// silently treated as ignore). Any failure rolls the whole thing back: the
+    /// review stays pending with zero residue on tasks/snapshots/new suggestion
+    /// rows.
     /// Transaction boundary: one `immediate_transaction` (BEGIN IMMEDIATE)
     /// covering — read the review row → validate status=pending (non-pending →
     /// Validation "already reviewed") → for supplemental_compile, validate the
@@ -1378,26 +1743,283 @@ impl super::sqlite::SqliteKernel {
                         compile_task_id: None,
                     })
                 }
+                "compile_dead_letter" => {
+                    // —— Step8 A17（§7/§8）：死信批准 = 原任务快照显式 force=true
+                    //    新建 epoch admission，review CAS 与 admission 同事务。
+                    //    canonical subject 是唯一任务指针（D7），任务必须 dead，
+                    //    租户必须一致，head 守卫保证同 revision 同 snapshot 重放。
+                    // —— Step8 A17 (§7/§8): a dead-letter approval = a new-epoch
+                    //    admission from the original task snapshot with an
+                    //    explicit force=true, the review CAS sharing the
+                    //    admission's transaction. The canonical subject is the
+                    //    sole task pointer (D7), the task must be dead, the
+                    //    tenant must agree, and the head guard pins the
+                    //    same-revision/same-snapshot replay.
+                    let subject_task_id = parse_dead_letter_task_id(&row.subject_json)?;
+                    let task = load_task_snapshot_on_conn(tx, subject_task_id)?;
+                    if task.status != "dead" {
+                        return Err(Error::Validation(format!(
+                            "dead-letter review {review_id} targets task {} with status \
+                             {:?}; approve only allows dead tasks",
+                            task.task_id, task.status
+                        )));
+                    }
+                    let task_domain = task_entity_domain(&task.entity_id)?;
+                    if task_domain != row.domain {
+                        return Err(Error::Validation(format!(
+                            "dead-letter review {review_id} domain {:?} does not match task \
+                             {} entity domain {:?}",
+                            row.domain, task.task_id, task_domain
+                        )));
+                    }
+                    guard_head_matches_task(tx, &task)?;
+                    let (prepared, deps, schema) = rebuild_prepared_from_task(&task)?;
+                    let admission = admit_compile_on_conn(
+                        tx,
+                        &prepared,
+                        &deps.context,
+                        &deps.policy,
+                        &schema,
+                        true,
+                    )?;
+                    // UNIQUE 三元保证重排的就是 subject 指向的任务行（同 id、
+                    // epoch+1）；其余分支 fail-closed 回滚（review 保持 pending）。
+                    // The UNIQUE triple guarantees the requeued row is exactly the
+                    // subject's task (same id, epoch+1); every other outcome fails
+                    // closed and rolls back (the review stays pending).
+                    let task_id = match admission {
+                        Admission::Queued(id) if id == subject_task_id => id,
+                        other => {
+                            return Err(Error::Validation(format!(
+                                "dead-letter re-admission of task {subject_task_id} did not \
+                                 requeue it ({other:?}); review stays pending"
+                            )));
+                        }
+                    };
+                    let affected = diesel::sql_query(
+                        "UPDATE review_queue
+                         SET status = 'approved', reviewed_at = ?, reviewed_by = ?,
+                             compile_task_id = ?
+                         WHERE review_id = ? AND status = 'pending'",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(now)
+                    .bind::<diesel::sql_types::Text, _>(reviewer)
+                    .bind::<diesel::sql_types::BigInt, _>(task_id)
+                    .bind::<diesel::sql_types::BigInt, _>(review_id)
+                    .execute(tx)?;
+                    if affected != 1 {
+                        // 单连接 + BEGIN IMMEDIATE 下不可达；防御性 CAS（对齐仓库风格）。
+                        // Unreachable under a single conn + BEGIN IMMEDIATE;
+                        // defensive CAS (aligned with the repo style).
+                        return Err(Error::Internal(
+                            "review row changed state during approval".into(),
+                        ));
+                    }
+                    tracing::debug!(review_id, task_id, "dead letter approved into a new epoch");
+                    Ok(ReviewOutcome {
+                        review_id,
+                        status: ReviewStatus::Approved,
+                        compile_task_id: Some(task_id),
+                    })
+                }
+                "consistency_conflict" => {
+                    // —— Step8 §7/D6：一致性冲突只能批准为一次新的
+                    //    supplemental_compile 审核转换——不能直接发布。同事务内：
+                    //    从任务快照恢复五字段 subject（无法恢复 → Validation 回
+                    //    滚）→ 插入一条 supplemental_compile 建议（reason 原样保
+                    //    留）→ force admission 新建 epoch → 新建议行与原 conflict
+                    //    行先后 CAS approved。发布仍须走完整管线（claim → 编译 →
+                    //    评分 → publish）。
+                    // —— Step8 §7/D6: a consistency conflict can only be approved
+                    //    as one new supplemental_compile review conversion — never
+                    //    a direct publish. In one transaction: recover the
+                    //    five-field subject from the task snapshot (recovery
+                    //    failure → Validation rollback) → insert a
+                    //    supplemental_compile suggestion (reason preserved
+                    //    verbatim) → a force admission creates the new epoch →
+                    //    the new suggestion row and then the original conflict row
+                    //    CAS to approved. Publication still requires the full
+                    //    pipeline (claim → compile → score → publish).
+                    let subject_task_id = parse_dead_letter_task_id(&row.subject_json)?;
+                    let task = load_task_snapshot_on_conn(tx, subject_task_id)?;
+                    let task_domain = task_entity_domain(&task.entity_id)?;
+                    if task_domain != row.domain {
+                        return Err(Error::Validation(format!(
+                            "consistency review {review_id} domain {:?} does not match task \
+                             {} entity domain {:?}",
+                            row.domain, task.task_id, task_domain
+                        )));
+                    }
+                    // 恢复校验：subject 必须能按 Step6 五字段形状完整还原（任一
+                    // 字段缺失/类型不符/不可解析/自相矛盾 → Validation 整体回滚）。
+                    // Recovery gate: the subject must fully round-trip into the
+                    // Step6 five-field shape (any missing/ill-typed/unparseable/
+                    // self-contradictory field → Validation + full rollback).
+                    let converted_subject = supplemental_subject_from_task(&task)?;
+                    parse_supplemental_subject(&converted_subject)?;
+                    guard_head_matches_task(tx, &task)?;
+                    let (prepared, deps, schema) = rebuild_prepared_from_task(&task)?;
+                    let admission = admit_compile_on_conn(
+                        tx,
+                        &prepared,
+                        &deps.context,
+                        &deps.policy,
+                        &schema,
+                        true,
+                    )?;
+                    let task_id = match admission {
+                        Admission::Queued(id) if id == subject_task_id => id,
+                        other => {
+                            return Err(Error::Validation(format!(
+                                "consistency re-admission of task {subject_task_id} did not \
+                                 requeue it ({other:?}); review stays pending"
+                            )));
+                        }
+                    };
+                    // 创建 supplemental 建议行（UNIQUE 冲突 = 已有同 subject 行，
+                    // 须仍为 pending 才可继续；否则协议错误回滚）。
+                    // Create the supplemental suggestion row (a UNIQUE conflict
+                    // means an identical subject row exists — it must still be
+                    // pending to proceed; otherwise a protocol error rolls back).
+                    let inserted = diesel::sql_query(
+                        "INSERT INTO review_queue
+                            (domain, action, source_log_ids_json, subject_json, reason_json,
+                             created_at, compile_task_id)
+                         VALUES (?, 'supplemental_compile', '[]', ?, ?, ?, ?)
+                         ON CONFLICT (domain, action, subject_json) DO NOTHING",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(&row.domain)
+                    .bind::<diesel::sql_types::Text, _>(&converted_subject)
+                    .bind::<diesel::sql_types::Text, _>(&row.reason_json)
+                    .bind::<diesel::sql_types::BigInt, _>(now)
+                    .bind::<diesel::sql_types::BigInt, _>(task_id)
+                    .execute(tx)?;
+                    // 新行取本连接 last_insert_rowid（事务内同连接有效）；冲突
+                    // 跳过（DO NOTHING 不更新 rowid）则按 UNIQUE 键回读旧行。
+                    // A new row takes this connection's last_insert_rowid (valid
+                    // on the same connection in-transaction); a skipped conflict
+                    // (DO NOTHING never bumps the rowid) reads the existing row
+                    // back by its UNIQUE key.
+                    let converted_id: i64 = if inserted == 1 {
+                        diesel::sql_query("SELECT last_insert_rowid() AS n")
+                            .get_result::<IdRow>(tx)?
+                            .n
+                    } else {
+                        diesel::sql_query(
+                            "SELECT review_id AS n FROM review_queue
+                             WHERE domain = ? AND action = 'supplemental_compile'
+                               AND subject_json = ?",
+                        )
+                        .bind::<diesel::sql_types::Text, _>(&row.domain)
+                        .bind::<diesel::sql_types::Text, _>(&converted_subject)
+                        .get_result::<IdRow>(tx)?
+                        .n
+                    };
+                    let affected = diesel::sql_query(
+                        "UPDATE review_queue
+                         SET status = 'approved', reviewed_at = ?, reviewed_by = ?,
+                             compile_task_id = ?
+                         WHERE review_id = ? AND status = 'pending'",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(now)
+                    .bind::<diesel::sql_types::Text, _>(reviewer)
+                    .bind::<diesel::sql_types::BigInt, _>(task_id)
+                    .bind::<diesel::sql_types::BigInt, _>(converted_id)
+                    .execute(tx)?;
+                    if affected != 1 {
+                        return Err(Error::Validation(format!(
+                            "converted supplemental review {converted_id} is not pending; \
+                             consistency conversion refused"
+                        )));
+                    }
+                    // 原 conflict 行置 approved（审计字段 + 回填重排任务）。
+                    // The original conflict row flips to approved (audit fields +
+                    // the requeued task backfilled).
+                    let affected = diesel::sql_query(
+                        "UPDATE review_queue
+                         SET status = 'approved', reviewed_at = ?, reviewed_by = ?,
+                             compile_task_id = ?
+                         WHERE review_id = ? AND status = 'pending'",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(now)
+                    .bind::<diesel::sql_types::Text, _>(reviewer)
+                    .bind::<diesel::sql_types::BigInt, _>(task_id)
+                    .bind::<diesel::sql_types::BigInt, _>(review_id)
+                    .execute(tx)?;
+                    if affected != 1 {
+                        return Err(Error::Internal(
+                            "review row changed state during approval".into(),
+                        ));
+                    }
+                    tracing::debug!(
+                        review_id,
+                        converted_id,
+                        task_id,
+                        "consistency conflict converted"
+                    );
+                    Ok(ReviewOutcome {
+                        review_id,
+                        status: ReviewStatus::Approved,
+                        compile_task_id: Some(task_id),
+                    })
+                }
+                "compatibility_conflict" => {
+                    // —— Step8 §7/A17：兼容审核只能批准为审计状态——不建任务、
+                    //    不提供「忽略兼容」路径；兼容修正在修复后的 domain.yaml
+                    //    下次 compile 的 preflight 自然通过。
+                    // —— Step8 §7/A17: a compatibility review can only be approved
+                    //    as an audit state — no task, no "ignore compatibility"
+                    //    path; the fix lands naturally through the repaired
+                    //    domain.yaml's next-compile preflight.
+                    let affected = diesel::sql_query(
+                        "UPDATE review_queue
+                         SET status = 'approved', reviewed_at = ?, reviewed_by = ?
+                         WHERE review_id = ? AND status = 'pending'",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(now)
+                    .bind::<diesel::sql_types::Text, _>(reviewer)
+                    .bind::<diesel::sql_types::BigInt, _>(review_id)
+                    .execute(tx)?;
+                    if affected != 1 {
+                        return Err(Error::Internal(
+                            "review row changed state during approval".into(),
+                        ));
+                    }
+                    Ok(ReviewOutcome {
+                        review_id,
+                        status: ReviewStatus::Approved,
+                        compile_task_id: None,
+                    })
+                }
                 other => Err(Error::Validation(format!(
-                    "review action {other:?} is not approvable; use ignore_review to \
-                     dismiss audit-only suggestions"
+                    "review action {other:?} is not approvable (unknown or non-approvable \
+                     action is a data-protocol/database-corruption error and is never \
+                     silently dismissed); use ignore_review to dismiss audit-only suggestions"
                 ))),
             }
         })
     }
 
-    /// 忽略审核项（批4；A16）。
-    /// Ignores a review item (batch 4; A16).
+    /// 忽略审核项（批4；A16；Step8 批 B6 扩展覆盖）。
+    /// Ignores a review item (batch 4; A16; coverage extended by Step8 batch B6).
     ///
     /// 纯审计转换：pending → status='ignored' + reviewed_at/reviewed_by；不校验
-    /// subject、不触碰 compile_tasks（畸形 subject 的建议同样可被忽略）。非
-    /// pending → Validation「已审核」；不存在的 review_id → Validation。单
-    /// BEGIN IMMEDIATE，取 conn Mutex 一次。
+    /// subject、不触碰 compile_tasks（畸形 subject 的建议同样可被忽略）。Step8
+    /// 三个新动作 `compile_dead_letter`/`consistency_conflict`/
+    /// `compatibility_conflict`（D6）同样可 ignore——置 ignored + 审计字段，
+    /// 不做任何任务/快照副作用；action 域由 0006 DDL CHECK 封死，未知 action
+    /// 无法入库，故本转换保持 action 无关。非 pending → Validation「已审核」；
+    /// 不存在的 review_id → Validation。单 BEGIN IMMEDIATE，取 conn Mutex 一次。
     /// A pure audit transition: pending → status='ignored' plus
     /// reviewed_at/reviewed_by; the subject is not validated and compile_tasks is
-    /// never touched (suggestions with malformed subjects are ignorable too).
-    /// Non-pending → Validation "already reviewed"; a missing review_id →
-    /// Validation. One BEGIN IMMEDIATE, conn Mutex taken once.
+    /// never touched (suggestions with malformed subjects are ignorable too). The
+    /// three Step8 actions `compile_dead_letter`/`consistency_conflict`/
+    /// `compatibility_conflict` (D6) are ignorable the same way — ignored plus
+    /// audit fields, with zero task/snapshot side effects; the action domain is
+    /// closed by the 0006 DDL CHECK so an unknown action cannot even be inserted,
+    /// keeping this transition action-agnostic. Non-pending → Validation "already
+    /// reviewed"; a missing review_id → Validation. One BEGIN IMMEDIATE, conn
+    /// Mutex taken once.
     pub fn ignore_review(&self, review_id: i64, reviewer: &str, now: i64) -> Result<()> {
         validate_reviewer(reviewer)?;
         let mut conn = self.lock_conn()?;
@@ -2046,6 +2668,8 @@ mod tests {
             embedding_model: "none".into(),
             quality_threshold: 0.75,
             require_source_refs: true,
+            schema_version: None,
+            prompt_version: None,
         }
     }
 
@@ -2523,5 +3147,687 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kernel.count_pending_reviews().unwrap(), 1);
+    }
+
+    // ===== Step8 批 B3：三个新 review action 的入库/校验（A10 的入库侧）=====
+    // ===== Step8 batch B3: inserting/validating the three new review actions
+    // (the insert side of A10) =====
+
+    /// 构造指定 action/subject 的建议输入。
+    /// Builds a suggestion input with the given action/subject.
+    fn suggestion_with(action: &str, subject: &str) -> ReviewSuggestionInput {
+        ReviewSuggestionInput {
+            action: action.into(),
+            source_log_ids_json: "[]".into(),
+            subject_json: subject.into(),
+            reason_json: r#"{"code":"CONSISTENCY_CONFLICT"}"#.into(),
+            created_at: 1000,
+        }
+    }
+
+    // compile_dead_letter：subject 必须恰好是 canonical {"task_id":N}；非对象/
+    // 非整数/非正数/多键/非紧凑形式一律 Validation 且零行落库。
+    // compile_dead_letter: the subject must be exactly the canonical
+    // {"task_id":N}; non-object/non-integer/non-positive/extra-key/non-compact
+    // inputs are all Validation with zero rows persisted.
+    #[test]
+    fn dead_letter_subject_shape_is_strictly_validated() {
+        let kernel = kernel();
+        let bad_subjects = [
+            r#"{}"#,
+            r#"{"id":7}"#,
+            r#"{"task_id":"7"}"#,
+            r#"{"task_id":7.5}"#,
+            r#"{"task_id":0}"#,
+            r#"{"task_id":-1}"#,
+            r#"{"task_id":7,"extra":1}"#,
+            r#"{"task_id": 7}"#,
+            r#" {\"task_id\":7}"#,
+        ];
+        for subject in bad_subjects {
+            let err = kernel
+                .insert_review_suggestions(
+                    DOMAIN,
+                    &[suggestion_with("compile_dead_letter", subject)],
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::Validation(_)),
+                "subject {subject}: {err:?}"
+            );
+        }
+        assert_eq!(kernel.row_counts().unwrap()["review_queue"], 0);
+    }
+
+    // compile_dead_letter：task 不存在 → Validation（事务内 fail-closed 回滚）；
+    // task 存在 → 入库、compile_task_id 回填、重复插入幂等（UNIQUE+DO NOTHING）、
+    // 列表可读；consistency_conflict/compatibility_conflict 宽松对象 subject 且
+    // compile_task_id 保持 NULL。
+    // compile_dead_letter: a missing task → Validation (fail-closed in-transaction
+    // rollback); an existing task → inserted with compile_task_id backfilled,
+    // idempotent re-insert (UNIQUE+DO NOTHING), readable via list; the
+    // consistency/compatibility conflicts accept loose object subjects and keep
+    // compile_task_id NULL.
+    #[test]
+    fn dead_letter_backfills_task_and_new_actions_insert() {
+        let kernel = kernel();
+
+        // task 不存在 → Validation。
+        // The task does not exist → Validation.
+        let err = kernel
+            .insert_review_suggestions(
+                DOMAIN,
+                &[suggestion_with("compile_dead_letter", r#"{"task_id":42}"#)],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got {err:?}");
+        assert_eq!(kernel.row_counts().unwrap()["review_queue"], 0);
+
+        // 直接 admission 建一条合法任务 → 死信入库并回填 compile_task_id。
+        // A direct admission creates a legal task → the dead letter inserts with
+        // the compile_task_id backfilled.
+        let prepared = prepare_source(&raw(1, 19.0), &schema(), &policy()).unwrap();
+        let task_id = match kernel
+            .admit_compile(&prepared, &ctx(), &policy(), &schema(), false)
+            .unwrap()
+        {
+            Admission::Queued(id) => id,
+            other => panic!("expected queued, got {other:?}"),
+        };
+        let subject = format!(r#"{{"task_id":{task_id}}}"#);
+        let ids = kernel
+            .insert_review_suggestions(
+                DOMAIN,
+                &[
+                    suggestion_with("compile_dead_letter", &subject),
+                    suggestion_with("consistency_conflict", &subject),
+                    suggestion_with("compatibility_conflict", r#"{"versions":{}}"#),
+                ],
+            )
+            .unwrap();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(kernel.row_counts().unwrap()["review_queue"], 3);
+
+        // 重复插入幂等：无新 id、无新行。
+        // Idempotent re-insert: no new ids, no new rows.
+        assert!(kernel
+            .insert_review_suggestions(
+                DOMAIN,
+                &[
+                    suggestion_with("compile_dead_letter", &subject),
+                    suggestion_with("consistency_conflict", &subject),
+                ],
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(kernel.row_counts().unwrap()["review_queue"], 3);
+
+        // 列表可读：action 原样输出；死信行回填 task_id，其余为 NULL。
+        // List-readable: actions verbatim; the dead-letter row carries the task
+        // id, the others stay NULL.
+        let rows = kernel.list_reviews(DOMAIN, None, 100).unwrap();
+        assert_eq!(rows.len(), 3);
+        let dead = rows
+            .iter()
+            .find(|r| r.action == "compile_dead_letter")
+            .unwrap();
+        assert_eq!(dead.subject_json, subject);
+        assert_eq!(dead.compile_task_id, Some(task_id));
+        for action in ["consistency_conflict", "compatibility_conflict"] {
+            let row = rows.iter().find(|r| r.action == action).unwrap();
+            assert_eq!(row.compile_task_id, None);
+        }
+    }
+
+    // ===== Step8 批 B6：死信批准 / 一致性转换 / 兼容审计（A16/A17）=====
+    // ===== Step8 batch B6: dead-letter approval / consistency conversion /
+    // compatibility audit (A16/A17) =====
+
+    /// 任务终态探针（epoch/计数/result 直读库，验证新 epoch 重排语义）。
+    /// A task-terminal probe (epoch/counters/result read straight from the DB to
+    /// verify the new-epoch requeue semantics).
+    #[derive(QueryableByName)]
+    struct EpochProbe {
+        #[diesel(sql_type = sql_types::BigInt)]
+        epoch: i64,
+        #[diesel(sql_type = sql_types::Text)]
+        status: String,
+        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        result: Option<String>,
+        #[diesel(sql_type = sql_types::BigInt)]
+        recompile_count: i64,
+        #[diesel(sql_type = sql_types::BigInt)]
+        retry_count: i64,
+    }
+
+    /// 读取任务终态探针。
+    /// Reads the task-terminal probe.
+    fn probe(kernel: &SqliteKernel, task_id: i64) -> EpochProbe {
+        let mut conn = kernel.lock_conn().unwrap();
+        diesel::sql_query(
+            "SELECT epoch, status, result, recompile_count, retry_count
+             FROM compile_tasks WHERE task_id = ?",
+        )
+        .bind::<sql_types::BigInt, _>(task_id)
+        .get_result(&mut *conn)
+        .unwrap()
+    }
+
+    /// B6 夹具：直接 admission 建任务 → 置 dead 终态；返回 (task_id, canonical
+    /// subject)。head/快照/事实均由真实 admission 落库，与生产路径同构。
+    /// The B6 fixture: a direct admission creates the task → forced into the dead
+    /// terminal; returns (task_id, canonical subject). Head/snapshot/facts all
+    /// land through the real admission, isomorphic with the production path.
+    fn dead_task(kernel: &SqliteKernel) -> (i64, String) {
+        let prepared = prepare_source(&raw(1, 19.0), &schema(), &policy()).unwrap();
+        let task_id = match kernel
+            .admit_compile(&prepared, &ctx(), &policy(), &schema(), false)
+            .unwrap()
+        {
+            Admission::Queued(id) => id,
+            other => panic!("expected queued, got {other:?}"),
+        };
+        kernel
+            .execute_batch(&format!(
+                "UPDATE compile_tasks SET status = 'dead', result = 'failed',
+                        error_message = 'quality brake exhausted'
+                 WHERE task_id = {task_id}"
+            ))
+            .unwrap();
+        (task_id, format!(r#"{{"task_id":{task_id}}}"#))
+    }
+
+    /// 绕过校验直插一条审核行（畸形 subject 的 fail-closed 用例需要）。
+    /// Inserts a review row bypassing validation (needed by the malformed-subject
+    /// fail-closed cases).
+    fn raw_insert_review(kernel: &SqliteKernel, domain: &str, action: &str, subject: &str) {
+        kernel
+            .execute_batch(&format!(
+                "INSERT INTO review_queue
+                     (domain, action, source_log_ids_json, subject_json, reason_json, created_at)
+                 VALUES ('{domain}', '{action}', '[]', '{subject}', '{{}}', 1)"
+            ))
+            .unwrap();
+    }
+
+    // A17 成功路径：approve pending 死信 → 原任务快照 force 新建 epoch admission
+    // ——同一任务行重排（UNIQUE 三元；id 不变、epoch+1、计数归零、result 清空）、
+    // review 置 approved 并回填 task_id；重复 approve 拒绝。
+    // A17 success path: approving a pending dead letter runs a force new-epoch
+    // admission from the original task snapshot — the same task row is requeued
+    // (UNIQUE triple; id unchanged, epoch+1, counters reset, result cleared), the
+    // review flips to approved with the task_id backfilled; a repeated approve is
+    // rejected.
+    #[test]
+    fn b6_approve_dead_letter_readmits_new_epoch() {
+        let kernel = kernel();
+        let (task_id, subject) = dead_task(&kernel);
+        let review_id = insert_review(&kernel, DOMAIN, "compile_dead_letter", &subject);
+        assert_eq!(probe(&kernel, task_id).epoch, 1, "precondition: epoch 1");
+
+        let outcome = kernel.approve_review(review_id, "ops", 2000).unwrap();
+        assert_eq!(outcome.status, ReviewStatus::Approved);
+        assert_eq!(
+            outcome.compile_task_id,
+            Some(task_id),
+            "the UNIQUE triple requeues the original task row"
+        );
+
+        // 任务：pending、epoch+1、计数归零、result 清空（旧 attempt/lease 因
+        // epoch fence 失效）。
+        // Task: pending, epoch+1, counters reset, result cleared (old attempts and
+        // leases are fenced out by the new epoch).
+        let after = probe(&kernel, task_id);
+        assert_eq!(after.status, "pending");
+        assert_eq!(after.epoch, 2);
+        assert_eq!(after.recompile_count, 0);
+        assert_eq!(after.retry_count, 0);
+        assert_eq!(after.result, None);
+
+        // review：approved + 审计字段 + task_id 回填；重复 approve → Validation。
+        // Review: approved + audit fields + task_id backfill; repeated approve →
+        // Validation.
+        let rows = kernel
+            .list_reviews(DOMAIN, Some(ReviewStatus::Approved), 100)
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].compile_task_id, Some(task_id));
+        assert_eq!(rows[0].reviewed_by.as_deref(), Some("ops"));
+        assert_eq!(rows[0].reviewed_at, Some(2000));
+        let err = kernel.approve_review(review_id, "ops", 3000).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "got {err:?}");
+        assert_eq!(probe(&kernel, task_id).epoch, 2, "no second epoch bump");
+    }
+
+    // A17 闸门：任务非 dead、review 非 pending、subject 非 canonical、任务缺失
+    // ——全部 Validation 且零副作用。
+    // A17 gates: a non-dead task, a non-pending review, a non-canonical subject
+    // and a missing task — all Validation with zero side effects.
+    #[test]
+    fn b6_approve_dead_letter_requires_pending_review_and_dead_task() {
+        let kernel = kernel();
+
+        // 任务 pending（非 dead）→ 拒绝，review 保持 pending。
+        // A pending (non-dead) task → refused, the review stays pending.
+        let prepared = prepare_source(&raw(1, 19.0), &schema(), &policy()).unwrap();
+        let task_id = match kernel
+            .admit_compile(&prepared, &ctx(), &policy(), &schema(), false)
+            .unwrap()
+        {
+            Admission::Queued(id) => id,
+            other => panic!("expected queued, got {other:?}"),
+        };
+        let review_id = insert_review(
+            &kernel,
+            DOMAIN,
+            "compile_dead_letter",
+            &format!(r#"{{"task_id":{task_id}}}"#),
+        );
+        let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+        assert!(err.to_string().contains("only allows dead"), "got {err:?}");
+        assert_eq!(probe(&kernel, task_id).status, "pending");
+
+        // 死信 + ignore → approve 拒绝（非 pending）。
+        // A dead letter ignored first → approve refused (non-pending).
+        kernel
+            .execute_batch(&format!(
+                "UPDATE compile_tasks SET status = 'dead', result = 'failed'
+                 WHERE task_id = {task_id}"
+            ))
+            .unwrap();
+        kernel.ignore_review(review_id, "bob", 1500).unwrap();
+        let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "got {err:?}");
+        assert_eq!(probe(&kernel, task_id).status, "dead", "ignored stays dead");
+
+        // subject 非 canonical（绕过 B3 校验直插）→ 拒绝。
+        // A non-canonical subject (raw insert bypassing the B3 validation) →
+        // refused.
+        raw_insert_review(&kernel, DOMAIN, "compile_dead_letter", r#"{"task_id":"7"}"#);
+        let rows = kernel
+            .list_reviews(DOMAIN, Some(ReviewStatus::Pending), 100)
+            .unwrap();
+        let bad_subject_id = rows.last().unwrap().review_id;
+        let err = kernel
+            .approve_review(bad_subject_id, "ops", 2000)
+            .unwrap_err();
+        assert!(err.to_string().contains("exactly"), "got {err:?}");
+
+        // subject 指向不存在的任务（绕过 B3 校验直插）→ 拒绝。
+        // A subject pointing at a missing task (raw insert bypassing the B3
+        // validation) → refused.
+        raw_insert_review(
+            &kernel,
+            DOMAIN,
+            "compile_dead_letter",
+            r#"{"task_id":424242}"#,
+        );
+        let rows = kernel
+            .list_reviews(DOMAIN, Some(ReviewStatus::Pending), 100)
+            .unwrap();
+        let missing_task_id = rows.last().unwrap().review_id;
+        let err = kernel
+            .approve_review(missing_task_id, "ops", 2000)
+            .unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got {err:?}");
+
+        // 全部失败零副作用：唯一任务无新 epoch。
+        // Every failure was side-effect free: the single task has no new epoch.
+        assert_eq!(kernel.row_counts().unwrap()["compile_tasks"], 1);
+        assert_eq!(probe(&kernel, task_id).epoch, 1);
+        assert_eq!(probe(&kernel, task_id).status, "dead");
+    }
+
+    // A17 回滚：head 漂移/快照损坏/跨租户 → Validation 整体回滚——review 保持
+    // pending、任务保持 dead、epoch 不变、无孤儿行。
+    // A17 rollback: a drifted head, a corrupt snapshot or a cross-tenant subject →
+    // Validation + full rollback — the review stays pending, the task stays dead,
+    // the epoch is unchanged, no orphan rows.
+    #[test]
+    fn b6_approve_dead_letter_fails_closed_and_rolls_back() {
+        // head revision 前移（源已更新）→ 守卫拒绝。
+        // The head revision advanced (the source moved on) → the guard refuses.
+        {
+            let kernel = kernel();
+            let (task_id, subject) = dead_task(&kernel);
+            kernel
+                .execute_batch(
+                    "UPDATE compile_source_heads SET source_revision = 5
+                     WHERE entity_id = 'milk-tea:drink:boba'",
+                )
+                .unwrap();
+            let review_id = insert_review(&kernel, DOMAIN, "compile_dead_letter", &subject);
+            let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+            assert!(err.to_string().contains("stale"), "got {err:?}");
+            let after = probe(&kernel, task_id);
+            assert_eq!(after.status, "dead");
+            assert_eq!(after.epoch, 1, "no partial admission");
+        }
+
+        // 快照损坏（dependencies_json 不可解析）→ 拒绝。
+        // A corrupt snapshot (unparseable dependencies_json) → refused.
+        {
+            let kernel = kernel();
+            let (task_id, subject) = dead_task(&kernel);
+            kernel
+                .execute_batch(&format!(
+                    "UPDATE compile_tasks SET dependencies_json = 'not json'
+                     WHERE task_id = {task_id}"
+                ))
+                .unwrap();
+            let review_id = insert_review(&kernel, DOMAIN, "compile_dead_letter", &subject);
+            let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+            assert!(err.to_string().contains("dependencies_json"), "got {err:?}");
+            assert_eq!(probe(&kernel, task_id).status, "dead");
+            assert_eq!(probe(&kernel, task_id).epoch, 1);
+            assert_eq!(
+                kernel
+                    .list_reviews(DOMAIN, Some(ReviewStatus::Pending), 100)
+                    .unwrap()
+                    .len(),
+                1,
+                "the review must stay pending after rollback"
+            );
+        }
+
+        // 跨租户：milk-tea 任务的死信挂在 ecommerce 审核下 → 拒绝。
+        // Cross-tenant: a milk-tea task's dead letter under an ecommerce review →
+        // refused.
+        {
+            let kernel = kernel();
+            let (task_id, subject) = dead_task(&kernel);
+            let review_id = insert_review(&kernel, "ecommerce", "compile_dead_letter", &subject);
+            let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+            assert!(err.to_string().contains("does not match"), "got {err:?}");
+            assert_eq!(probe(&kernel, task_id).status, "dead");
+        }
+    }
+
+    // §7 一致性转换：approve consistency_conflict → 同事务内恢复五字段 subject、
+    // 插入并批准一条 supplemental_compile 建议（reason 原样保留）、force 新建
+    // epoch、原 conflict 行置 approved；不直接发布（pages 零变化）。
+    // §7 consistency conversion: approving a consistency_conflict — in one
+    // transaction — recovers the five-field subject, inserts and approves one
+    // supplemental_compile suggestion (the reason preserved verbatim), creates a
+    // force new epoch, and flips the original conflict row to approved; never a
+    // direct publish (pages unchanged).
+    #[test]
+    fn b6_approve_consistency_conflict_converts_to_supplemental() {
+        let kernel = kernel();
+        let (task_id, subject) = dead_task(&kernel);
+        let review_id = insert_review(&kernel, DOMAIN, "consistency_conflict", &subject);
+        let before = kernel.row_counts().unwrap();
+
+        let outcome = kernel.approve_review(review_id, "ops", 2000).unwrap();
+        assert_eq!(outcome.status, ReviewStatus::Approved);
+        assert_eq!(outcome.compile_task_id, Some(task_id));
+
+        // 新 epoch 重排；pages 零变化（admission 只排队，绝不发布）。
+        // The new-epoch requeue; pages unchanged (admission only queues, never
+        // publishes).
+        let after = probe(&kernel, task_id);
+        assert_eq!(after.status, "pending");
+        assert_eq!(after.epoch, 2);
+        assert_eq!(
+            kernel.row_counts().unwrap()["pages"],
+            before["pages"],
+            "the conversion must not publish"
+        );
+
+        // 原冲突行 approved；恰好新增一条 supplemental_compile 建议行：
+        // approved、五字段 subject、reason 原样保留、task_id 回填、审计字段。
+        // The original conflict row is approved; exactly one new
+        // supplemental_compile suggestion row: approved, the five-field subject,
+        // the reason preserved verbatim, task_id backfilled, audit fields set.
+        let rows = kernel.list_reviews(DOMAIN, None, 100).unwrap();
+        assert_eq!(rows.len(), 2);
+        let conflict = rows.iter().find(|r| r.review_id == review_id).unwrap();
+        assert_eq!(conflict.action, "consistency_conflict");
+        assert_eq!(conflict.status, ReviewStatus::Approved);
+        assert_eq!(conflict.compile_task_id, Some(task_id));
+        let converted = rows
+            .iter()
+            .find(|r| r.action == "supplemental_compile")
+            .expect("one converted supplemental suggestion");
+        assert_eq!(converted.status, ReviewStatus::Approved);
+        assert_eq!(converted.reviewed_by.as_deref(), Some("ops"));
+        assert_eq!(converted.reviewed_at, Some(2000));
+        assert_eq!(converted.compile_task_id, Some(task_id));
+        assert_eq!(
+            converted.reason_json, conflict.reason_json,
+            "the reason is preserved verbatim"
+        );
+        let recovered: serde_json::Value = serde_json::from_str(&converted.subject_json).unwrap();
+        assert_eq!(recovered["entity_id"], "milk-tea:drink:boba");
+        assert_eq!(recovered["source_revision"], 1);
+        assert_eq!(recovered["domain_pack_version"], "0.1.0");
+        assert!(recovered["source_json"].is_string());
+        assert!(recovered["dependencies_json"].is_string());
+
+        // 重复 approve 原 conflict 行 → Validation（非 pending）。
+        // Re-approving the original conflict row → Validation (non-pending).
+        let err = kernel.approve_review(review_id, "ops", 3000).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)), "got {err:?}");
+        assert_eq!(probe(&kernel, task_id).epoch, 2, "no double requeue");
+    }
+
+    // 一致性转换 fail-closed：快照损坏 / subject 非 canonical → Validation 回滚
+    // ——原行保持 pending、无 supplemental 残留、任务原样。
+    // Consistency conversion fail-closed: a corrupt snapshot or a non-canonical
+    // subject → Validation + rollback — the original row stays pending, no
+    // supplemental residue, the task untouched.
+    #[test]
+    fn b6_approve_consistency_conflict_fails_closed() {
+        // 快照损坏（source_json 不可解析）→ Validation 回滚。
+        // A corrupt snapshot (unparseable source_json) → Validation + rollback.
+        {
+            let kernel = kernel();
+            let (task_id, subject) = dead_task(&kernel);
+            kernel
+                .execute_batch(&format!(
+                    "UPDATE compile_tasks SET source_json = 'not json'
+                     WHERE task_id = {task_id}"
+                ))
+                .unwrap();
+            let review_id = insert_review(&kernel, DOMAIN, "consistency_conflict", &subject);
+            let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+            assert!(err.to_string().contains("source_json"), "got {err:?}");
+            assert_eq!(
+                kernel
+                    .list_reviews(DOMAIN, Some(ReviewStatus::Pending), 100)
+                    .unwrap()
+                    .len(),
+                1,
+                "the conflict row must stay pending"
+            );
+            assert!(
+                kernel
+                    .list_reviews(DOMAIN, Some(ReviewStatus::Approved), 100)
+                    .unwrap()
+                    .is_empty(),
+                "no converted suggestion may survive a rollback"
+            );
+            assert_eq!(probe(&kernel, task_id).status, "dead");
+            assert_eq!(probe(&kernel, task_id).epoch, 1);
+        }
+
+        // subject 非 canonical（带额外键，绕过 B3 校验直插）→ 拒绝。
+        // A non-canonical subject (an extra key, raw insert bypassing the B3
+        // validation) → refused.
+        {
+            let kernel = kernel();
+            let (task_id, subject) = dead_task(&kernel);
+            let stripped = &subject[..subject.len() - 1];
+            raw_insert_review(
+                &kernel,
+                DOMAIN,
+                "consistency_conflict",
+                &format!(r#"{stripped},"extra":1}}"#),
+            );
+            let rows = kernel
+                .list_reviews(DOMAIN, Some(ReviewStatus::Pending), 100)
+                .unwrap();
+            let bad_subject_id = rows.last().unwrap().review_id;
+            let err = kernel
+                .approve_review(bad_subject_id, "ops", 2000)
+                .unwrap_err();
+            assert!(err.to_string().contains("exactly"), "got {err:?}");
+            assert_eq!(probe(&kernel, task_id).status, "dead");
+        }
+    }
+
+    // A17：兼容审核只能审计批准——不建任务、不建 supplemental 行、不提供绕过
+    // preflight 的路径；ignore 同样可用；重复审核拒绝。
+    // A17: a compatibility review can only be audit-approved — no task, no
+    // supplemental row, no path around the preflight; ignore works too; repeated
+    // reviews are rejected.
+    #[test]
+    fn b6_approve_compatibility_conflict_is_audit_only() {
+        let kernel = kernel();
+        let review_id = insert_review(
+            &kernel,
+            DOMAIN,
+            "compatibility_conflict",
+            r#"{"artifact_version":"wiki-v1","domain":"milk-tea","domain_pack_version":"1.2.0","prompt_version":null,"schema_version":null}"#,
+        );
+        let (task_id, _subject) = dead_task(&kernel);
+
+        let outcome = kernel.approve_review(review_id, "ops", 2000).unwrap();
+        assert_eq!(outcome.status, ReviewStatus::Approved);
+        assert_eq!(
+            outcome.compile_task_id, None,
+            "the audit approval never queues a task"
+        );
+
+        let rows = kernel.list_reviews(DOMAIN, None, 100).unwrap();
+        let row = rows.iter().find(|r| r.review_id == review_id).unwrap();
+        assert_eq!(row.status, ReviewStatus::Approved);
+        assert_eq!(row.reviewed_by.as_deref(), Some("ops"));
+        assert_eq!(row.reviewed_at, Some(2000));
+        assert_eq!(row.compile_task_id, None);
+        // 兼容批准不触碰任务/不生成转换建议行（无 preflight 绕过）。
+        // The compatibility approval touches no task and creates no conversion
+        // suggestion (no preflight bypass).
+        assert_eq!(probe(&kernel, task_id).status, "dead");
+        assert_eq!(probe(&kernel, task_id).epoch, 1);
+        assert!(rows.iter().all(|r| r.action != "supplemental_compile"));
+        assert_eq!(kernel.row_counts().unwrap()["compile_tasks"], 1);
+
+        // 已审核（approved）再 approve/ignore → Validation；另一条可 ignore。
+        // Already approved: re-approve/ignore → Validation; another row can be
+        // ignored.
+        assert!(kernel.approve_review(review_id, "ops", 3000).is_err());
+        assert!(kernel.ignore_review(review_id, "ops", 3000).is_err());
+        let other = insert_review(
+            &kernel,
+            DOMAIN,
+            "compatibility_conflict",
+            r#"{"domain":"milk-tea"}"#,
+        );
+        kernel.ignore_review(other, "bob", 3000).unwrap();
+        let ignored = kernel
+            .list_reviews(DOMAIN, Some(ReviewStatus::Ignored), 100)
+            .unwrap();
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0].review_id, other);
+        assert_eq!(ignored[0].reviewed_by.as_deref(), Some("bob"));
+        assert_eq!(kernel.row_counts().unwrap()["compile_tasks"], 1);
+    }
+
+    // A16/A17 汇总面：三个新 action 全部可 ignore（纯审计 + 无任务副作用），
+    // 且死信 ignore 后任务保持 dead（不静默重排）。
+    // The A16/A17 aggregate face: all three new actions are ignorable (pure
+    // audit, no task side effects), and ignoring a dead letter keeps the task dead
+    // (never a silent requeue).
+    #[test]
+    fn b6_new_actions_are_ignorable_without_side_effects() {
+        let kernel = kernel();
+        let (task_id, subject) = dead_task(&kernel);
+        let dead_letter = insert_review(&kernel, DOMAIN, "compile_dead_letter", &subject);
+        let consistency = insert_review(&kernel, DOMAIN, "consistency_conflict", &subject);
+        let compatibility = insert_review(
+            &kernel,
+            DOMAIN,
+            "compatibility_conflict",
+            r#"{"domain":"milk-tea"}"#,
+        );
+
+        for (review_id, by) in [
+            (dead_letter, "alice"),
+            (consistency, "bob"),
+            (compatibility, "carol"),
+        ] {
+            kernel.ignore_review(review_id, by, 2000).unwrap();
+        }
+        let ignored = kernel
+            .list_reviews(DOMAIN, Some(ReviewStatus::Ignored), 100)
+            .unwrap();
+        assert_eq!(ignored.len(), 3);
+        // 死信行保留 B3 回填的 task_id；一致性/兼容行保持 NULL。
+        // The dead-letter row keeps its B3-backfilled task_id; the consistency/
+        // compatibility rows stay NULL.
+        for row in &ignored {
+            match row.action.as_str() {
+                "compile_dead_letter" => assert_eq!(row.compile_task_id, Some(task_id)),
+                _ => assert_eq!(row.compile_task_id, None),
+            }
+        }
+        // 任务保持 dead、epoch 不变：ignore 绝不重排。
+        // The task stays dead at the same epoch: ignore never requeues.
+        assert_eq!(probe(&kernel, task_id).status, "dead");
+        assert_eq!(probe(&kernel, task_id).epoch, 1);
+        assert_eq!(kernel.row_counts().unwrap()["compile_tasks"], 1);
+    }
+
+    // ===== Step8 批 B7：故障注入（§8/§7 approve 原子性）=====
+    // ===== Step8 batch B7: fault injection (§8/§7 approve atomicity) =====
+    //
+    // 死信 approve = 同一事务「force admission 新建 epoch → review CAS
+    // approved + 回填」。注入 admission 之后的 review CAS 失败：整事务回滚——
+    // 任务保持 dead（不产生新 epoch）、review 保持 pending、零残留。
+    // A dead-letter approval is the one-transaction "force admission (new epoch)
+    // → review CAS approved + backfill". Injecting a failure at the review CAS
+    // after admission: the whole transaction rolls back — the task stays dead
+    // (no new epoch), the review stays pending, zero residue.
+    #[test]
+    fn b6_approve_dead_letter_mid_transaction_failure_rolls_back() {
+        let kernel = kernel();
+        kernel
+            .execute_batch(
+                "CREATE TRIGGER inject_approve_cas_fail BEFORE UPDATE OF status ON review_queue
+                 WHEN NEW.status = 'approved' AND OLD.action = 'compile_dead_letter'
+                 BEGIN SELECT RAISE(ABORT, 'injected: approve CAS failure'); END;",
+            )
+            .unwrap();
+        let (task_id, subject) = dead_task(&kernel);
+        let review_id = insert_review(&kernel, DOMAIN, "compile_dead_letter", &subject);
+        let err = kernel.approve_review(review_id, "ops", 2000).unwrap_err();
+        assert!(
+            matches!(err, Error::Database(_) | Error::Internal(_)),
+            "got {err:?}"
+        );
+        // 任务保持 dead、epoch 不变；review 仍 pending；无孤儿行。
+        // The task stays dead with its epoch unchanged; the review stays pending;
+        // no orphan rows.
+        let after = probe(&kernel, task_id);
+        assert_eq!(after.status, "dead");
+        assert_eq!(after.epoch, 1);
+        assert_eq!(after.result.as_deref(), Some("failed"));
+        let pending = kernel
+            .list_reviews(DOMAIN, Some(ReviewStatus::Pending), 100)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].review_id, review_id);
+
+        // 拆除注入后同一 approve 成功——核对故障确实来自注入点。
+        // The same approval succeeds after dropping the injection — proving the
+        // fault came from the injection point.
+        kernel
+            .execute_batch("DROP TRIGGER inject_approve_cas_fail;")
+            .unwrap();
+        let outcome = kernel.approve_review(review_id, "ops", 2000).unwrap();
+        assert_eq!(outcome.compile_task_id, Some(task_id));
+        assert_eq!(probe(&kernel, task_id).status, "pending");
+        assert_eq!(probe(&kernel, task_id).epoch, 2);
     }
 }

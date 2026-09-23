@@ -13,7 +13,11 @@
 //! compile_runs / compile_daily_budget，以及 Step 6 反馈闭环的
 //! feedback_events / review_queue / feedback_rejections。query_logs 不在此列：
 //! 它只被 raw SQL（查询日志写入与反馈窗口读取）使用，0005 新列同样由
-//! kernel/feedback_store.rs 的 raw 行映射承载。
+//! kernel/feedback_store.rs 的 raw 行映射承载。Step 8（0006）为 compile_tasks
+//! 与 compile_attempts 增补四列（一致性/兼容状态与诊断摘要）。
+//! and its 0005 columns are likewise carried by the raw row mappings in
+//! kernel/feedback_store.rs. Step 8 (0006) adds four columns to compile_tasks
+//! and compile_attempts (consistency/compatibility status and diagnostics).
 //! compile_runs / compile_daily_budget, plus the Step 6 feedback-loop tables
 //! feedback_events / review_queue / feedback_rejections. query_logs is omitted:
 //! it is only touched by raw SQL (query-log writes and feedback window reads),
@@ -120,6 +124,11 @@ diesel::table! {
         result -> Nullable<Text>,
         reserved_tokens -> BigInt,
         task_token_budget -> BigInt,
+        // 0006 新增列：一致性 / 兼容状态（默认 'unchecked'，Step8 §5.2）。
+        // Columns added in 0006: consistency / compatibility status (default
+        // 'unchecked', Step8 §5.2).
+        consistency_status -> Text,
+        compatibility_status -> Text,
     }
 }
 
@@ -158,6 +167,13 @@ diesel::table! {
         error_code -> Nullable<Text>,
         created_at -> BigInt,
         finished_at -> Nullable<BigInt>,
+        // 0006 新增列：确定性诊断摘要（仅 code/比较键/BLAKE3 摘要/版本/数量，
+        // 不存源明文；Step8 §5.2）。
+        // Columns added in 0006: deterministic diagnostic summaries (only
+        // codes/comparison keys/BLAKE3 digests/versions/counts; raw source text
+        // never lands here; Step8 §5.2).
+        consistency_json -> Text,
+        compatibility_json -> Text,
     }
 }
 
