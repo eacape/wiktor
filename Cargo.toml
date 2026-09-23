@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/wiktor-core",
     "crates/wiktor-cli",
+    "crates/wiktor-feedback",
+    "crates/wiktor-server",
 ]
 
 [workspace.package]
@@ -64,6 +66,20 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
+
+# HTTP server（Step 6 批5，spec step6 §3 D2：axum 0.7 + tower 0.5，仅
+# POST /feedback、GET /health、GET /metrics 三路 endpoint，不引 tonic）。
+# HTTP server (Step 6 batch 5, spec step6 §3 D2: axum 0.7 + tower 0.5, only the
+# three endpoints POST /feedback, GET /health, GET /metrics; no tonic).
+axum = "0.7"
+tower = "0.5"
+
+# 测试（Step 6 批5）：tower oneshot 的响应体收集，与 axum 0.7 的 http-body 1.x
+# 配套（http-body-util 0.1 是 axum 0.7 的既有传递配套版本）。
+# Tests (Step 6 batch 5): response-body collection for tower oneshot, matching
+# axum 0.7's http-body 1.x stack (http-body-util 0.1 is the existing transitive
+# companion version).
+http-body-util = "0.1"
 
 # 测试
 tempfile = "3.12"

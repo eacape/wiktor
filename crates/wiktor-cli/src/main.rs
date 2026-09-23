@@ -110,6 +110,12 @@ enum Command {
     /// Run the A/B/C golden evaluation and write the report trio (Step 5).
     /// 运行 A/B/C golden 评测并写出三件套报告（Step 5）。
     Eval(commands::eval::EvalArgs),
+    /// Feedback loop operations (Step 6): analyze / list / review.
+    /// 反馈闭环操作（Step 6）：analyze / list / review。
+    Feedback {
+        #[command(subcommand)]
+        command: commands::feedback::FeedbackCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +203,7 @@ async fn main() -> Result<()> {
             QugCommand::Build(args) => finish(commands::qug::run(args).await?)?,
         },
         Command::Eval(args) => finish(commands::eval::run(args).await?)?,
+        Command::Feedback { command } => finish(commands::feedback::run(command).await?)?,
     }
     Ok(())
 }
@@ -386,6 +393,18 @@ async fn cmd_search(
             false,
         ),
     };
+
+    // Step 6 批2（D10）：CLI search 注入默认过滤放宽器——带过滤滤空时至多
+    // 放宽一次并重新下推重试，滤空/放宽三状态随查询日志落库。引擎默认不装
+    // 配（A9：无 relaxer 触发不了），装配是 CLI 的显式决定。
+    // Step 6 batch 2 (D10): CLI search injects the default filter relaxer — a
+    // filtered-empty with filters relaxes at most once and retries the
+    // pushdown, with the filter-empty/relaxation state triple persisted in the
+    // query log. The engine never auto-installs one (A9: without a relaxer
+    // nothing can trigger); installing is the CLI's explicit decision.
+    let engine = engine.with_filter_relaxer(Arc::new(
+        wiktor_core::query_engine::DefaultFilterRelaxer::new(),
+    ));
 
     // 运维提示（不改变退出语义）：QUG 不可用时的原因线索；`wiktor qug build`
     // 由 Step5 CLI 批次提供。

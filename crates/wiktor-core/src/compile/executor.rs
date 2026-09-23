@@ -977,6 +977,16 @@ mod tests {
         let mut conn =
             diesel::sqlite::SqliteConnection::establish(db_path.to_str().expect("db path utf8"))
                 .unwrap();
+        // 与 kernel establish 同一 pragma 面（spec step6 §9 busy timeout 5s）：
+        // 读代数时内核连接可能正在写，等待而非立即 BUSY。
+        // Same pragma surface as the kernel establish (spec step6 §9, 5s busy
+        // timeout): the kernel connection may be writing while generations are
+        // read — wait instead of failing with an immediate BUSY.
+        diesel::connection::SimpleConnection::batch_execute(
+            &mut conn,
+            crate::schema::BUSY_TIMEOUT_PRAGMA_SQL,
+        )
+        .unwrap();
         diesel::sql_query("SELECT generation FROM pages WHERE page_id = ?")
             .bind::<diesel::sql_types::Text, _>(page_id)
             .get_result::<GenRow>(&mut conn)

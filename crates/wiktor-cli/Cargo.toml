@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 wiktor-core = { path = "../wiktor-core", features = ["vector-qdrant"] }
+wiktor-feedback = { path = "../wiktor-feedback" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

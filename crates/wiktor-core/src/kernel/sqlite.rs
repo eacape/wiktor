@@ -46,12 +46,12 @@ struct SearchRow {
     score: f32,
 }
 
-/// 本二进制支持的 schema 版本（0004_qug_persistence，见 A22/Step5 §5）。
+/// 本二进制支持的 schema 版本（0005_feedback_loop，见 Step5 §5 / Step6 §5）。
 /// `open_existing` 用它拒绝旧/新 schema 而不迁移。
-/// The schema version this binary supports (0004_qug_persistence, see A22 /
-/// Step5 §5). `open_existing` uses it to reject older/newer schemas without
+/// The schema version this binary supports (0005_feedback_loop, see Step5 §5 /
+/// Step6 §5). `open_existing` uses it to reject older/newer schemas without
 /// migrating.
-const SUPPORTED_SCHEMA_VERSION: i64 = 4;
+const SUPPORTED_SCHEMA_VERSION: i64 = 5;
 
 /// 单列文本行（filter 全量 / 过滤下推用）。
 /// Single text-column row (used for full filter scans and filter pushdown).
@@ -67,6 +67,40 @@ struct TextRow {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     n: i64,
+}
+
+/// Step 6 批2：新写入查询日志的 domain 缺省值（spec step6 §6：缺省
+/// `__default__`，不得继续用 0005 列默认 `__legacy__` 写新行；`__legacy__`
+/// 仅保留给 0005 之前的历史行）。
+/// Step 6 batch 2: the default domain for newly written query logs (spec step6
+/// §6: defaults to `__default__`; the 0005 column default `__legacy__` must no
+/// longer back new rows — it stays reserved for pre-0005 historical rows).
+pub const DEFAULT_QUERY_LOG_DOMAIN: &str = "__default__";
+
+/// 查询日志写入载荷（Step 6 D10：domain 与滤空/放宽三状态列随行写入）。
+/// Query-log write payload (Step 6 D10: domain plus the three filter-empty/
+/// relaxation state columns are written with the row).
+pub struct QueryLogInsert<'a> {
+    pub query_text: &'a str,
+    pub query_json: &'a str,
+    pub rewritten_json: Option<&'a str>,
+    pub rewrite_failure: bool,
+    pub hit_count: i64,
+    pub latency_ms: i64,
+    /// 租户 domain（Query.domain 缺省 `__default__`，见
+    /// [`DEFAULT_QUERY_LOG_DOMAIN`]）。
+    /// Tenant domain (Query.domain defaults to `__default__`, see
+    /// [`DEFAULT_QUERY_LOG_DOMAIN`]).
+    pub domain: &'a str,
+    /// D10：初始候选域为空（带过滤下推后为空）。
+    /// D10: the initial candidate scope was empty (empty after filter pushdown).
+    pub candidate_empty_initial: bool,
+    /// D10：放宽重试已尝试（至多一次）。
+    /// D10: a relaxation retry was attempted (at most once).
+    pub relaxation_attempted: bool,
+    /// D10：放宽重试成功打开候选域。
+    /// D10: the relaxation retry reopened the candidate scope.
+    pub relaxation_succeeded: bool,
 }
 
 impl SqliteKernel {
@@ -112,9 +146,13 @@ impl SqliteKernel {
             Error::InvalidConfig(format!("db path is not valid UTF-8: {}", path.display()))
         })?;
         let mut conn = establish(path_str)?;
-        // 不调用 migrate：dry-run 语义禁止迁移/写 pragma。
+        // 不调用 migrate：dry-run 语义禁止迁移与落库类 pragma（journal_mode）。
+        // establish 已设置的 busy_timeout 仅作用于本连接、不落库，不受此限。
         // `schema_version` reads the migrations ledger only; a missing table (a
-        // non-Wiktor or pre-0001 file) surfaces as Error::Database.
+        // non-Wiktor or pre-0001 file) surfaces as Error::Database. No migrate
+        // here: dry-run semantics forbid migrations and DB-persisting pragmas
+        // (journal_mode). The busy_timeout set by establish is connection-local
+        // and never persisted, so it is exempt.
         let version = schema::schema_version(&mut conn).map_err(|e| {
             Error::InvalidConfig(format!(
                 "migration_required: cannot read schema version of {}: {e}",
@@ -163,6 +201,12 @@ impl SqliteKernel {
             "compile_tasks",
             "query_logs",
             "generations",
+            // Step 6 反馈闭环表（0005）随 row_counts 一并暴露（诊断口径）。
+            // Step 6 feedback-loop tables (0005) exposed via row_counts too
+            // (diagnostic surface).
+            "feedback_events",
+            "review_queue",
+            "feedback_rejections",
         ];
         let mut out = BTreeMap::new();
         for t in tables {
@@ -179,6 +223,48 @@ impl SqliteKernel {
         let mut conn = self.conn.lock().unwrap();
         diesel::connection::SimpleConnection::batch_execute(&mut *conn, sql)?;
         Ok(())
+    }
+
+    /// 写入一条完整查询日志并返回实际 `log_id`（Step 6 批2，spec step6 §6）。
+    /// Writes one full query-log row and returns the actual `log_id` (Step 6
+    /// batch 2, spec step6 §6).
+    ///
+    /// 错误面：写失败直接向上传 `Err`——QueryEngine 必须把日志写失败作为查询
+    /// 错误传播（反馈引用依赖 log_id，不得静默吞掉）。
+    /// Error surface: write failures propagate as `Err` — the QueryEngine must
+    /// surface log-write failures as query errors (feedback references depend on
+    /// the log_id; never swallow them silently).
+    ///
+    /// 锁纪律：取 conn Mutex 一次，INSERT 与 `last_insert_rowid()` 在同一锁内
+    /// 完成（同连接无并发插入，rowid 读取不会被其他语句穿插），不持锁跨 await。
+    /// Lock discipline: the conn Mutex is taken once; INSERT and
+    /// `last_insert_rowid()` complete under the same lock (single connection, no
+    /// concurrent insert can interleave with the rowid read), never held across
+    /// await.
+    pub fn insert_query_log(&self, row: &QueryLogInsert<'_>) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        diesel::sql_query(
+            "INSERT INTO query_logs
+                (query_text, query_json, rewritten_json, rewrite_failure,
+                 hit_count, latency_ms, timestamp, domain,
+                 candidate_empty_initial, relaxation_attempted, relaxation_succeeded)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .bind::<diesel::sql_types::Text, _>(row.query_text)
+        .bind::<diesel::sql_types::Text, _>(row.query_json)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(row.rewritten_json)
+        .bind::<diesel::sql_types::Integer, _>(i32::from(row.rewrite_failure))
+        .bind::<diesel::sql_types::BigInt, _>(row.hit_count)
+        .bind::<diesel::sql_types::BigInt, _>(row.latency_ms)
+        .bind::<diesel::sql_types::BigInt, _>(unix_now())
+        .bind::<diesel::sql_types::Text, _>(row.domain)
+        .bind::<diesel::sql_types::Integer, _>(i32::from(row.candidate_empty_initial))
+        .bind::<diesel::sql_types::Integer, _>(i32::from(row.relaxation_attempted))
+        .bind::<diesel::sql_types::Integer, _>(i32::from(row.relaxation_succeeded))
+        .execute(&mut *conn)?;
+        let id: CountRow =
+            diesel::sql_query("SELECT last_insert_rowid() AS n").get_result(&mut *conn)?;
+        Ok(id.n)
     }
 
     /// 写入/覆盖一页知识平面（seed 场景：手工编译产物，评分默认满分，幂等）。
@@ -523,9 +609,17 @@ impl SqliteKernel {
         let latency_ms = started.elapsed().as_millis() as i64;
         let log = |hit_count: i64| -> Result<()> {
             let mut conn = self.conn.lock().unwrap();
+            // Step 6：新行 domain 显式写 `__default__`（None 时），不再落到
+            // 0005 的 `__legacy__` 列默认（三状态列维持 0 默认——本 legacy 闭环
+            // 不感知滤空/放宽状态，QueryEngine 才是权威写入口）。
+            // Step 6: new rows write domain explicitly (`__default__` on None)
+            // instead of falling to 0005's `__legacy__` column default (the three
+            // state columns keep their 0 defaults — this legacy loop is unaware
+            // of filter-empty/relaxation state; the QueryEngine is the
+            // authoritative writer).
             diesel::sql_query(
-                "INSERT INTO query_logs (query_text, query_json, rewritten_json, rewrite_failure, hit_count, latency_ms, timestamp)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                "INSERT INTO query_logs (query_text, query_json, rewritten_json, rewrite_failure, hit_count, latency_ms, timestamp, domain)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             )
             .bind::<diesel::sql_types::Text, _>(text)
             .bind::<diesel::sql_types::Text, _>(&query_json)
@@ -534,6 +628,7 @@ impl SqliteKernel {
             .bind::<diesel::sql_types::BigInt, _>(hit_count)
             .bind::<diesel::sql_types::BigInt, _>(latency_ms)
             .bind::<diesel::sql_types::BigInt, _>(unix_now())
+            .bind::<diesel::sql_types::Text, _>(domain.unwrap_or(DEFAULT_QUERY_LOG_DOMAIN))
             .execute(&mut *conn)
             .map(|_| ())
             .map_err(Error::Database)
@@ -553,11 +648,26 @@ impl SqliteKernel {
 }
 
 fn establish(url: &str) -> Result<SqliteConnection> {
-    SqliteConnection::establish(url).map_err(|e| {
+    let mut conn = SqliteConnection::establish(url).map_err(|e| {
         Error::Database(diesel::result::Error::QueryBuilderError(
             format!("connection error: {e}").into(),
         ))
-    })
+    })?;
+    // spec step6 §9：连接级 busy timeout 5s（kernel open / open_in_memory /
+    // open_existing 三个打开点统一经过本函数）。该 PRAGMA 仅作用于当前连接、
+    // 不落库——open_existing 的 dry-run「不写库」语义不受影响；落库类 pragma
+    // （journal_mode）仍只在 schema::migrate 中设置。
+    // spec step6 §9: the connection-local 5s busy timeout (all three open
+    // points — kernel open / open_in_memory / open_existing — funnel through
+    // this function). The PRAGMA only affects the current connection and is
+    // never persisted, so open_existing's dry-run "never writes" semantics are
+    // unaffected; DB-persisting pragmas (journal_mode) remain exclusive to
+    // schema::migrate.
+    diesel::connection::SimpleConnection::batch_execute(
+        &mut conn,
+        crate::schema::BUSY_TIMEOUT_PRAGMA_SQL,
+    )?;
+    Ok(conn)
 }
 
 /// SQL 字符串字面量（单引号转义防注入）。用于 raw SQL 逃生路径的参数内联。

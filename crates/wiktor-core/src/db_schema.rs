@@ -10,7 +10,15 @@
 //! page_quality / facts / fact_refs，以及 Step 4 编译管线的
 //! page_quality / facts / fact_refs, plus the Step 4 compile-pipeline tables:
 //! compile_tasks / compile_source_heads / compile_attempts / qug_edges /
-//! compile_runs / compile_daily_budget。
+//! compile_runs / compile_daily_budget，以及 Step 6 反馈闭环的
+//! feedback_events / review_queue / feedback_rejections。query_logs 不在此列：
+//! 它只被 raw SQL（查询日志写入与反馈窗口读取）使用，0005 新列同样由
+//! kernel/feedback_store.rs 的 raw 行映射承载。
+//! compile_runs / compile_daily_budget, plus the Step 6 feedback-loop tables
+//! feedback_events / review_queue / feedback_rejections. query_logs is omitted:
+//! it is only touched by raw SQL (query-log writes and feedback window reads),
+//! and its 0005 columns are likewise carried by the raw row mappings in
+//! kernel/feedback_store.rs.
 
 diesel::table! {
     pages (page_id) {
@@ -184,6 +192,51 @@ diesel::table! {
     }
 }
 
+// ===== Step 6 反馈闭环表（migrations/0005_feedback_loop）=====
+// ===== Step 6 feedback-loop tables (migrations/0005_feedback_loop) =====
+
+diesel::table! {
+    feedback_events (event_id) {
+        event_id -> BigInt,
+        idempotency_key -> Text,
+        domain -> Text,
+        // FK → query_logs.log_id ON DELETE RESTRICT（防孤儿事件，spec §5）。
+        // FK → query_logs.log_id ON DELETE RESTRICT (no orphan events, spec §5).
+        log_id -> BigInt,
+        kind -> Text,
+        page_id -> Nullable<Text>,
+        rating -> Nullable<BigInt>,
+        metadata_json -> Text,
+        received_at -> BigInt,
+    }
+}
+
+diesel::table! {
+    review_queue (review_id) {
+        review_id -> BigInt,
+        domain -> Text,
+        action -> Text,
+        status -> Text,
+        source_log_ids_json -> Text,
+        subject_json -> Text,
+        reason_json -> Text,
+        created_at -> BigInt,
+        reviewed_at -> Nullable<BigInt>,
+        reviewed_by -> Nullable<Text>,
+        compile_task_id -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    feedback_rejections (rejection_id) {
+        rejection_id -> BigInt,
+        domain -> Nullable<Text>,
+        reason -> Text,
+        payload_bytes -> BigInt,
+        created_at -> BigInt,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     pages,
     page_sections,
@@ -195,5 +248,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     compile_attempts,
     qug_edges,
     compile_runs,
-    compile_daily_budget
+    compile_daily_budget,
+    feedback_events,
+    review_queue,
+    feedback_rejections
 );

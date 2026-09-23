@@ -51,14 +51,18 @@ const MAX_ARTIFACT_BYTES: usize = 256 * 1024;
 
 /// `compile_tasks.dependencies_json` 的持久化形状（§7 步骤 3：context/policy/schema）。
 /// claim 反序列化还原编译上下文与预算参数；publish 还原 artifact_version 等。
+/// `pub(super)`：Step6 批4 审核批准把同一形状作为 supplemental subject 的
+/// `dependencies_json` 契约复用（step6 spec §8，禁止双实现漂移）。
 /// Persisted shape of `compile_tasks.dependencies_json` (§7 item 3:
 /// context/policy/schema). Claim deserializes the compile context and budget
-/// params; publish restores artifact_version etc.
+/// params; publish restores artifact_version etc. `pub(super)`: Step6 batch 4
+/// review approval reuses the same shape as the supplemental subject's
+/// `dependencies_json` contract (step6 spec §8; no drifting duplicates).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredDependencies {
-    context: CompileContext,
-    policy: CompilePolicy,
-    schema: serde_json::Value,
+pub(super) struct StoredDependencies {
+    pub(super) context: CompileContext,
+    pub(super) policy: CompilePolicy,
+    pub(super) schema: serde_json::Value,
 }
 
 /// `pages.frontmatter_json` 的读取形状（§8.1：aliases/tags/refs/质量策略）。
@@ -624,10 +628,17 @@ fn record_skipped_task(
     .map_err(Error::Database)
 }
 
-/// admit 事务主体（§7 步骤 1-4）。
-/// The admit transaction body (§7 items 1-4).
-fn admit_in_transaction(
-    tx: &mut SqliteConnection,
+/// admit 事务主体（§7 步骤 1-4）。`pub(super)`：Step6 批4 approve_review 在
+/// **同一个** BEGIN IMMEDIATE 内复用本主体（D12；diesel 2.3 嵌套 BEGIN 报
+/// AlreadyInTransaction，故复用主体而非嵌套事务）；调用方必须已在
+/// `immediate_transaction` 中，本函数不再自行开启事务。
+/// The admit transaction body (§7 items 1-4). `pub(super)`: Step6 batch 4's
+/// approve_review reuses this body inside the **same** BEGIN IMMEDIATE (D12;
+/// diesel 2.3 rejects nested BEGINs with AlreadyInTransaction, so the body is
+/// reused rather than nesting transactions); callers must already run inside
+/// `immediate_transaction` — this function never opens its own.
+pub(super) fn admit_compile_on_conn(
+    conn: &mut SqliteConnection,
     prepared: &PreparedSource,
     ctx: &CompileContext,
     policy: &CompilePolicy,
@@ -645,7 +656,7 @@ fn admit_in_transaction(
          FROM compile_source_heads WHERE entity_id = ?",
     )
     .bind::<diesel::sql_types::Text, _>(&entity_key)
-    .get_result(tx)
+    .get_result(conn)
     .optional()?;
 
     if let Some(h) = &head {
@@ -666,12 +677,12 @@ fn admit_in_transaction(
             // 高 revision：先以事实 CAS 写 facts（仅 CAS 成功才替换，§7.1/§8.2）。
             // Higher revision: write facts via CAS first (replacement only when
             // CAS applies, §7.1/§8.2).
-            write_facts_cas(tx, &prepared.facts, prepared.full.source_revision, now)?;
+            write_facts_cas(conn, &prepared.facts, prepared.full.source_revision, now)?;
         }
         // 同 revision 同 snapshot → 幂等重放，不重复写 facts。
         // Same revision and snapshot → idempotent replay, no facts rewrite.
     } else {
-        write_facts_cas(tx, &prepared.facts, prepared.full.source_revision, now)?;
+        write_facts_cas(conn, &prepared.facts, prepared.full.source_revision, now)?;
     }
 
     // desired_hash = content_hash(knowledge, ctx, policy, schema)（§7）。
@@ -698,7 +709,7 @@ fn admit_in_transaction(
          ORDER BY generation DESC, updated_at DESC LIMIT 1",
     )
     .bind::<diesel::sql_types::Text, _>(&entity_key)
-    .get_result(tx)
+    .get_result(conn)
     .optional()?;
 
     if let Some(p) = &accepted {
@@ -710,7 +721,7 @@ fn admit_in_transaction(
                 // Newer input revision: record succeeded/skipped; the accepted page,
                 // its original revision evidence and generation stay untouched.
                 let row = record_skipped_task(
-                    tx,
+                    conn,
                     &entity_key,
                     revision,
                     &ctx.domain_pack_version,
@@ -723,7 +734,7 @@ fn admit_in_transaction(
                     now,
                 )?;
                 upsert_source_head(
-                    tx,
+                    conn,
                     &entity_key,
                     revision,
                     &prepared.snapshot_hash,
@@ -748,7 +759,7 @@ fn admit_in_transaction(
     .bind::<diesel::sql_types::Text, _>(&entity_key)
     .bind::<diesel::sql_types::BigInt, _>(revision)
     .bind::<diesel::sql_types::Text, _>(&ctx.domain_pack_version)
-    .get_result(tx)
+    .get_result(conn)
     .optional()?;
 
     let (task_id, epoch) = match existing {
@@ -768,7 +779,7 @@ fn admit_in_transaction(
                 .bind::<diesel::sql_types::Text, _>(&prepared.snapshot_hash)
                 .bind::<diesel::sql_types::BigInt, _>(now)
                 .bind::<diesel::sql_types::BigInt, _>(t.task_id)
-                .execute(tx)?;
+                .execute(conn)?;
                 (t.task_id, t.epoch)
             } else {
                 // 相同 hash 的 dead/failed/succeeded 不自动重启，计入现有 terminal
@@ -776,7 +787,7 @@ fn admit_in_transaction(
                 // Same-hash dead/failed/succeeded never auto-restarts; the existing
                 // terminal result stands (§7.3).
                 upsert_source_head(
-                    tx,
+                    conn,
                     &entity_key,
                     revision,
                     &prepared.snapshot_hash,
@@ -817,7 +828,7 @@ fn admit_in_transaction(
             .bind::<diesel::sql_types::BigInt, _>(policy.task_token_budget as i64)
             .bind::<diesel::sql_types::BigInt, _>(now)
             .bind::<diesel::sql_types::BigInt, _>(t.task_id)
-            .get_result(tx)?;
+            .get_result(conn)?;
             (row.task_id, row.epoch)
         }
         None => {
@@ -842,7 +853,7 @@ fn admit_in_transaction(
             .bind::<diesel::sql_types::BigInt, _>(policy.task_token_budget as i64)
             .bind::<diesel::sql_types::BigInt, _>(now)
             .bind::<diesel::sql_types::BigInt, _>(now)
-            .get_result(tx)?;
+            .get_result(conn)?;
             (row.task_id, row.epoch)
         }
     };
@@ -850,7 +861,7 @@ fn admit_in_transaction(
     // —— §7 步骤 4：source_heads 保存 latest desired task_id/epoch/hash ——
     // —— §7 item 4: source_heads stores the latest desired task_id/epoch/hash ——
     upsert_source_head(
-        tx,
+        conn,
         &entity_key,
         revision,
         &prepared.snapshot_hash,
@@ -1672,7 +1683,7 @@ impl SqliteKernel {
     ) -> Result<Admission> {
         let mut conn = self.lock_conn()?;
         conn.immediate_transaction(|tx| {
-            admit_in_transaction(tx, prepared, ctx, policy, schema, force)
+            admit_compile_on_conn(tx, prepared, ctx, policy, schema, force)
         })
     }
 

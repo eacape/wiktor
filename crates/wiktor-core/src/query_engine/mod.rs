@@ -4,12 +4,12 @@
 //! scope → FTS + vector dual recall → RRF fusion → query log. Zero-LLM by default.
 
 use crate::kernel::qug_store::{load_active_qug, QUG_STALE_PREFIX};
-use crate::kernel::SqliteKernel;
+use crate::kernel::{QueryLogInsert, SqliteKernel, DEFAULT_QUERY_LOG_DOMAIN};
 use crate::query_engine::hybrid::{rrf_merge, whitelist_filter};
 use crate::query_engine::qug::QugGraph;
 use crate::traits::{DomainConfig, VectorHit, VectorStore};
 use crate::types::error::{Error, Result};
-use crate::types::{Filters, Query, RewrittenQuery, SearchHit};
+use crate::types::{FilterCondition, Filters, Query, RewrittenQuery, SearchHit};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -48,8 +48,9 @@ pub enum RewriteStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryDiagnostics {
     pub rewrite_status: RewriteStatus,
-    /// 最终生效的过滤条件（QUG + 用户 AND 合并）。
-    /// Effective filter conditions (QUG + user ANDed together).
+    /// 最终生效的过滤条件（QUG + 用户 AND 合并；放宽重试成功后为放宽后条件）。
+    /// Effective filter conditions (QUG + user ANDed together; the relaxed ones
+    /// after a successful relaxation retry).
     pub applied_filters: Filters,
     /// 事实平面预筛候选实体数；无过滤时表示未限制。
     /// Candidate entities after fact-plane prefiltering; means "unrestricted" when no filter applies.
@@ -57,6 +58,18 @@ pub struct QueryDiagnostics {
     pub fts_count: usize,
     pub vector_count: usize,
     pub rrf_k: u32,
+    /// Step 6 D10：滤空放宽重试是否已尝试（初始候选为空 + 带过滤 + 已装
+    /// relaxer；至多一次）。`#[serde(default)]` 保持旧诊断 JSON 可反序列化。
+    /// Step 6 D10: whether a relaxation retry was attempted (initial empty
+    /// scope + filters present + a relaxer installed; at most once).
+    /// `#[serde(default)]` keeps old diagnostics JSON deserializable.
+    #[serde(default)]
+    pub relaxation_attempted: bool,
+    /// Step 6 D10：放宽重试是否成功打开候选域（未尝试时恒 false）。
+    /// Step 6 D10: whether the relaxation retry reopened the candidate scope
+    /// (always false when no attempt was made).
+    #[serde(default)]
+    pub relaxation_succeeded: bool,
 }
 
 /// 查询结果（hits + 改写 + 诊断 + 延迟）。
@@ -68,6 +81,130 @@ pub struct QueryResult {
     pub rewrite_failure: bool,
     pub diagnostics: QueryDiagnostics,
     pub latency_ms: u64,
+    /// Step 6 批2：本次查询写入的 `query_logs` 行 ID（反馈事件经
+    /// `insert_feedback_idempotent` 引用它）。日志写失败会让查询返回
+    /// `Err`（spec step6 §6 硬要求，不得静默吞掉），故成功路径恒为
+    /// `Some`；`#[serde(default)]` 保持旧结果 JSON 可反序列化。
+    /// Step 6 batch 2: the `query_logs` row id written for this query
+    /// (referenced by feedback events via `insert_feedback_idempotent`).
+    /// A log-write failure makes the query return `Err` (hard requirement of
+    /// spec step6 §6, never swallowed silently), so a successful search always
+    /// carries `Some`; `#[serde(default)]` keeps old result JSON deserializable.
+    #[serde(default)]
+    pub log_id: Option<i64>,
+}
+
+/// Step 6 D10：过滤放宽器——滤空（带过滤下推后候选为空）时由 QueryEngine
+/// 调用，同一次查询**至多一次**。
+/// Step 6 D10: the filter relaxer — invoked by the QueryEngine on a
+/// filtered-empty (empty candidate scope after filter pushdown), **at most
+/// once** per query.
+///
+/// 契约（spec step6 §6）：输入当前生效过滤条件；`Ok(Some(..))` 返回放宽后的
+/// 条件，`Ok(None)` 表示无放宽语义（不重试）。实现必须确定性、无副作用；
+/// `Err` 作为查询错误向上传播，不得转为空结果。
+/// Contract (spec step6 §6): takes the currently effective filters;
+/// `Ok(Some(..))` returns the relaxed filters and `Ok(None)` means "no
+/// relaxation semantics" (no retry). Implementations must be deterministic and
+/// side-effect free; `Err` propagates as a query error and must never be
+/// converted into an empty result.
+pub trait FilterRelaxer: Send + Sync {
+    fn relax_once(&self, filters: &Filters) -> Result<Option<Filters>>;
+}
+
+/// 默认放宽器（上层拍板语义，记入 spec §12 偏差）：
+/// - `NumericRange{min,max}`：去掉较紧一侧——两侧都在时**先去 max**；仅一侧时
+///   去掉该侧。去掉后区间变为无约束（两侧皆 None）时，该条件不再约束任何
+///   实体（与 `schema::facts::filter_where` 的开放区间规则一致），整条条件从
+///   列表移除；列表因此变空即等价无过滤（引擎按不限候选域处理）。
+/// - `TextEquals`：不放宽（枚举值无"更宽"语义），返回 `None`。
+/// - `RefContains`：不放宽（允许集语义敏感），返回 `None`。
+/// - `RefExcludes`：不放宽（排除集语义敏感，MVP 不动），返回 `None`。
+/// - 多条件：按条件顺序放宽**第一条**可放宽条件；全部不可放宽返回 `None`。
+///
+/// The default relaxer (upstream-decided semantics, recorded as a spec §12
+/// deviation):
+/// - `NumericRange{min,max}`: drop the tighter side — with both sides present
+///   drop **max first**; with a single side drop that side. Once the range
+///   becomes unconstrained (both None) the condition binds nothing (matching
+///   `schema::facts::filter_where`'s open-range rule) and is removed from the
+///   list; an emptied list is equivalent to no filter (the engine treats it as
+///   an unrestricted candidate scope).
+/// - `TextEquals`: not relaxed (enum values have no "wider" ordering) → `None`.
+/// - `RefContains`: not relaxed (allow-set semantics are sensitive) → `None`.
+/// - `RefExcludes`: not relaxed (exclude-set semantics are sensitive; untouched
+///   in the MVP) → `None`.
+/// - Multiple conditions: relax the **first** relaxable condition in order;
+///   return `None` when none can be relaxed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultFilterRelaxer;
+
+impl DefaultFilterRelaxer {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl FilterRelaxer for DefaultFilterRelaxer {
+    fn relax_once(&self, filters: &Filters) -> Result<Option<Filters>> {
+        for (idx, cond) in filters.conditions.iter().enumerate() {
+            // 逐条件判定放宽结果：外层 `None` = 本条件无放宽语义（继续下一条）；
+            // 内层 `Some(Some(c))` = 放宽为新条件；内层 `Some(None)` = 放宽后
+            // 无约束 → 移除整条条件。
+            // Per-condition relaxation outcome: the outer `None` = this condition
+            // has no relaxation semantics (move on); the inner `Some(Some(c))` =
+            // relaxed into a new condition; the inner `Some(None)` = unconstrained
+            // after relaxation → remove the whole condition.
+            let outcome: Option<Option<FilterCondition>> = match cond {
+                FilterCondition::NumericRange { field, min, max } => match (min, max) {
+                    // 两侧都在：先去 max（拍板；保留 min 下界约束）。
+                    // Both sides present: drop max first (the upstream decision;
+                    // the min bound stays).
+                    (_, Some(_)) => Some(Some(FilterCondition::NumericRange {
+                        field: field.clone(),
+                        min: *min,
+                        max: None,
+                    })),
+                    // 仅 min：去 min 后区间无约束 → 整条条件移除。
+                    // min only: dropping min leaves an unconstrained range →
+                    // remove the whole condition.
+                    (Some(_), None) => Some(None),
+                    // 双侧皆空：本就无约束，无可放宽。
+                    // Both absent: already unconstrained, nothing to relax.
+                    (None, None) => None,
+                },
+                // TextEquals / RefContains / RefExcludes：无放宽语义（拍板）。
+                // TextEquals / RefContains / RefExcludes: no relaxation semantics
+                // (the upstream decision).
+                _ => None,
+            };
+            if let Some(new_cond) = outcome {
+                let mut conditions = filters.conditions.clone();
+                match new_cond {
+                    Some(c) => conditions[idx] = c,
+                    // 放宽为无约束 → 移除条件（可能使 Filters 变空）。
+                    // Relaxed into unconstrained → remove the condition (this may
+                    // empty the Filters).
+                    None => {
+                        conditions.remove(idx);
+                    }
+                }
+                return Ok(Some(Filters { conditions }));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// 滤空/放宽三状态（D10；与 `query_logs` 的三列一一对应，随同一次日志写入
+/// 落库，绝不拆成多次写）。
+/// Filter-empty/relaxation state (D10; maps 1:1 to the three `query_logs`
+/// columns and lands within the same single log write, never split).
+#[derive(Debug, Clone, Copy, Default)]
+struct RelaxState {
+    candidate_empty_initial: bool,
+    relaxation_attempted: bool,
+    relaxation_succeeded: bool,
 }
 
 /// 查询嵌入器（查询文本 → 向量；Mock/CLI 用确定性实现，qdrant 路径由调用方注入）。
@@ -113,6 +250,14 @@ pub struct QueryEngine<V: VectorStore> {
     /// behavior; QUG semantics are untouched (tier A expresses itself via
     /// `qug=None`).
     pub fts_only: bool,
+    /// Step 6 D10：可选过滤放宽器。默认 `None`——滤空不触发放宽重试（A9：
+    /// 无 relaxer 触发不了）；是否装配由构造方决定（CLI search 注入
+    /// [`DefaultFilterRelaxer`]，引擎绝不自动装配）。
+    /// Step 6 D10: the optional filter relaxer. Defaults to `None` — a
+    /// filtered-empty never triggers a relaxation retry (A9: without a relaxer
+    /// nothing can trigger); installation is the constructor's decision (CLI
+    /// search injects [`DefaultFilterRelaxer`]; the engine never auto-installs).
+    pub filter_relaxer: Option<Arc<dyn FilterRelaxer>>,
 }
 
 impl<V: VectorStore> QueryEngine<V> {
@@ -142,7 +287,20 @@ impl<V: VectorStore> QueryEngine<V> {
             candidate_multiplier,
             rrf_k,
             fts_only: false,
+            filter_relaxer: None,
         })
+    }
+
+    /// Step 6 批2：安装过滤放宽器（builder 风格，命名对齐
+    /// `with_persistent_qug`；不安装则滤空不重试）。「至多一次」的次数约束由
+    /// 引擎保证，relaxer 实现只需确定性、无副作用。
+    /// Step 6 batch 2: installs a filter relaxer (builder style, named after
+    /// `with_persistent_qug`; without one a filtered-empty never retries). The
+    /// at-most-once bound is enforced by the engine; relaxer implementations
+    /// only need to be deterministic and side-effect free.
+    pub fn with_filter_relaxer(mut self, relaxer: Arc<dyn FilterRelaxer>) -> Self {
+        self.filter_relaxer = Some(relaxer);
+        self
     }
 
     /// Step5 批3 构造路径（spec §4.4）：QUG 图优先从持久化 active published
@@ -263,7 +421,7 @@ impl<V: VectorStore> QueryEngine<V> {
         // 用户过滤与 QUG 过滤合并（QUG 已在 rewrite 内与用户条件做冲突合并）
         // Merge user filters with QUG filters (rewrite already merged them with
         // conflict resolution)
-        let applied: Filters = rewritten
+        let mut applied: Filters = rewritten
             .as_ref()
             .map(|r| r.filters.clone())
             .unwrap_or_else(|| query.filters.clone());
@@ -271,39 +429,87 @@ impl<V: VectorStore> QueryEngine<V> {
         // 过滤下推候选域：SKU 满足条件 → category 值集合（= 知识页 entity_id）
         // Filter-pushdown candidate scope: SKUs matching conditions → category
         // values (= knowledge-page entity_id)
-        let candidates = if applied.is_empty() {
+        let mut candidates = if applied.is_empty() {
             None
         } else {
             Some(self.kernel.filter_page_candidates(&applied)?)
         };
+
+        // Step 6 D10：初始候选为空（必然带过滤）→ 注入的 FilterRelaxer 至多
+        // 放宽一次并重新下推重试。无过滤不触发（candidates 恒 None，A9）；
+        // 未装 relaxer 触发不了（attempted 恒 0，A9）；放宽后仍空 → 三状态
+        // `candidate_empty_initial=1 AND relaxation_succeeded=0` 显式落库，
+        // 供批3 分析器区分「滤空」与「真正零召回」（A10/D11）。
+        // Step 6 D10: when the initial candidate scope is empty (which implies
+        // filters are present) → the injected FilterRelaxer relaxes at most once
+        // and the pushdown retries. No filters → never triggered (candidates
+        // stay None, A9); no relaxer installed → cannot trigger (attempted stays
+        // 0, A9); still empty after relaxation → the state triple
+        // `candidate_empty_initial=1 AND relaxation_succeeded=0` is persisted
+        // explicitly so the batch-3 analyzer can tell "filtered empty" from
+        // "genuine zero recall" (A10/D11).
+        let mut relax = RelaxState::default();
+        if candidates.as_ref().is_some_and(|ids| ids.is_empty()) {
+            relax.candidate_empty_initial = true;
+            if let Some(relaxer) = &self.filter_relaxer {
+                relax.relaxation_attempted = true;
+                if let Some(relaxed) = relaxer.relax_once(&applied)? {
+                    let retry = if relaxed.is_empty() {
+                        // 放宽为无过滤 → 不限候选域。
+                        // Relaxed into no filter → unrestricted candidate scope.
+                        None
+                    } else {
+                        Some(self.kernel.filter_page_candidates(&relaxed)?)
+                    };
+                    // 放宽成功 ⇔ 重试后候选域不再为空（无过滤 = 不受限，
+                    // 也算打开；此后 FTS 仍可能零命中 → 真正零召回，由分析器
+                    // 按 D11 判定）。
+                    // Relaxation succeeded ⇔ the retried scope is no longer empty
+                    // (no filter = unrestricted, which also counts as reopened;
+                    // FTS may still miss → genuine zero recall, judged by the
+                    // analyzer per D11).
+                    if retry.as_ref().is_none_or(|ids| !ids.is_empty()) {
+                        relax.relaxation_succeeded = true;
+                        applied = relaxed;
+                        candidates = retry;
+                    }
+                }
+            }
+        }
         let candidate_count = candidates.as_ref().map_or(0, Vec::len);
         if let Some(ids) = &candidates {
             if ids.is_empty() {
-                // 空候选域：零命中，仍写日志
-                // Empty scope: zero hits; still write the log
+                // 空候选域：零命中，仍写日志（带滤空/放宽三状态；写失败 =
+                // 查询 Err，不得静默）。
+                // Empty scope: zero hits; still write the log (with the three
+                // filter-empty/relaxation flags; a write failure = query Err,
+                // never silent).
                 let latency_ms = started.elapsed().as_millis() as u64;
-                let res = QueryResult {
+                let log_id = self.log_query(
+                    query,
+                    rewritten.as_ref(),
+                    rewrite_failure,
+                    &[],
+                    latency_ms,
+                    &relax,
+                )?;
+                return Ok(QueryResult {
                     hits: Vec::new(),
                     rewritten: rewritten.clone(),
                     rewrite_failure,
                     diagnostics: QueryDiagnostics {
                         rewrite_status: status,
-                        applied_filters: applied.clone(),
+                        applied_filters: applied,
                         candidate_count,
                         fts_count: 0,
                         vector_count: 0,
                         rrf_k: self.rrf_k,
+                        relaxation_attempted: relax.relaxation_attempted,
+                        relaxation_succeeded: relax.relaxation_succeeded,
                     },
+                    log_id: Some(log_id),
                     latency_ms,
-                };
-                self.log_query(
-                    query,
-                    rewritten.as_ref(),
-                    rewrite_failure,
-                    &res.hits,
-                    latency_ms,
-                )?;
-                return Ok(res);
+                });
             }
         }
 
@@ -365,22 +571,30 @@ impl<V: VectorStore> QueryEngine<V> {
             fts_count: fts_hits.len(),
             vector_count: usable_vector_count,
             rrf_k: self.rrf_k,
+            relaxation_attempted: relax.relaxation_attempted,
+            relaxation_succeeded: relax.relaxation_succeeded,
         };
-        let res = QueryResult {
-            hits: hits.clone(),
-            rewritten: rewritten.clone(),
-            rewrite_failure,
-            diagnostics,
-            latency_ms,
-        };
-        self.log_query(
+        // 日志先写并取回实际 log_id（写失败 = 查询 Err，不得静默——反馈引用
+        // 依赖它），再随结果返回。
+        // The log is written first and the actual log_id returned (a write
+        // failure = query Err, never silent — feedback references depend on it),
+        // then handed back with the result.
+        let log_id = self.log_query(
             query,
             rewritten.as_ref(),
             rewrite_failure,
             &hits,
             latency_ms,
+            &relax,
         )?;
-        Ok(res)
+        Ok(QueryResult {
+            hits: hits.clone(),
+            rewritten: rewritten.clone(),
+            rewrite_failure,
+            diagnostics,
+            log_id: Some(log_id),
+            latency_ms,
+        })
     }
 
     /// 输入校验（Step 3 A16：top_k 1..=100、文本 ≤4096）。
@@ -452,9 +666,14 @@ impl<V: VectorStore> QueryEngine<V> {
         Ok(kept)
     }
 
-    /// 写查询日志（成功与可恢复空结果路径都要写；写失败仅 tracing 告警）。
-    /// Writes a query log entry (on success and recoverable empty-result paths;
-    /// log failures only warn via tracing).
+    /// 写查询日志（成功与可恢复空结果路径都要写）。Step 6 批2：返回实际
+    /// `log_id`；写失败作为查询 `Err` 向上传播（spec step6 §6 硬要求——反馈
+    /// 引用依赖 log_id，不得静默 warn 吞掉）。
+    /// Writes a query log entry (on success and recoverable empty-result
+    /// paths). Step 6 batch 2: returns the actual `log_id`; write failures
+    /// propagate as the query's `Err` (hard requirement of spec step6 §6 —
+    /// feedback references depend on the log_id; the old warn-and-swallow is
+    /// gone).
     fn log_query(
         &self,
         query: &Query,
@@ -462,38 +681,33 @@ impl<V: VectorStore> QueryEngine<V> {
         rewrite_failure: bool,
         hits: &[SearchHit],
         latency_ms: u64,
-    ) -> Result<()> {
+        relax: &RelaxState,
+    ) -> Result<i64> {
         let query_json = serde_json::to_string(query)?;
         let rewritten_json = rewritten.map(serde_json::to_string).transpose()?;
-        let sql = format!(
-            "INSERT INTO query_logs (query_text, query_json, rewritten_json, rewrite_failure, hit_count, latency_ms, timestamp)
-             VALUES ({},{},{},{},{},{},{})",
-            sq(query.text.as_str()),
-            sq(&query_json),
-            rewritten_json.as_deref().map(sq).unwrap_or_else(|| "NULL".into()),
-            if rewrite_failure { "1" } else { "0" },
-            hits.len(),
-            latency_ms,
-            now_secs(),
-        );
-        if let Err(e) = self.kernel.execute_batch(&sql) {
-            tracing::warn!("query log write failed: {e}");
-        }
-        Ok(())
+        // domain 取 Query 的 domain，缺省 `__default__`（spec step6 §6：不得
+        // 再用 legacy 默认值写新行）。
+        // The domain comes from Query.domain, defaulting to `__default__`
+        // (spec step6 §6: the legacy default must no longer back new rows).
+        let domain = query.domain.as_deref().unwrap_or(DEFAULT_QUERY_LOG_DOMAIN);
+        self.kernel.insert_query_log(&QueryLogInsert {
+            query_text: &query.text,
+            query_json: &query_json,
+            rewritten_json: rewritten_json.as_deref(),
+            rewrite_failure,
+            hit_count: hits.len() as i64,
+            latency_ms: latency_ms as i64,
+            domain,
+            candidate_empty_initial: relax.candidate_empty_initial,
+            relaxation_attempted: relax.relaxation_attempted,
+            relaxation_succeeded: relax.relaxation_succeeded,
+        })
     }
 }
 
-/// SQL 字符串字面量（防注入；本模块仅用于日志写入的参数内联）。
-/// SQL string literal (injection-safe; used here only to inline log parameters).
-fn sq(v: &str) -> String {
-    format!("'{}'", v.replace('\'', "''"))
-}
-
-/// 当前 Unix 秒。
-/// Current Unix seconds.
-fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+// SQL 字符串字面量与内联日志写入已随 Step 6 批2 迁往
+// `kernel::sqlite::insert_query_log`（参数绑定 + 返回 log_id，query_engine
+// 保持不直接写 SQL 的分工）。
+// The SQL string literals and the inlined log write moved to
+// `kernel::sqlite::insert_query_log` in Step 6 batch 2 (parameter binding plus
+// the returned log_id; query_engine keeps its no-direct-SQL role).

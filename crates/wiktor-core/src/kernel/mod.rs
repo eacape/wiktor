@@ -30,11 +30,34 @@ mod qdrant_vector;
 // (spec step5 §4.1). Batch 3 adds the runtime load entry load_active_qug and
 // the stale stable prefix.
 pub mod qug_store;
+// pub：Step 6 批1 反馈闭环存储层（insert_feedback_idempotent / load_feedback_window /
+// list_reviews 与契约类型单源定义；偏差 STEP6-003：不引入第二连接栈，SQLite 实现
+// 按仓库模式落 kernel，`wiktor-feedback` 只持有 FeedbackStore trait 与 re-export）。
+// pub: the Step 6 batch-1 feedback-loop storage layer (insert_feedback_idempotent /
+// load_feedback_window / list_reviews plus the single-source contract types;
+// deviation STEP6-003: no second connection stack — the SQLite implementation
+// lands in the kernel per the repo pattern, and `wiktor-feedback` only carries
+// the FeedbackStore trait plus re-exports).
+pub mod feedback_store;
 mod sqlite;
 
 pub use mock_vector::MockVectorStore;
 pub use qug_store::{build_and_publish_qug, load_active_qug, QugStore, QUG_STALE_PREFIX};
 pub use sqlite::SqliteKernel;
+// Step 6 批1 契约类型在 kernel 层再导出（wiktor-feedback 全量 re-export 为 §6 面；
+// 批3 追加 ReviewSuggestionInput，批4 追加 ReviewOutcome，批5 追加
+// FeedbackRejectionReason）。
+// Step 6 batch-1 contract types re-exported at kernel level (wiktor-feedback
+// re-exports them fully as the §6 surface; batch 3 adds ReviewSuggestionInput,
+// batch 4 adds ReviewOutcome, batch 5 adds FeedbackRejectionReason).
+pub use feedback_store::{
+    FeedbackEvent, FeedbackEventInput, FeedbackIngested, FeedbackKind, FeedbackRejectionReason,
+    QueryLogSnapshot, ReviewItem, ReviewOutcome, ReviewStatus, ReviewSuggestionInput,
+};
+// Step 6 批2：查询日志写入口（QueryEngine 用）——载荷类型与 domain 缺省常量。
+// Step 6 batch 2: the query-log write entry (used by the QueryEngine) — the
+// payload type and the default-domain constant.
+pub use sqlite::{QueryLogInsert, DEFAULT_QUERY_LOG_DOMAIN};
 
 #[cfg(feature = "vector-qdrant")]
 pub use qdrant_vector::QdrantVectorStore;

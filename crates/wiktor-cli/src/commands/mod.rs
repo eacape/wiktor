@@ -8,7 +8,7 @@
 //! converge into [`Error::InvalidConfig`] so they take the config-error exit
 //! code 3).
 //!
-//! 退出码（D7，build/eval 统一）：
+//! 退出码（D7，build/eval/feedback 统一；feedback 的空报告/无建议同为 0）：
 //! - 0 成功（包括 `qug_decision=disabled`——QUG 无收益不是失败）；
 //! - 1 运行失败：`source_changed`、stale、查询失败、数据库故障、报告写盘失败等；
 //! - 2 CLI 用法错误：参数缺失/越界（clap 自身的解析错误也以 2 退出）；
@@ -21,7 +21,8 @@
 //! `contains` 匹配内核稳定前缀（[`SOURCE_CHANGED_PREFIX`]/
 //! [`QUG_STALE_PREFIX`]），绝不解析其余正文。
 //!
-//! Exit codes (D7, shared by build/eval):
+//! Exit codes (D7, shared by build/eval/feedback; a feedback empty report / no
+//! suggestions is a 0 too):
 //! - 0 success (including `qug_decision=disabled` — a no-gain QUG is not a
 //!   failure);
 //! - 1 run failure: `source_changed`, stale, query failure, database faults,
@@ -40,6 +41,7 @@
 //! message is never parsed.
 
 pub mod eval;
+pub mod feedback;
 pub mod qug;
 
 use std::path::Path;

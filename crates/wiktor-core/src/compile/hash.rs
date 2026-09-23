@@ -27,6 +27,7 @@ use crate::compile::config::{CompilePolicy, COMPILE_TEMPERATURE};
 use crate::traits::EntitySchema;
 use crate::types::error::{Error, Result};
 use crate::types::{CompileContext, RawEntity};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -228,6 +229,30 @@ pub(crate) fn schema_to_value(schema: &EntitySchema) -> Value {
     serde_json::json!({
         "entity_type": schema.entity_type,
         "fields": fields,
+    })
+}
+
+/// `schema_to_value` 的逆变换（Step6 批4：approve_review 从 supplemental subject
+/// 的 `dependencies_json`（与 compile_tasks.dependencies_json 同形状）还原
+/// EntitySchema 以复用 admission）。形状漂移即 Validation——绝不猜造字段。
+/// Inverse of `schema_to_value` (Step6 batch 4: approve_review restores the
+/// EntitySchema from the supplemental subject's `dependencies_json` — the same
+/// shape as compile_tasks.dependencies_json — to reuse admission). Shape drift
+/// is Validation — fields are never fabricated.
+pub(crate) fn schema_from_value(value: &Value) -> Result<EntitySchema> {
+    #[derive(Deserialize)]
+    struct SchemaMirror {
+        entity_type: String,
+        fields: Vec<crate::types::FieldDefinition>,
+    }
+    let mirror: SchemaMirror = serde_json::from_value(value.clone()).map_err(|e| {
+        Error::Validation(format!(
+            "knowledge_schema is not a valid EntitySchema value: {e}"
+        ))
+    })?;
+    Ok(EntitySchema {
+        entity_type: mirror.entity_type,
+        fields: mirror.fields,
     })
 }
 

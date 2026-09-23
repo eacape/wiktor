@@ -15,3 +15,10 @@ mod query_log;
 pub mod tasks;
 
 pub use migrations::{migrate, schema_version};
+
+// 连接级 busy timeout pragma（spec step6 §9；kernel establish 与 migrate 共用，
+// 避免两处字面量漂移）。crate 内使用，不对外暴露。
+// The connection-level busy-timeout pragma (spec step6 §9; shared by the kernel
+// establish and migrate so the literal cannot drift between the two sites).
+// Crate-internal use, not part of the public API.
+pub(crate) use migrations::BUSY_TIMEOUT_PRAGMA_SQL;

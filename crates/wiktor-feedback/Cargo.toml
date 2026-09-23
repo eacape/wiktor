@@ -1,0 +1,32 @@
+[package]
+name = "wiktor-feedback"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 仅依赖 core（偏差 STEP6-003：SQLite 实现单源在 core kernel；禁止 core 反向依赖
+# feedback，禁止依赖 wiktor-server）。
+# Depends on core only (deviation STEP6-003: the SQLite implementation lives
+# single-source in the core kernel; core never depends back on feedback, and
+# wiktor-server is never a dependency here).
+wiktor-core = { path = "../wiktor-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 偏差 STEP6-006：spec §4 的依赖清单漏列 blake3，但 §6 要求 report_hash 为
+# canonical JSON 的 BLAKE3；报告模型在 feedback 层，哈希函数随层落在本 crate，
+# 不把 feedback 的报告格式知识推回 core。
+# Deviation STEP6-006: the spec §4 dependency list omits blake3, but §6 requires
+# report_hash to be a BLAKE3 over canonical JSON; the report model lives in the
+# feedback layer, so the hash lands here instead of pushing feedback report
+# knowledge back into core.
+blake3 = { workspace = true }
+async-trait = "0.1"
+tracing = { workspace = true }
+
+[dev-dependencies]
+# 报告落盘原子性测试（A13：临时文件 + rename 无残留）。
+# Report atomicity tests (A13: temp file + rename with no leftovers).
+tempfile = { workspace = true }

@@ -1,0 +1,46 @@
+[package]
+name = "wiktor-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 依赖边界（A1 / spec step6 §4）：core（存储与反馈实现）+ feedback（FeedbackStore
+# trait 契约面，server → feedback 单向允许）；core/feedback 均不得反向依赖本 crate。
+# Dependency boundaries (A1 / spec step6 §4): core (storage + feedback impl) plus
+# feedback (the FeedbackStore trait contract face; the one-way server → feedback
+# edge is allowed); neither core nor feedback may depend back on this crate.
+wiktor-core = { path = "../wiktor-core" }
+wiktor-feedback = { path = "../wiktor-feedback" }
+
+# HTTP 面（spec step6 §3 D2）：axum 0.7 + tokio 多线程 runtime；tower 0.5 仅
+# 使用 axum 传递层能力（本 crate 直接依赖以便后续 middleware 扩展）；serde
+# derive + serde_json 解析请求体；tracing 服务端日志；blake3 生成 key 标签
+# （原文不进标签/日志/指标，D8）。
+# HTTP surface (spec step6 §3 D2): axum 0.7 + tokio multi-thread runtime; tower
+# 0.5 only uses axum's transitive layer capabilities (declared directly for
+# future middleware extensions); serde derive + serde_json parse request
+# bodies; tracing for server-side logs; blake3 derives key labels (raw secrets
+# never enter labels/logs/metrics, D8).
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+# tower oneshot + http-body-util：离线（不联网）的 router 请求/响应驱动，验证
+# A5–A8/A17。
+# tower oneshot + http-body-util: offline (no network) router request/response
+# driving, verifying A5–A8/A17.
+tower = { workspace = true, features = ["util"] }
+http-body-util = { workspace = true }
+
+# 并发 smoke（Step 6 批7 / A18）：同库临时文件 + 两连接（server/CLI 角色）。
+# Concurrency smoke (Step 6 batch 7 / A18): a temp file DB + two connections
+# (server / CLI roles).
+tempfile = { workspace = true }
