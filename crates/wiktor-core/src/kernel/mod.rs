@@ -49,6 +49,12 @@ mod sqlite;
 // module, so the return type of the public method
 // SqliteKernel::recover_compile_leases must be nameable.
 pub use compile_store::RecoveryStats;
+// 真实嵌入实验：accepted 页向量构建读取面的返回类型（供 CLI `vector build`
+// 消费；compile_store 是 pub(crate) 模块，公开方法的返回类型必须可命名）。
+// Real-embedding experiment: the return type of the accepted-page vector-build
+// read surface (consumed by the CLI `vector build`; compile_store is a
+// pub(crate) module, so the public method's return type must be nameable).
+pub use compile_store::AcceptedPageVector;
 pub use mock_vector::MockVectorStore;
 pub use qug_store::{build_and_publish_qug, load_active_qug, QugStore, QUG_STALE_PREFIX};
 pub use sqlite::SqliteKernel;

@@ -394,6 +394,37 @@ struct CompatTaskRow {
     dependencies_json: String,
 }
 
+/// 页面向量构建行（真实嵌入实验：accepted 页的 embedding 载荷所需六列）。
+/// Row for vector-index building (real-embedding experiment: the six columns an
+/// embedding payload needs from an accepted page).
+#[derive(QueryableByName)]
+struct AcceptedPageVectorRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    page_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    title: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    content: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    content_hash: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    generation: i64,
+}
+
+/// 页面向量构建行的公开载体（含生成代数，供 `wiktor vector build` 使用）。
+/// Public carrier for vector-build rows (with the generation, consumed by
+/// `wiktor vector build`).
+pub struct AcceptedPageVector {
+    pub page_id: String,
+    pub entity_id: String,
+    pub title: String,
+    pub content: String,
+    pub content_hash: String,
+    pub generation: u64,
+}
+
 /// list_published_pages 行（Step 4 §10：向量 worker 的稳定键读取接口）。
 /// Row for `list_published_pages` (Step 4 §10: the stable-key reader for the
 /// future vector worker).
@@ -2693,6 +2724,43 @@ impl SqliteKernel {
         .bind::<diesel::sql_types::Text, _>(&payload)
         .load(&mut *conn)?;
         Ok(rows.into_iter().map(|r| r.page_id).collect())
+    }
+
+    /// 页面向量索引构建读取面（真实嵌入实验）：某 domain 全部 accepted 页的
+    /// embedding 载荷六列（page_id/entity_id/title/content/content_hash/
+    /// generation）。纯 SELECT，一次连接锁、无事务、无写入；`page_id` 序稳定，
+    /// 向量索引确定性可复现。generation 取自 pages 表自身，与
+    /// [`validate_vector_payloads`] 的 staleness 校验同源（payload 的
+    /// generation 必须等于该页的 `pages.generation` 才不会被判 stale）。
+    /// Vector-index build read surface (real-embedding experiment): the six
+    /// embedding-payload columns (page_id/entity_id/title/content/content_hash/
+    /// generation) of every accepted page of a domain. A pure SELECT — one
+    /// connection lock, no transaction, no writes; stable `page_id` order keeps
+    /// the vector index deterministically reproducible. The generation comes
+    /// from the pages table itself, the same source as the
+    /// [`validate_vector_payloads`] staleness check (a payload's generation must
+    /// equal the page's `pages.generation` or it is dropped as stale).
+    pub fn accepted_page_vectors(&self, domain: &str) -> Result<Vec<AcceptedPageVector>> {
+        let mut conn = self.lock_conn()?;
+        let rows: Vec<AcceptedPageVectorRow> = diesel::sql_query(
+            "SELECT page_id, entity_id, title, content, content_hash, generation
+             FROM pages
+             WHERE domain = ? AND status = 'accepted'
+             ORDER BY page_id",
+        )
+        .bind::<diesel::sql_types::Text, _>(domain)
+        .load(&mut *conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AcceptedPageVector {
+                page_id: r.page_id,
+                entity_id: r.entity_id,
+                title: r.title,
+                content: r.content,
+                content_hash: r.content_hash,
+                generation: r.generation.max(0) as u64,
+            })
+            .collect())
     }
 
     // ===== Step8 批 B5：兼容 preflight 读取面（§6.4/D10/D11；只读）=====

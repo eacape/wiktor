@@ -39,6 +39,8 @@
 pub mod compile;
 pub mod data;
 mod db_schema;
+#[cfg(feature = "embedding-http")]
+pub mod embedding;
 pub mod eval;
 pub mod kernel;
 pub mod query_engine;

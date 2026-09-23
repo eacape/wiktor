@@ -37,6 +37,16 @@ vector-qdrant = ["dep:qdrant-client"]
 # tokio is already a non-optional base dependency and cannot appear in the feature
 # list. CLI feature forwarding lands in a later batch.
 llm-openai = ["dep:async-openai", "dep:reqwest"]
+# embedding-http：真实嵌入客户端（OpenAI 兼容 /embeddings，默认阿里 MaaS
+# qwen3.7-text-embedding-flash）。与 llm-openai 共用 reqwest/rustls 栈与
+# API_KEY_ENV 兜底，因此透传 llm-openai；key/端点/模型全走环境变量（见
+# src/embedding/mod.rs）。
+# embedding-http: the real embedding client (OpenAI-compatible /embeddings,
+# default Aliyun MaaS qwen3.7-text-embedding-flash). It shares the
+# reqwest/rustls stack and the API_KEY_ENV fallback with llm-openai, so it
+# forwards that feature; key/endpoint/model come from env vars (see
+# src/embedding/mod.rs).
+embedding-http = ["dep:reqwest", "llm-openai"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

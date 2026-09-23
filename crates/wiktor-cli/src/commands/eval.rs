@@ -179,11 +179,15 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
     // —— The three-tier evaluation (fairness is the runner's contract; per-query
     //    errors summarize into one run failure while stale/Internal/database
     //    errors fail immediately — all through the classifier → 1/4) ——
-    let embedder: Arc<dyn QueryEmbedder> = Arc::new(embed::DeterministicEmbedder::new(embed::DIM));
+    let (embedder, dim) = match resolve_embedder(args.no_qdrant).await {
+        Ok(ed) => ed,
+        Err(e) => return Ok(report_error(command, e)),
+    };
     let outcome = if args.no_qdrant {
         run_with_mock(
             kernel.clone(),
             embedder,
+            dim,
             &config,
             &intents_bytes,
             &golden,
@@ -194,6 +198,7 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
         run_with_qdrant(
             kernel.clone(),
             embedder,
+            dim,
             &config,
             &intents_bytes,
             &golden,
@@ -218,6 +223,44 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
     Ok(EXIT_OK)
 }
 
+/// 解析评测嵌入器与维度：
+/// - `--no-qdrant`：恒为确定性嵌入器（768 维，离线可复现）；
+/// - 真实 qdrant 路径 + `embedding-http` feature + 环境变量给出嵌入配置 →
+///   `HttpEmbedder`（维度从首次响应探测，不硬编码）；
+/// - 其余（无 feature 或无 env）→ 确定性嵌入器（768 维）。
+///
+/// Resolves the evaluation embedder and dimension:
+/// - `--no-qdrant`: always the deterministic embedder (768-dim, reproducible
+///   offline);
+/// - real qdrant + `embedding-http` feature + env-configured embedding → the
+///   `HttpEmbedder` (dimension probed from the first response, never
+///   hard-coded);
+/// - everything else (no feature / no env) → the deterministic embedder
+///   (768-dim).
+async fn resolve_embedder(no_qdrant: bool) -> wiktor_core::Result<(Arc<dyn QueryEmbedder>, usize)> {
+    #[cfg(feature = "embedding-http")]
+    {
+        use wiktor_core::embedding::{HttpEmbedder, EMBEDDING_API_KEY_ENV, EMBEDDING_BASE_URL_ENV};
+        let env_configured = !no_qdrant
+            && (std::env::var(EMBEDDING_BASE_URL_ENV).is_ok()
+                || std::env::var(EMBEDDING_API_KEY_ENV)
+                    .map(|k| !k.trim().is_empty())
+                    .unwrap_or(false));
+        if env_configured {
+            let embedder = Arc::new(HttpEmbedder::from_env()?);
+            // 探测维度（首次 embed 响应长度；阿里 MaaS qwen 嵌入维度不硬编码）。
+            // Probe the dimension (the first response's vector length; the Aliyun
+            // MaaS qwen embedding dimension is never hard-coded).
+            let dim = embedder.embed("\u{0}dimension-probe").await?.len();
+            return Ok((embedder, dim));
+        }
+    }
+    Ok((
+        Arc::new(embed::DeterministicEmbedder::new(embed::DIM)),
+        embed::DIM,
+    ))
+}
+
 /// `--no-qdrant`：Mock VectorStore + 空集合（向量路 0 命中、RRF 退 FTS，离线
 /// 可复现）。
 /// `--no-qdrant`: a Mock VectorStore over an empty collection (the vector path
@@ -225,6 +268,7 @@ pub async fn run(args: EvalArgs) -> Result<i32> {
 async fn run_with_mock(
     kernel: Arc<SqliteKernel>,
     embedder: Arc<dyn QueryEmbedder>,
+    dim: usize,
     config: &DomainConfig,
     intents_bytes: &[u8],
     golden: &GoldenSet,
@@ -232,7 +276,7 @@ async fn run_with_mock(
 ) -> wiktor_core::Result<EvalOutcome> {
     let store = Arc::new(MockVectorStore::new());
     store
-        .ensure_collection(&eval_config.collection, embed::DIM, DistanceMetric::Cosine)
+        .ensure_collection(&eval_config.collection, dim, DistanceMetric::Cosine)
         .await?;
     run_evaluation(
         kernel,
@@ -248,13 +292,17 @@ async fn run_with_mock(
 
 /// qdrant 路径：地址/密钥来自 `$WIKTOR_QDRANT_URL` / `$WIKTOR_QDRANT_API_KEY`
 /// （默认 http://127.0.0.1:6334），与 `vector ping` 同源；连接/集合错误 →
-/// 运行失败（退出码 1）。
+/// 运行失败（退出码 1）。维度取 embedder 实际维度（真实嵌入动态
+/// 探测；确定性嵌入器恒定 768）。
 /// The qdrant path: address/key come from `$WIKTOR_QDRANT_URL` /
 /// `$WIKTOR_QDRANT_API_KEY` (default http://127.0.0.1:6334), same sources as
-/// `vector ping`; connection/collection errors are run failures (exit 1).
+/// `vector ping`; connection/collection errors are run failures (exit 1). The
+/// dimension comes from the embedder (dynamic for real embeddings; fixed at
+/// 768 for the deterministic one).
 async fn run_with_qdrant(
     kernel: Arc<SqliteKernel>,
     embedder: Arc<dyn QueryEmbedder>,
+    dim: usize,
     config: &DomainConfig,
     intents_bytes: &[u8],
     golden: &GoldenSet,
@@ -266,10 +314,10 @@ async fn run_with_qdrant(
     let store = Arc::new(QdrantVectorStore::from_config(
         &url,
         api_key.as_deref(),
-        embed::DIM,
+        dim,
     )?);
     store
-        .ensure_collection(&eval_config.collection, embed::DIM, DistanceMetric::Cosine)
+        .ensure_collection(&eval_config.collection, dim, DistanceMetric::Cosine)
         .await?;
     run_evaluation(
         kernel,

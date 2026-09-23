@@ -29,8 +29,14 @@ tracing-subscriber = { workspace = true }
 # llm-openai: forwards to the same-named wiktor-core feature (spec §12 steps 6/7);
 # the CLI enables it by default; without it `--provider openai/ollama` errors
 # explicitly while mock runs offline (A23).
-default = ["llm-openai"]
+default = ["llm-openai", "embedding-http"]
 llm-openai = ["wiktor-core/llm-openai"]
+# embedding-http：转发真实嵌入客户端（真实效果实验；key/端点/模型走环境变量）。
+# CLI 默认开启；`vector build` 在无该 feature 时自动退化为确定性嵌入器。
+# embedding-http: forwards the real embedding client (real-backend experiment;
+# key/endpoint/model come from env vars). Enabled by default; `vector build`
+# degrades to the deterministic embedder without it.
+embedding-http = ["wiktor-core/embedding-http"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

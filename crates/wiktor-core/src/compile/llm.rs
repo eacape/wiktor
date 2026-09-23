@@ -54,7 +54,7 @@
 
 use crate::compile::config::CompilePolicy;
 use crate::compile::contract::{
-    decode_response, system_prompt, CompileEvidence, CompileFailure, TokenUsage, MAX_RESPONSE_BYTES,
+    decode_response, CompileEvidence, CompileFailure, TokenUsage, MAX_RESPONSE_BYTES,
 };
 use crate::seed::split_sections;
 use crate::traits::Compiler;
@@ -122,16 +122,29 @@ pub struct OpenAiLlmClient {
     base_url: String,
     api_key: Option<String>,
     http: reqwest::Client,
+    /// 兼容网关关闭思考模式的开关（qwen 系网关的 `chat_template_kwargs` 扩展）。
+    /// Switch to disable thinking mode on compatible gateways (the qwen-family
+    /// `chat_template_kwargs` extension).
+    disable_thinking: bool,
 }
 
 impl OpenAiLlmClient {
     /// 构造适配器：`base_url`/`api_key` 缺省时按 `ollama` 取默认端点；key 只从
     /// 显式参数或 [`API_KEY_ENV`] 解析（§4），ollama 不需要 key。每次 complete
     /// 恰好一次 HTTP 请求（见模块注释的单请求语义）。
+    /// `WIKTOR_LLM_DISABLE_THINKING=1` 时对兼容网关附加
+    /// `chat_template_kwargs: {"enable_thinking": false}`（实验验证：goaichat
+    /// 的 qwen3.8-max 强制思考、content 恒空，关闭后正常返回；标准 OpenAI 端点
+    /// 不设置此变量以免被拒）。
     /// Builds the adapter: missing `base_url`/`api_key` fall back to the
     /// `ollama`-selected defaults; the key resolves only from the explicit
     /// argument or [`API_KEY_ENV`] (§4); ollama needs none. Every complete does
     /// exactly one HTTP request (see single-request semantics in the module doc).
+    /// With `WIKTOR_LLM_DISABLE_THINKING=1` the adapter attaches
+    /// `chat_template_kwargs: {"enable_thinking": false}` to compatible gateways
+    /// (experimentally verified: goaichat's qwen3.8-max forces thinking with an
+    /// always-empty content; disabling it restores normal output; standard OpenAI
+    /// endpoints leave this unset to avoid rejection).
     pub fn new(
         model: impl Into<String>,
         base_url: Option<String>,
@@ -144,6 +157,9 @@ impl OpenAiLlmClient {
             None => OPENAI_BASE_URL.to_string(),
         };
         let api_key = api_key.or_else(|| std::env::var(API_KEY_ENV).ok());
+        let disable_thinking = std::env::var("WIKTOR_LLM_DISABLE_THINKING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         let http = reqwest::Client::builder()
             // 请求级 timeout 由 LlmRequest.timeout_seconds 覆盖；这里兜底 90s。
             // Per-request timeout comes from LlmRequest.timeout_seconds; 90s is
@@ -156,6 +172,7 @@ impl OpenAiLlmClient {
             base_url,
             api_key,
             http,
+            disable_thinking,
         })
     }
 
@@ -285,10 +302,19 @@ fn parse_http_date(value: &str) -> Option<i64> {
 
 /// 拼装 Chat Completions 请求体（SDK wire 类型；供应商 DTO 不越过适配器）。
 /// `model` 为请求最终使用的模型标识（request.model 为空时回退到 client 默认）。
+/// `disable_thinking` 为 true 时对兼容网关附加 `chat_template_kwargs` 扩展
+/// （qwen 系思考模式关闭；标准 OpenAI 端点为 false 以避免拒收）。
 /// Builds the Chat Completions body (SDK wire types; vendor DTOs never leave
 /// the adapter). `model` is the final model id (falls back to the client
-/// default when request.model is empty).
-fn build_request_body(request: &LlmRequest, model: &str) -> Result<Vec<u8>> {
+/// default when request.model is empty). With `disable_thinking` the body gains
+/// the `chat_template_kwargs` extension for compatible gateways (disabling the
+/// qwen-family thinking mode; standard OpenAI endpoints keep it false to avoid
+/// rejection).
+fn build_request_body(
+    request: &LlmRequest,
+    model: &str,
+    disable_thinking: bool,
+) -> Result<Vec<u8>> {
     // `max_tokens` 在 OpenAI 侧标记 deprecated，但为 ollama 等本地兼容端点的
     // 最大公约数，此处显式 allow；JSON object 模式 + 本地 serde 强校验兜底。
     // `max_tokens` is deprecated on OpenAI but remains the lowest common
@@ -312,7 +338,21 @@ fn build_request_body(request: &LlmRequest, model: &str) -> Result<Vec<u8>> {
         .response_format(ResponseFormat::JsonObject)
         .build()
         .map_err(|e| Error::Internal(format!("llm request build failed: {e}")))?;
-    Ok(serde_json::to_vec(&body)?)
+    let mut value = serde_json::to_value(&body)?;
+    if disable_thinking {
+        // 兼容网关（阿里 MaaS / kimitk / goaichat 的 qwen 系）思考模式关闭：
+        // `thinking: {"type":"disabled"}` 实测稳定关闭（reasoning_tokens=0、
+        // content 完整、entity_id 不再截断；6/6 有效）；SDK wire 类型无此字段，
+        // 故在序列化后的 JSON 值上追加，标准 OpenAI 端点为 false 不带此字段。
+        // Compatible-gateway thinking-mode off (Aliyun MaaS / kimitk / goaichat
+        // qwen families): `thinking: {"type":"disabled"}` experimentally turns it
+        // off reliably (reasoning_tokens=0, full content, no entity_id
+        // truncation; 6/6 valid); the SDK wire type lacks this field so it is
+        // appended to the serialized JSON value, and standard OpenAI endpoints
+        // keep it unset via false.
+        value["thinking"] = serde_json::json!({ "type": "disabled" });
+    }
+    Ok(serde_json::to_vec(&value)?)
 }
 
 /// 流式读取响应正文，硬上限 `MAX_RESPONSE_BYTES`（§4：≤128 KiB）。
@@ -357,14 +397,15 @@ impl LlmClient for OpenAiLlmClient {
         } else {
             request.model.clone()
         };
-        let body = build_request_body(&request, &model).map_err(|e| match e {
-            Error::Serialization(inner) => CompileFailure::Permanent {
-                code: format!("REQUEST_SERIALIZATION:{inner}"),
-            },
-            other => CompileFailure::Permanent {
-                code: format!("REQUEST_BUILD:{other}"),
-            },
-        })?;
+        let body =
+            build_request_body(&request, &model, self.disable_thinking).map_err(|e| match e {
+                Error::Serialization(inner) => CompileFailure::Permanent {
+                    code: format!("REQUEST_SERIALIZATION:{inner}"),
+                },
+                other => CompileFailure::Permanent {
+                    code: format!("REQUEST_BUILD:{other}"),
+                },
+            })?;
         let timeout = if request.timeout_seconds == 0 {
             DEFAULT_TIMEOUT_SECONDS
         } else {
@@ -460,8 +501,16 @@ impl Compiler for LlmCompiler {
             let value = serde_json::to_value(&raw)?;
             serde_json::to_string(&value)?
         };
+        // 用 ctx.prompt_template（CLI build_context 已把 compile.prompt 或内置
+        // system_prompt() 填入；此处不再硬编码 system_prompt()，使自定义 prompt
+        // 真正生效并参与 content_hash——见 hash.rs prompt_template 域）。
+        // Use ctx.prompt_template (CLI build_context already fills it with the
+        // domain compile.prompt or the built-in system_prompt(); here we stop
+        // hard-coding system_prompt() so a custom prompt actually takes effect
+        // and joins the content_hash — see the prompt_template domain in
+        // hash.rs).
         let request = LlmRequest {
-            system: system_prompt(),
+            system: ctx.prompt_template.clone(),
             input_json,
             model: ctx.model_version.clone(),
             max_output_tokens: self.policy.max_output_tokens,
@@ -538,6 +587,7 @@ impl Compiler for LlmCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compile::contract::system_prompt;
     use crate::types::{CompileContext, EntityId};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -783,7 +833,7 @@ mod tests {
             max_output_tokens: 256,
             timeout_seconds: 60,
         };
-        let body = build_request_body(&request, "test-model").unwrap();
+        let body = build_request_body(&request, "test-model", false).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["model"], "test-model");
         assert_eq!(value["temperature"], 0.0);
@@ -792,6 +842,29 @@ mod tests {
         assert_eq!(value["messages"][0]["role"], "system");
         assert_eq!(value["messages"][1]["role"], "user");
         assert_eq!(value["messages"][1]["content"], "{\"a\":1}");
+    }
+
+    // disable_thinking 时请求体带 thinking 关闭扩展（qwen 兼容网关）。
+    // With disable_thinking the request body carries the thinking-off extension
+    // (qwen-compatible gateways).
+    #[test]
+    fn request_body_attaches_thinking_off_extension() {
+        let request = LlmRequest {
+            system: "SYS".into(),
+            input_json: "{\"a\":1}".into(),
+            model: "test-model".into(),
+            max_output_tokens: 256,
+            timeout_seconds: 60,
+        };
+        let body = build_request_body(&request, "test-model", true).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["thinking"]["type"], serde_json::json!("disabled"));
+        let body = build_request_body(&request, "test-model", false).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value.get("thinking").is_none(),
+            "standard OpenAI body must not carry the extension"
+        );
     }
 
     // OpenAiLlmClient 构造：端点选择与缺 key 判定（不改环境变量）。

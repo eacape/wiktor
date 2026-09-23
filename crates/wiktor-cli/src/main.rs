@@ -151,6 +151,38 @@ enum VectorCommand {
         #[arg(long, env = "WIKTOR_QDRANT_API_KEY")]
         api_key: Option<String>,
     },
+    /// Embed accepted pages and upsert them into the vector store (builds the
+    /// vector index; real embeddings via the embedding-http feature or the
+    /// deterministic local baseline).
+    /// 把 accepted 页面嵌入并写入向量库（构建向量索引；真实嵌入走
+    /// embedding-http feature，本地基线用确定性嵌入器）。
+    Build {
+        /// domain.yaml path (mandatory)
+        /// domain.yaml 路径（必填）
+        #[arg(long)]
+        domain: PathBuf,
+        /// SQLite database path (default ./wiktor.db)
+        /// SQLite 数据库路径（默认 ./wiktor.db）
+        #[arg(long, default_value = "wiktor.db")]
+        db: PathBuf,
+        /// Vector collection name (default: the domain name from domain.yaml)
+        /// 向量 collection 名（默认 domain.yaml 的域名）
+        #[arg(long)]
+        collection: Option<String>,
+        /// Max pages to embed (default: all accepted pages)
+        /// 最多嵌入页数（默认全部 accepted 页）
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Use the deterministic local embedder instead of the real HTTP
+        /// embedder (offline; useful for tests).
+        /// 用确定性本地嵌入器代替真实 HTTP 嵌入器（离线；测试用）。
+        #[arg(long)]
+        deterministic: bool,
+        /// Emit a single JSON summary on stdout.
+        /// stdout 输出单个 JSON 摘要。
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[tokio::main]
@@ -196,6 +228,24 @@ async fn main() -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!(e.to_string()))?;
                 println!("qdrant ok: {}", health.version);
+            }
+            VectorCommand::Build {
+                domain,
+                db,
+                collection,
+                limit,
+                deterministic,
+                json,
+            } => {
+                cmd_vector_build(
+                    &domain,
+                    &db,
+                    collection.as_deref(),
+                    limit,
+                    deterministic,
+                    json,
+                )
+                .await?
             }
         },
         Command::Compile(args) => {
@@ -318,6 +368,141 @@ pub(crate) async fn cmd_seed(
         started.elapsed()
     );
     Ok(())
+}
+
+/// Build the vector index: embed every accepted page of the domain and upsert
+/// into the vector store. Real embeddings come from the HTTP embedder
+/// (embedding-http feature, env-configured) unless `--deterministic` forces
+/// the local token-hash baseline.
+/// 构建向量索引：把域内全部 accepted 页嵌入并写入向量库。默认走真实 HTTP
+/// 嵌入器（embedding-http feature，环境变量配置）；`--deterministic` 强制用
+/// 本地 token-hash 基线（离线）。
+async fn cmd_vector_build(
+    domain_yaml: &Path,
+    db: &Path,
+    collection_override: Option<&str>,
+    limit: Option<usize>,
+    deterministic: bool,
+    json: bool,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let yaml_text = std::fs::read_to_string(domain_yaml)
+        .with_context(|| format!("read {}", domain_yaml.display()))?;
+    let config: DomainConfig =
+        serde_yaml_ng::from_str(&yaml_text).map_err(|e| anyhow!("parse domain.yaml: {e}"))?;
+    let collection = collection_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| config.name.clone());
+    let kernel = SqliteKernel::open(db)?;
+
+    // —— embedder：真实 HTTP（embedding-http feature）或确定性基线 ——
+    // —— embedder: the real HTTP one (embedding-http feature) or the
+    //    deterministic baseline ——
+    #[cfg(feature = "embedding-http")]
+    let embedder: Arc<dyn wiktor_core::QueryEmbedder> = if deterministic {
+        Arc::new(embed::DeterministicEmbedder::new(embed::DIM))
+    } else {
+        Arc::new(wiktor_core::embedding::HttpEmbedder::from_env()?)
+    };
+    #[cfg(not(feature = "embedding-http"))]
+    let embedder: Arc<dyn wiktor_core::QueryEmbedder> =
+        Arc::new(embed::DeterministicEmbedder::new(embed::DIM));
+
+    let pages = kernel.accepted_page_vectors(&config.name)?;
+    let pages: Vec<wiktor_core::kernel::AcceptedPageVector> = match limit {
+        Some(n) => pages.into_iter().take(n).collect(),
+        None => pages,
+    };
+    if pages.is_empty() {
+        println!("vector build: no accepted pages for domain {}", config.name);
+        return Ok(());
+    }
+
+    // —— 首次嵌入探测维度 → 建 collection（维度与 generation 对齐
+    //    validate_vector_payloads 的 stale 校验）——
+    // —— Probe the dimension on the first embed → ensure the collection
+    //    (the dimension and generation align with the validate_vector_payloads
+    //    staleness check) ——
+    let first_text = embed_text(&pages[0]);
+    let dim = embedder.embed(&first_text).await?.len();
+
+    // qdrant 地址/key 与 vector ping 同源（环境变量）。CLI 恒开
+    // vector-qdrant feature（wiktor-core 依赖带上），store 恒为 QdrantVectorStore。
+    // The qdrant address/key share the same env sources as `vector ping`. The CLI
+    // always enables the vector-qdrant feature (via the wiktor-core dependency),
+    // so the store is always QdrantVectorStore.
+    let url =
+        std::env::var("WIKTOR_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6334".to_string());
+    let api_key = std::env::var("WIKTOR_QDRANT_API_KEY").ok();
+    let store = Arc::new(wiktor_core::QdrantVectorStore::from_config(
+        &url,
+        api_key.as_deref(),
+        dim,
+    )?);
+
+    store
+        .ensure_collection(&collection, dim, DistanceMetric::Cosine)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    let mut upserted = 0usize;
+    let mut points = Vec::new();
+    for (idx, page) in pages.iter().enumerate() {
+        let text = if idx == 0 {
+            first_text.clone()
+        } else {
+            embed_text(page)
+        };
+        let vector = embedder.embed(&text).await?;
+        // point id 必须是 UUID（Step1 约定：BLAKE3 派生，防 page_id 非 UUID 撞
+        // qdrant 校验）；与向量重建/幂等覆盖同源同式。
+        // The point id must be a UUID (the Step1 convention: BLAKE3-derived, so
+        // non-UUID page_ids never trip qdrant validation); the same source and
+        // shape as vector rebuild/idempotent overwrite.
+        let entity = wiktor_core::types::EntityId::from_key(&page.entity_id)?;
+        let point_id =
+            wiktor_core::QdrantVectorStore::point_id(&entity, "summary", page.generation);
+        points.push(wiktor_core::traits::VectorPoint {
+            id: point_id,
+            vector,
+            metadata: wiktor_core::traits::VectorMetadata {
+                entity_id: page.entity_id.clone(),
+                page_id: page.page_id.clone(),
+                chunk_type: wiktor_core::traits::ChunkType::Summary,
+                content_hash: page.content_hash.clone(),
+                generation: page.generation,
+            },
+        });
+        upserted += 1;
+    }
+    store
+        .upsert(&collection, &points)
+        .await
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+
+    if json {
+        let summary = serde_json::json!({
+            "collection": collection,
+            "pages": upserted,
+            "dimension": dim,
+            "embedder": if deterministic { "deterministic" } else { "http" },
+            "backend": "qdrant",
+        });
+        println!("{summary}");
+    } else {
+        println!(
+            "vector build: collection={collection} pages={upserted} dimension={dim} elapsed={:?}",
+            started.elapsed()
+        );
+    }
+    Ok(())
+}
+
+/// 页面向量嵌入文本（title + body，与查询侧 terms 拼接同一素材面）。
+/// The text embedded per page (title + body; the same material surface as the
+/// query-side term join).
+fn embed_text(page: &wiktor_core::kernel::AcceptedPageVector) -> String {
+    format!("{}\n{}", page.title, page.content)
 }
 
 /// Search through the QueryEngine: QUG rewrite (optional) → filter pushdown →
