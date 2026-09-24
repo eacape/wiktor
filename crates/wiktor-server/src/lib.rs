@@ -75,6 +75,7 @@ mod tests;
 pub mod grpc;
 pub mod http_search;
 pub mod services;
+pub mod worker;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

@@ -145,4 +145,196 @@ mod tests {
             resp.log_id
         );
     }
+
+    // B4：Compile.Admit 只写任务不调模型；Compile.Status 返回 pending 快照。
+    // 用临时目录里的单实体 domain.yaml + jsonl（离线，无网络）。
+    // B4: Compile.Admit only writes tasks and never calls a model; Compile.Status
+    // returns the pending snapshot. Uses a temp-dir single-entity domain.yaml +
+    // jsonl (offline, no network).
+    #[tokio::test]
+    async fn compile_admit_and_status_roundtrip() {
+        use crate::grpc::v1::compile_server::Compile;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("domain.yaml"),
+            r#"name: milk-tea
+version: "0.1.0"
+entities:
+  - name: drink
+    source: jsonl://data.jsonl
+    id_field: entity_id
+    type_field: category
+    fields:
+      - { name: name, field_type: text, filterable: false }
+      - { name: description, field_type: text, filterable: false }
+      - { name: category, field_type: text, filterable: false }
+      - { name: price, field_type: numeric, filterable: false }
+compile:
+  quality_threshold: 0.75
+  knowledge_fields: [name, description]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("data.jsonl"),
+            "{\"entity_id\": \"milk-tea:drink:test\", \"name\": \"珍珠奶茶\", \
+             \"description\": \"红茶底配 Q 弹珍珠。\", \"category\": \"milk-tea:drink:test\", \
+             \"price\": 19.0, \"source_revision\": 1}\n",
+        )
+        .unwrap();
+        let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+        let svc = crate::services::compile::CompileService::new(kernel.clone());
+        let domain_pack = dir
+            .path()
+            .join("domain.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let resp = svc
+            .admit(tonic::Request::new(v1::CompileAdmitRequest {
+                domain: "milk-tea".into(),
+                source_path: "jsonl://data.jsonl".into(),
+                source_format: "jsonl".into(),
+                domain_pack_path: domain_pack,
+                domain_pack_version: "0.1.0".into(),
+                force: false,
+                max_entities: 0,
+                options_json: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let summary = resp.summary.unwrap();
+        assert_eq!(summary.scanned, 1);
+        assert_eq!(summary.admitted, 1);
+        assert_eq!(summary.task_ids.len(), 1);
+        assert!(!summary.run_id.is_empty());
+        let task_id = summary.task_ids[0];
+        let st = svc
+            .status(tonic::Request::new(v1::CompileStatusRequest {
+                task_id,
+                domain: "milk-tea".into(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(st.task_id, task_id);
+        assert_eq!(st.entity_id, "milk-tea:drink:test");
+        assert_eq!(st.status, "pending");
+        assert_eq!(st.attempt_count, 0);
+        // 不存在的任务 → NOT_FOUND。
+        // An unknown task → NOT_FOUND.
+        let not_found = svc
+            .status(tonic::Request::new(v1::CompileStatusRequest {
+                task_id: 99_999,
+                domain: String::new(),
+            }))
+            .await;
+        assert_eq!(not_found.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    // B4：worker 消费 pending 任务并发布（MockCompiler 离线；轮询至终态）。
+    // B4: the worker consumes pending tasks and publishes (MockCompiler offline;
+    // polls until terminal).
+    #[tokio::test]
+    async fn compile_worker_consumes_and_publishes() {
+        use crate::grpc::v1::compile_server::Compile;
+
+        let dir = tempfile::tempdir().unwrap();
+        let domain_yaml = r#"name: milk-tea
+version: "0.1.0"
+entities:
+  - name: drink
+    source: jsonl://data.jsonl
+    id_field: entity_id
+    type_field: category
+    fields:
+      - { name: name, field_type: text, filterable: false }
+      - { name: description, field_type: text, filterable: false }
+      - { name: category, field_type: text, filterable: false }
+      - { name: price, field_type: numeric, filterable: false }
+compile:
+  quality_threshold: 0.75
+  knowledge_fields: [name, description]
+"#;
+        std::fs::write(dir.path().join("domain.yaml"), domain_yaml).unwrap();
+        std::fs::write(
+            dir.path().join("data.jsonl"),
+            "{\"entity_id\": \"milk-tea:drink:test\", \"name\": \"珍珠奶茶\", \
+             \"description\": \"红茶底配 Q 弹珍珠。\", \"category\": \"milk-tea:drink:test\", \
+             \"price\": 19.0, \"source_revision\": 1}\n",
+        )
+        .unwrap();
+
+        let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+        let svc = crate::services::compile::CompileService::new(kernel.clone());
+        let domain_pack = dir
+            .path()
+            .join("domain.yaml")
+            .to_string_lossy()
+            .into_owned();
+        let admitted = svc
+            .admit(tonic::Request::new(v1::CompileAdmitRequest {
+                domain: "milk-tea".into(),
+                source_path: "jsonl://data.jsonl".into(),
+                source_format: "jsonl".into(),
+                domain_pack_path: domain_pack.clone(),
+                domain_pack_version: "0.1.0".into(),
+                force: false,
+                max_entities: 0,
+                options_json: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let task_id = admitted.summary.unwrap().task_ids[0];
+
+        // 与 Admit 同源装配 worker（STEP7-002：同一 domain.yaml → 同一 policy/
+        // schema → content_hash 一致，publish fencing 通过）。
+        // Assemble the worker from the same source as Admit (STEP7-002: same
+        // domain.yaml → same policy/schema → content_hash matches, publish
+        // fencing passes).
+        let worker = crate::worker::CompileWorker::from_domain_pack(
+            kernel.clone(),
+            &domain_pack,
+            Some("jsonl://data.jsonl"),
+            Some("0.1.0"),
+            "",
+        )
+        .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = worker.spawn(cancel.clone());
+
+        // 轮询 Status 直到终态（非 pending/running），最多 10s。
+        // Poll Status until terminal (not pending/running), up to 10s.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut terminal: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            let st = svc
+                .status(tonic::Request::new(v1::CompileStatusRequest {
+                    task_id,
+                    domain: String::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            if st.status == "succeeded" || st.status == "failed" || st.status == "dead" {
+                terminal = Some(st.status);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        cancel.cancel();
+        let _ = handle.await;
+        assert_eq!(
+            terminal.as_deref(),
+            Some("succeeded"),
+            "MockCompiler must publish"
+        );
+        // 发布后该实体的 accepted 页存在（worker 走 publish_compile 的真实事务）。
+        // After publish, the entity's accepted page exists (the worker ran the
+        // real publish_compile transaction).
+        let pages = kernel.list_published_pages("milk-tea").unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].0, "milk-tea:drink:test");
+    }
 }

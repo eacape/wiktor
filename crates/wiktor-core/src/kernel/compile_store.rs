@@ -366,6 +366,69 @@ struct ArtifactJsonRow {
     artifact_json: String,
 }
 
+/// 编译任务状态快照行（Step7 B4 Compile.Status 只读查询）。
+/// A compile-task status-snapshot row (Step7 B4, the read-only Compile.Status
+/// query).
+#[derive(QueryableByName)]
+struct CompileStatusRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    task_id: i64,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    result: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    attempt_count: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    retry_count: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    recompile_count: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    error_message: Option<String>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    updated_at: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
+    lease_expires_at: Option<i64>,
+}
+
+/// 编译任务对外状态快照（Step7 B4 Compile.Status；server 只读消费，不持有
+/// SQLite 连接泄漏——纯值类型）。
+/// The public compile-task status snapshot (Step7 B4 Compile.Status; consumed
+/// read-only by the server, never holding the SQLite connection — a pure value
+/// type).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileTaskStatus {
+    pub task_id: i64,
+    pub entity_id: String,
+    pub status: String,
+    pub result: Option<String>,
+    pub attempt_count: u32,
+    pub retry_count: u32,
+    pub recompile_count: u32,
+    pub error_message: Option<String>,
+    pub updated_at: i64,
+    pub lease_expires_at: Option<i64>,
+}
+
+impl From<CompileStatusRow> for CompileTaskStatus {
+    fn from(r: CompileStatusRow) -> Self {
+        CompileTaskStatus {
+            task_id: r.task_id,
+            entity_id: r.entity_id,
+            status: r.status,
+            result: r.result,
+            attempt_count: r.attempt_count.max(0) as u32,
+            retry_count: r.retry_count.max(0) as u32,
+            recompile_count: r.recompile_count.max(0) as u32,
+            error_message: r.error_message,
+            updated_at: r.updated_at,
+            lease_expires_at: r.lease_expires_at,
+        }
+    }
+}
+
 /// compatibility_page_identities 行（Step8 批 B5 §6.4：身份四列只读投影）。
 /// Row for `compatibility_page_identities` (Step8 batch B5 §6.4: a read-only
 /// projection of the four identity columns).
@@ -2665,6 +2728,40 @@ impl SqliteKernel {
             .into_iter()
             .map(|r| (r.page_id, r.generation, r.content_hash, r.embedding_model))
             .collect())
+    }
+
+    /// 按 task_id 读取编译任务状态快照（Step7 B4 Compile.Status 只读接口；
+    /// A12/A15 轮询形状）。任务不存在返回 None。
+    /// Reads the compile-task status snapshot by task_id (the Step7 B4
+    /// Compile.Status read-only interface; the A12/A15 polling shape). Returns
+    /// None when the task does not exist.
+    pub fn compile_task_status(&self, task_id: i64) -> Result<Option<CompileTaskStatus>> {
+        use diesel::prelude::*;
+        let mut conn = self.lock_conn()?;
+        let rows: Vec<CompileStatusRow> = diesel::sql_query(
+            "SELECT task_id, entity_id, status, result, attempt_count, retry_count,
+                    recompile_count, error_message, updated_at, lease_expires_at
+             FROM compile_tasks
+             WHERE task_id = ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(task_id)
+        .load(&mut *conn)?;
+        Ok(rows.into_iter().next().map(CompileTaskStatus::from))
+    }
+
+    /// 列出到期的 pending 编译任务 ID，供常驻 CompileWorker 批量 claim。
+    /// Lists due pending compile-task IDs for the resident CompileWorker to claim.
+    pub fn list_due_compile_task_ids(&self, now: i64, limit: u32) -> Result<Vec<i64>> {
+        let mut conn = self.lock_conn()?;
+        let rows: Vec<TaskIdRow> = diesel::sql_query(
+            "SELECT task_id FROM compile_tasks
+             WHERE status = 'pending' AND next_attempt_at <= ? AND retry_count < max_retries
+             ORDER BY next_attempt_at, task_id LIMIT ?",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(now)
+        .bind::<diesel::sql_types::BigInt, _>(i64::from(limit.max(1)))
+        .load(&mut *conn)?;
+        Ok(rows.into_iter().map(|r| r.task_id).collect())
     }
 
     /// 向量 payload 批量校验（§10 必要边界修复）：返回仍有效的 page_id 集合。
@@ -5047,5 +5144,34 @@ mod tests {
         assert_eq!(task_state(&kernel, task_a).status, "dead");
         assert_eq!(task_state(&kernel, task_b).status, "pending");
         assert_eq!(count(&kernel, "review_queue"), 1);
+    }
+
+    // Step7 B4 的 compile_task_status：admit 后 pending 快照字段齐全；不存在的
+    // task_id 返回 None；claim 后 attempt_count 可见。
+    // Step7 B4 compile_task_status: a post-admit pending snapshot carries all
+    // fields; an unknown task_id yields None; attempt_count is visible post-claim.
+    #[test]
+    fn compile_task_status_snapshot_roundtrip() {
+        let kernel = SqliteKernel::open_in_memory().unwrap();
+        let p = prepared_with(1, &policy());
+        let task_id = queued(&kernel, &p);
+        let snap = kernel.compile_task_status(task_id).unwrap().unwrap();
+        assert_eq!(snap.task_id, task_id);
+        assert_eq!(snap.entity_id, "milk-tea:drink:boba");
+        assert_eq!(snap.status, "pending");
+        assert_eq!(snap.attempt_count, 0);
+        assert!(snap.result.is_none());
+        assert!(snap.error_message.is_none());
+
+        let lease = kernel
+            .claim_compile(&[task_id], "run-1", 1000)
+            .unwrap()
+            .unwrap();
+        let after = kernel.compile_task_status(task_id).unwrap().unwrap();
+        assert_eq!(after.status, "running");
+        assert!(after.lease_expires_at.is_some());
+        assert_eq!(lease.task_id, task_id);
+
+        assert!(kernel.compile_task_status(99_999).unwrap().is_none());
     }
 }

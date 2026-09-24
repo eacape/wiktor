@@ -163,9 +163,18 @@ pub struct PipelineExecutor {
 /// Scheduling outcome of one lease: finalized (already counted) or retrying
 /// with backoff (stays queued).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LeaseOutcome {
+pub enum LeaseOutcome {
     Finalized,
     RetryAt(i64),
+}
+
+/// Step7 B4 `admit_batch` 的结果：admission 统计 + 入队的 task_ids（worker 消费）。
+/// The `admit_batch` outcome (Step7 B4): admission stats plus the queued
+/// task_ids (consumed by the worker).
+#[derive(Debug, Clone)]
+pub struct AdmitOutcome {
+    pub stats: CompileStats,
+    pub task_ids: Vec<i64>,
 }
 
 impl PipelineExecutor {
@@ -397,6 +406,113 @@ impl PipelineExecutor {
                 .await?;
         }
         Ok(stats)
+    }
+
+    /// Step7 B4 窄接口（spec step7 §3 D5 / STEP7-002）：单个已 claim 租约的全
+    /// 流程处理（compile → validate → score → publish/failure + 心跳/fencing +
+    /// 预算/刹车/死信）。供 server `CompileWorker` 消费队列时复用 `run` 的
+    /// 同一内部逻辑（`process_lease`），禁止在 server 复制发布/失败 SQL。
+    /// `schema` 由调用方提供（worker 从 EntityConfig 构造，无需 DataSource）；
+    /// stats 计数为 run 级，本接口内部使用临时统计、不暴露。
+    /// Step7 B4 narrow interface (spec step7 §3 D5 / STEP7-002): the full
+    /// processing of one already-claimed lease (compile → validate → score →
+    /// publish/failure + heartbeat/fencing + budget/brake/dead-letter). Lets
+    /// the server `CompileWorker` reuse the exact internal logic of `run`
+    /// (`process_lease`) when consuming the queue — the server must never copy
+    /// publish/failure SQL. The caller supplies `schema` (the worker builds it
+    /// from an `EntityConfig`, without a `DataSource`); stats are run-level, so
+    /// this interface uses a throwaway `CompileStats` internally.
+    pub async fn process_claimed_task(
+        &self,
+        lease: crate::compile::config::TaskLease,
+        schema: &crate::traits::EntitySchema,
+    ) -> Result<LeaseOutcome> {
+        let mut stats = CompileStats::default();
+        self.process_lease(&lease, schema, &mut stats).await
+    }
+
+    /// Step7 B4 只 admission 入口（spec step7 §3 D4/D5）：扫描数据源、做兼容
+    /// preflight 与投影，调用 `kernel.admit_compile` 把实体入队，**不 claim、
+    /// 不调模型**。返回 admitted task_ids 供常驻 CompileWorker 异步消费。
+    /// 复用 `run` 的同一 admission 语义（preflight/预算/去重/force），不复制 SQL。
+    /// Step7 B4 admit-only entry (spec step7 §3 D4/D5): scans the source, runs the
+    /// compatibility preflight and projection, and calls `kernel.admit_compile`
+    /// to queue entities — **no claim, no model call**. Returns the admitted
+    /// task_ids for the resident CompileWorker to consume asynchronously. Reuses
+    /// the exact admission semantics of `run` (preflight/budget/dedup/force)
+    /// without copying SQL.
+    pub async fn admit_batch(
+        &self,
+        source: &dyn crate::traits::DataSource,
+        ctx: &CompileContext,
+        options: crate::compile::config::RunOptions,
+    ) -> Result<AdmitOutcome> {
+        self.policy.validate()?;
+        options.validate()?;
+        let schema = source.schema();
+        let mut stats = CompileStats {
+            run_id: format!("{}-admit", self.clock.unix_seconds()),
+            ..CompileStats::default()
+        };
+        let mut task_ids: Vec<i64> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut offset = 0usize;
+        let mut remaining = options.limit;
+        let mut compat_checked = false;
+        loop {
+            let requested = remaining.min(options.batch_size);
+            let batch = source
+                .fetch(Some(Cursor {
+                    offset,
+                    batch_size: requested,
+                }))
+                .await?;
+            enforce_fetch_protocol(&batch, requested)?;
+            if batch.is_empty() {
+                break;
+            }
+            remaining -= batch.len();
+            offset += batch.len();
+            if !compat_checked {
+                compat_checked = true;
+                self.run_compatibility_preflight(&batch[0].id.domain, ctx, false)
+                    .await?;
+            }
+            for raw in batch {
+                stats.scanned += 1;
+                let key = raw.id.to_key();
+                if !seen.insert(key) {
+                    stats.skipped += 1;
+                    continue;
+                }
+                let prepared = match prepare_source(&raw, &schema, &self.policy) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        stats.failed += 1;
+                        continue;
+                    }
+                };
+                let kernel = self.kernel.clone();
+                let ctx_clone = ctx.clone();
+                let policy = self.policy.clone();
+                let schema_clone = schema.clone();
+                let force = options.force;
+                match blocking(move || {
+                    kernel.admit_compile(&prepared, &ctx_clone, &policy, &schema_clone, force)
+                })
+                .await?
+                {
+                    Admission::Queued(task_id) => task_ids.push(task_id),
+                    Admission::Skipped => stats.skipped += 1,
+                    Admission::Deferred => stats.deferred += 1,
+                    Admission::Rejected(_) => stats.failed += 1,
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
+        Ok(AdmitOutcome { stats, task_ids })
     }
 
     /// dry-run（§9）：只读配置/源/现有 DB，算 hash/计划；不写事实/任务、

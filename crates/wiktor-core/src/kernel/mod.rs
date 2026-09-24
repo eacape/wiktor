@@ -55,6 +55,10 @@ pub use compile_store::RecoveryStats;
 // read surface (consumed by the CLI `vector build`; compile_store is a
 // pub(crate) module, so the public method's return type must be nameable).
 pub use compile_store::AcceptedPageVector;
+// Step7 B4（spec step7 §3 D5/A15）：Compile.Status 的快照类型公开给 server。
+// Step7 B4 (spec step7 §3 D5/A15): the Compile.Status snapshot type is exposed
+// to the server.
+pub use compile_store::CompileTaskStatus;
 pub use mock_vector::MockVectorStore;
 pub use qug_store::{build_and_publish_qug, load_active_qug, QugStore, QUG_STALE_PREFIX};
 pub use sqlite::SqliteKernel;
