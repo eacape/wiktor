@@ -2883,6 +2883,7 @@ dependencies = [
  "tracing-subscriber",
  "wiktor-core",
  "wiktor-feedback",
+ "wiktor-server",
 ]
 
 [[package]]

@@ -337,4 +337,53 @@ compile:
         assert_eq!(pages.len(), 1);
         assert_eq!(pages[0].0, "milk-tea:drink:test");
     }
+
+    // B5：Review.List/Ignore 往返；reviewer 来自认证 label，不由客户端传入。
+    // B5: Review.List/Ignore roundtrip; the reviewer comes from the auth label,
+    // never from the client.
+    #[tokio::test]
+    async fn review_list_and_ignore_roundtrip() {
+        use crate::auth::AuthedKey;
+        use crate::grpc::v1::review_server::Review;
+        use std::collections::BTreeSet;
+        use wiktor_core::kernel::ReviewSuggestionInput;
+
+        let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+        let ids = kernel
+            .insert_review_suggestions(
+                "milk-tea",
+                &[ReviewSuggestionInput {
+                    action: "ignore".into(),
+                    source_log_ids_json: "[1]".into(),
+                    subject_json: r#"{"normalized_query":"boba"}"#.into(),
+                    reason_json: r#"{"signal":"zero_recall"}"#.into(),
+                    created_at: 1000,
+                }],
+            )
+            .unwrap();
+        let svc = crate::services::review::ReviewService::new(kernel);
+        let listed = svc
+            .list(tonic::Request::new(v1::ReviewListRequest {
+                domain: "milk-tea".into(),
+                status: "pending".into(),
+                limit: 10,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(listed.items.len(), 1);
+        let mut request = tonic::Request::new(v1::ReviewDecisionRequest {
+            review_id: ids[0],
+            domain: "milk-tea".into(),
+        });
+        request.extensions_mut().insert(AuthedKey {
+            domain: "milk-tea".into(),
+            label: "reviewer-label".into(),
+            methods: BTreeSet::from(["review".to_string()]),
+        });
+        let ignored = svc.ignore(request).await.unwrap().into_inner();
+        let item = ignored.item.unwrap();
+        assert_eq!(item.status, "ignored");
+        assert_eq!(item.reviewed_by, "reviewer-label");
+    }
 }

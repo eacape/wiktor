@@ -74,6 +74,7 @@ mod tests;
 // depends on this module (§1 non-goal).
 pub mod grpc;
 pub mod http_search;
+pub mod serve;
 pub mod services;
 pub mod worker;
 

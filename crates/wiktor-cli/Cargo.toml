@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 wiktor-core = { path = "../wiktor-core", features = ["vector-qdrant"] }
 wiktor-feedback = { path = "../wiktor-feedback" }
+wiktor-server = { path = "../wiktor-server", optional = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -37,6 +38,7 @@ llm-openai = ["wiktor-core/llm-openai"]
 # key/endpoint/model come from env vars). Enabled by default; `vector build`
 # degrades to the deterministic embedder without it.
 embedding-http = ["wiktor-core/embedding-http"]
+server = ["dep:wiktor-server"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -116,6 +116,26 @@ enum Command {
         #[command(subcommand)]
         command: commands::feedback::FeedbackCommand,
     },
+    /// Start the HTTP + gRPC server (requires the `server` feature).
+    /// 启动 HTTP + gRPC 双监听服务（需要 `server` feature）。
+    #[cfg(feature = "server")]
+    Serve {
+        /// SQLite database path.
+        #[arg(long, default_value = "wiktor.db")]
+        db: PathBuf,
+        /// HTTP listen address.
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen_http: String,
+        /// gRPC listen address.
+        #[arg(long, default_value = "127.0.0.1:50051")]
+        listen_grpc: String,
+        /// Domain pack path used by the compile worker.
+        #[arg(long)]
+        domain: Option<PathBuf>,
+        /// Optional jsonl source override.
+        #[arg(long)]
+        source: Option<String>,
+    },
     /// Domain-pack operations (Step 8): read-only compatibility preflight.
     /// 领域包操作（Step 8）：只读兼容 preflight。
     Domain {
@@ -261,6 +281,24 @@ async fn main() -> Result<()> {
         Command::Eval(args) => finish(commands::eval::run(args).await?)?,
         Command::Feedback { command } => finish(commands::feedback::run(command).await?)?,
         Command::Domain { command } => finish(commands::domain::run(command).await?)?,
+        #[cfg(feature = "server")]
+        Command::Serve {
+            db,
+            listen_http,
+            listen_grpc,
+            domain,
+            source,
+        } => {
+            wiktor_server::serve::run_server(wiktor_server::serve::ServeOptions {
+                db,
+                listen_http,
+                listen_grpc,
+                domain_pack: domain,
+                source_path: source,
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
+        }
     }
     Ok(())
 }

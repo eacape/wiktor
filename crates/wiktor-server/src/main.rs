@@ -16,8 +16,6 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use wiktor_server::state::{ApiKeys, ServerState};
-
 struct Args {
     db: PathBuf,
     listen: String,
@@ -68,22 +66,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), String> {
     let args = parse_args(std::env::args().skip(1))?;
-    let keys = ApiKeys::from_env().map_err(|e| e.to_string())?;
-    // 打开即迁移（本批任务：server 启动时 migrate）。
-    // Open implies migrate (this batch's task: migrate at server startup).
-    let kernel = std::sync::Arc::new(
-        wiktor_core::SqliteKernel::open(&args.db)
-            .map_err(|e| format!("open database {}: {e}", args.db.display()))?,
-    );
-    let state = std::sync::Arc::new(ServerState::new(kernel, keys));
-    let router = wiktor_server::build_router(state);
-    let listener = tokio::net::TcpListener::bind(&args.listen)
-        .await
-        .map_err(|e| format!("bind {}: {e}", args.listen))?;
-    // 无 subscriber 时为 no-op；嵌入方可自行安装 tracing-subscriber。
-    // A no-op without a subscriber; embedders can install tracing-subscriber.
-    tracing::info!(listen = %args.listen, "wiktor-server listening");
-    axum::serve(listener, router)
-        .await
-        .map_err(|e| format!("server error: {e}"))
+    wiktor_server::serve::run_server(wiktor_server::serve::ServeOptions {
+        db: args.db,
+        listen_http: args.listen,
+        listen_grpc: std::env::var("WIKTOR_GRPC_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".into()),
+        domain_pack: std::env::var("WIKTOR_DOMAIN_PACK")
+            .ok()
+            .map(std::path::PathBuf::from),
+        source_path: std::env::var("WIKTOR_SOURCE_PATH").ok(),
+    })
+    .await
 }
