@@ -1,0 +1,33 @@
+# Wiktor Step9 — litestream S3/阿里 OSS 模板（spec step9 §4.2 A3/A12，D6）。
+# Wiktor Step9 — litestream S3 / Alibaba OSS template (spec step9 §4.2 A3/A12, D6).
+#
+# 默认禁用：需要用户拥有 bucket/endpoint/credentials 并显式验证后才启用。
+# 本文件永不保存真密钥；credentials 经环境变量/凭据机制注入（root 管理的
+# EnvironmentFile 或扩展变量）。只启用唯一实际配置的目标（A3/A12）。
+# Disabled by default: requires the user to own a bucket/endpoint/credentials and
+# to explicitly verify before enabling. This file never holds real secrets;
+# credentials come via env-var expansion or a root-managed environment file.
+# Only the single actually-configured target is enabled (A3/A12).
+#
+# 它引用的变量必须由运行环境注入，例如：
+# Variables referenced here must be injected at runtime, e.g.:
+#   LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY
+# schema 已对照 v0.5.17 实测（STEP9-013）：sync-interval 是 db 级键。
+# Schema verified against v0.5.17 (STEP9-013): sync-interval is a db-level key.
+dbs:
+  - path: /srv/wiktor/data/wiktor.db
+    sync-interval: 1s
+    replicas:
+      # —— 通用 S3 / 云厂商 S3-compatible ——
+      # —— generic S3 / cloud S3-compatible ——
+      - url: s3://MY_BUCKET/wiktor
+        access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+        snapshot-interval: 1h
+        retention: 168h
+      # —— 阿里云 OSS（litestream 原生支持；替换为真实 bucket/endpoint）——
+      # —— Alibaba Cloud OSS (natively supported; replace bucket/endpoint) ——
+      # - url: oss://MY_BUCKET/wiktor
+      #   endpoint: oss-cn-hangzhou.aliyuncs.com
+      #   access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+      #   secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}

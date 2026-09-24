@@ -1,0 +1,36 @@
+# Wiktor Step9 — litestream SFTP 副本模板（spec step9 §4.2 A3/A5，D4/D5）。
+# Wiktor Step9 — litestream SFTP replica template (spec step9 §4.2 A3/A5, D4/D5).
+#
+# 生产首选目标（用户 Mac 开启 Remote Login 且可达时）：Linux → Mac 持续复制，
+# 数据落在独立故障域。启用前必须完成：远端目录预建、专用账号最小权限、
+# host-key 校验（禁止 StrictHostKeyChecking=no）、密钥由 root 环境文件注入。
+# Preferred production target (when the user's Mac has Remote Login enabled and
+# is reachable): Linux → Mac continuous replication to a separate failure
+# domain. Before enabling: pre-create the remote dir, least-privilege dedicated
+# account, host-key verification (never StrictHostKeyChecking=no), secrets via
+# the root environment file.
+#
+# 凭据注入（D8）：litestream 从进程环境读取 SFTP 密码，因此把 secret 放进
+# systemd 的 EnvironmentFile=/etc/wiktor/litestream.env（root:root 0600），
+# 例如：
+#   LITESTREAM_PASS=my-sftp-password
+# Credential injection (D8): litestream reads the SFTP password from the process
+# environment, so secrets go in the systemd EnvironmentFile=/etc/wiktor/
+# litestream.env (root:root 0600). For example:
+#   LITESTREAM_PASS=my-sftp-password
+# schema 已对照 v0.5.17 实测（STEP9-013）：sync-interval 是 db 级键；SFTP 对象键
+# type/host/port/path/user/password 均被 v0.5.17 接受。
+# Schema verified against v0.5.17 (STEP9-013): sync-interval is a db-level key;
+# the SFTP object keys type/host/port/path/user/password are all accepted.
+dbs:
+  - path: /srv/wiktor/data/wiktor.db
+    sync-interval: 1s
+    replicas:
+      - type: sftp
+        host: 192.168.1.100
+        port: 22
+        path: /Users/wiktor-backup/litestream
+        user: wiktor-ls
+        password: ${LITESTREAM_PASS}
+        snapshot-interval: 1h
+        retention: 168h

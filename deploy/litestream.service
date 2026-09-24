@@ -1,0 +1,34 @@
+# Wiktor Step9 — litestream systemd unit（spec step9 §4.2 A6，D9）。
+# Wiktor Step9 — litestream systemd unit (spec step9 §4.2 A6, D9).
+#
+# 部署前核对：User/Group 与运行 Wiktor 的账号一致；ReadWritePaths 覆盖
+# 数据库 WAL 目录与 file replica 目标；SFTP 私钥/known_hosts 经 ReadOnlyPaths
+# 显式允许（权限 0600）。改配置或 unit 后执行：
+#   systemctl daemon-reload && systemctl enable --now litestream
+# Before deploying: align User/Group with the account running Wiktor; let
+# ReadWritePaths cover the DB/WAL dir and the file-replica target; allow SFTP
+# key/known_hosts via ReadOnlyPaths (mode 0600). After changes:
+#   systemctl daemon-reload && systemctl enable --now litestream
+[Unit]
+Description=Litestream continuous SQLite replication for Wiktor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wiktor
+Group=wiktor
+EnvironmentFile=-/etc/wiktor/litestream.env
+ExecStart=/usr/local/bin/litestream replicate -config /etc/litestream.yml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/backup/wiktor/litestream /srv/wiktor/data
+# SFTP 凭据/known_hosts（按需放开，权限必须为 root/账号 0600）：
+# ReadOnlyPaths=/home/wiktor/.ssh/id_ed25519 /home/wiktor/.ssh/known_hosts
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,25 @@
+# Wiktor Step9 — litestream file:// 副本配置样例（spec step9 §4.2 A3，D4）。
+# Wiktor Step9 — litestream file:// replica config sample (spec step9 §4.2 A3, D4).
+#
+# 可运行的 file:// 样例：把 SQLite WAL 持续复制到本地/挂载盘目录。
+# Runs as-is with file://: continuously replicates the SQLite WAL to a local /
+# mounted directory.
+#
+# 注意（D5）：同盘 file:// 只能承载演练与短期副本，不抵御整盘损坏；生产首选
+# 远端 SFTP（见 litestream.sftp.example.yml）或独立挂载盘。
+# Note (D5): a same-disk file:// replica carries drills and short-term copies
+# only — it does not survive whole-disk loss; production prefers remote SFTP
+# (litestream.sftp.example.yml) or a separately mounted volume.
+#
+# schema 已对照 v0.5.17 实测（STEP9-013）：sync-interval 是 db 级键，控制实际
+# 同步频率；snapshot-interval / retention 是 replica 级键。
+# Schema verified against v0.5.17 (STEP9-013): sync-interval is a db-level key
+# controlling the actual sync frequency; snapshot-interval / retention are
+# replica-level keys.
+dbs:
+  - path: /srv/wiktor/data/wiktor.db
+    sync-interval: 1s
+    replicas:
+      - url: file:///srv/backup/wiktor/litestream
+        snapshot-interval: 1h
+        retention: 168h
