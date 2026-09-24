@@ -32,31 +32,48 @@
 //! - Uses the same reqwest stack (rustls) as `compile/llm.rs`; no second HTTP
 //!   client is introduced.
 
+#[cfg(feature = "embedding-http")]
 use crate::query_engine::QueryEmbedder;
+#[cfg(feature = "embedding-http")]
 use crate::types::error::{Error, Result};
+#[cfg(feature = "embedding-http")]
 use async_trait::async_trait;
+#[cfg(feature = "embedding-http")]
 use std::sync::Mutex;
+#[cfg(feature = "embedding-http")]
 use std::time::Duration;
+
+/// 确定性本地基线（Step7 迁入共享；离线测试与无嵌入配置时的 embedder）。
+/// The deterministic local baseline (moved in for sharing under Step7; the
+/// embedder for offline tests and no-embedding-config setups).
+pub mod deterministic;
 
 /// key 的环境变量名（唯一来源；缺省兜底 `WIKTOR_OPENAI_API_KEY`）。
 /// The env name for the key (sole source; falls back to `WIKTOR_OPENAI_API_KEY`).
+#[cfg(feature = "embedding-http")]
 pub const EMBEDDING_API_KEY_ENV: &str = "WIKTOR_EMBEDDING_API_KEY";
 /// 端点的环境变量名（OpenAI 兼容 base url）。
 /// The env name for the endpoint (OpenAI-compatible base url).
+#[cfg(feature = "embedding-http")]
 pub const EMBEDDING_BASE_URL_ENV: &str = "WIKTOR_EMBEDDING_BASE_URL";
 /// 模型名的环境变量名。
 /// The env name for the model id.
+#[cfg(feature = "embedding-http")]
 pub const EMBEDDING_MODEL_ENV: &str = "WIKTOR_EMBEDDING_MODEL";
 /// 默认端点（阿里云 MaaS 兼容模式；实验时经环境变量覆盖）。
 /// Default endpoint (Aliyun MaaS compatible mode; overridden via env at run time).
+#[cfg(feature = "embedding-http")]
 pub const DEFAULT_EMBEDDING_BASE_URL: &str = "https://api.openai.com/v1";
 /// 默认模型（qwen3.7-text-embedding-flash，2026-09 实验拍板）。
 /// Default model (qwen3.7-text-embedding-flash, decided 2026-09 for the
 /// real-backend experiment).
+#[cfg(feature = "embedding-http")]
 pub const DEFAULT_EMBEDDING_MODEL: &str = "qwen3.7-text-embedding-flash";
 
-/// OpenAI 兼容 `/embeddings` 的 HTTP 嵌入器。
-/// HTTP embedder for the OpenAI-compatible `/embeddings` endpoint.
+/// OpenAI 兼容 `/embeddings` 的 HTTP 嵌入器（`embedding-http` feature）。
+/// HTTP embedder for the OpenAI-compatible `/embeddings` endpoint (the
+/// `embedding-http` feature).
+#[cfg(feature = "embedding-http")]
 pub struct HttpEmbedder {
     model: String,
     base_url: String,
@@ -67,6 +84,7 @@ pub struct HttpEmbedder {
     dim: Mutex<Option<usize>>,
 }
 
+#[cfg(feature = "embedding-http")]
 impl HttpEmbedder {
     /// 构造：`base_url`/`api_key`/`model` 缺省时全部从环境变量读取。
     /// Builds the embedder; missing `base_url`/`api_key`/`model` are read from
@@ -119,6 +137,7 @@ impl HttpEmbedder {
     }
 }
 
+#[cfg(feature = "embedding-http")]
 #[async_trait]
 impl QueryEmbedder for HttpEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
@@ -165,17 +184,19 @@ impl QueryEmbedder for HttpEmbedder {
 
 /// `/embeddings` 响应（只取所需字段；未知字段忽略）。
 /// `/embeddings` response (only the fields needed; unknown fields are ignored).
+#[cfg(feature = "embedding-http")]
 #[derive(Debug, serde::Deserialize)]
 struct EmbeddingResponse {
     data: Vec<EmbeddingDatum>,
 }
 
+#[cfg(feature = "embedding-http")]
 #[derive(Debug, serde::Deserialize)]
 struct EmbeddingDatum {
     embedding: Vec<f32>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "embedding-http"))]
 mod tests {
     use super::*;
     use serde_json::json;

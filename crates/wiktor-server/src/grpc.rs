@@ -17,9 +17,9 @@ pub mod v1 {
 /// Registers the six services on a tonic Router, each bound to its method
 /// permission's interceptor (Step7 §3.1 method-permission mapping + D3 shared
 /// semantics).
-pub fn router(
+pub fn router<V: wiktor_core::traits::VectorStore + 'static>(
     keys: crate::state::ApiKeys,
-    search: crate::services::search::SearchService,
+    search: crate::services::search::SearchService<V>,
     compile: crate::services::compile::CompileService,
     qug: crate::services::qug_build::QugBuildService,
     review: crate::services::review::ReviewService,
@@ -58,6 +58,8 @@ pub fn router(
 #[cfg(test)]
 mod tests {
     use super::v1;
+    use std::sync::Arc;
+    use wiktor_core::{MockVectorStore, SqliteKernel};
 
     // A1：proto 生成代码可用，六 service server 类型存在（字段号稳定由 proto
     // 文件本身保证，任何字段号复用都会在 tonic-prost-build 报错）。
@@ -72,34 +74,75 @@ mod tests {
             filters_json: String::new(),
             top_k: 5,
         };
-        let _ =
-            v1::search_server::SearchServer::new(crate::services::search::SearchService::default());
         let _ = v1::compile_server::CompileServer::new(
             crate::services::compile::CompileService::default(),
         );
-        let _ = v1::qug_build_server::QugBuildServer::new(
-            crate::services::qug_build::QugBuildService::default(),
-        );
         let _ =
             v1::review_server::ReviewServer::new(crate::services::review::ReviewService::default());
-        let _ = v1::compatibility_server::CompatibilityServer::new(
-            crate::services::compatibility::CompatibilityService::default(),
-        );
-        let _ =
-            v1::status_server::StatusServer::new(crate::services::status::StatusService::default());
     }
 
-    // A2：空壳 service 的未知实现返回 UNIMPLEMENTED（B1 占位语义）。
-    // A2: the shell service returns UNIMPLEMENTED (the B1 placeholder
-    // semantics).
+    // B3：Status 服务在内存 kernel 上返回 schema 版本 + 行数（A17 形状）。
+    // B3: the Status service returns the schema version + row counts over an
+    // in-memory kernel (the A17 shape).
     #[tokio::test]
-    async fn shell_search_returns_unimplemented() {
-        use crate::grpc::v1::search_server::Search;
-        let svc = crate::services::search::SearchService::default();
-        let err = svc
-            .search(tonic::Request::new(v1::SearchRequest::default()))
+    async fn status_service_returns_schema_and_rows() {
+        use crate::grpc::v1::status_server::Status;
+        let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+        let svc = crate::services::status::StatusService::new(kernel);
+        let resp = svc
+            .get(tonic::Request::new(v1::StatusRequest {}))
             .await
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+            .unwrap()
+            .into_inner();
+        assert!(resp.healthy);
+        assert!(!resp.schema_version.is_empty());
+        assert!(resp.row_counts.contains_key("pages"));
+    }
+
+    // B3：Search 服务在 Mock 向量 + 确定性嵌入器下可装配可调用（QUG 缺席时
+    // 返回成功且 review.compute rewrite_failure 语义由引擎保证）。
+    // B3: the Search service assembles and runs under the Mock vector store +
+    // the deterministic embedder (with QUG absent, it succeeds and the
+    // rewrite_failure semantics are the engine's).
+    #[tokio::test]
+    async fn search_service_runs_on_mock_engine() {
+        use crate::grpc::v1::search_server::Search;
+        use wiktor_core::embedding::deterministic::DeterministicEmbedder;
+        use wiktor_core::query_engine::QueryEngine;
+        use wiktor_core::traits::{DistanceMetric, VectorStore};
+
+        let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+        let store = Arc::new(MockVectorStore::new());
+        store
+            .ensure_collection("milk-tea", 768, DistanceMetric::Cosine)
+            .await
+            .unwrap();
+        let engine = QueryEngine::new(
+            kernel,
+            store,
+            None,
+            Arc::new(DeterministicEmbedder::new(768)),
+            "milk-tea",
+            5,
+            60,
+        )
+        .unwrap();
+        let svc = crate::services::search::SearchService::new(Arc::new(engine), 16 * 1024);
+        let resp = svc
+            .search(tonic::Request::new(v1::SearchRequest {
+                domain: "milk-tea".into(),
+                text: "珍珠奶茶".into(),
+                filters_json: String::new(),
+                top_k: 5,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.hits.is_empty(), "empty store → no hits");
+        assert!(
+            resp.log_id > 0,
+            "a successful search writes a query-log row (log_id={})",
+            resp.log_id
+        );
     }
 }

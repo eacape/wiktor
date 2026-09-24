@@ -73,6 +73,7 @@ mod tests;
 // grpc.rs); the six service implementations live under services/. core never
 // depends on this module (§1 non-goal).
 pub mod grpc;
+pub mod http_search;
 pub mod services;
 
 use std::collections::BTreeSet;
@@ -667,9 +668,16 @@ pub fn build_router(state: Arc<ServerState>) -> Router {
         .route("/feedback", post(post_feedback))
         .layer(from_fn_with_state(state.clone(), auth::auth_middleware))
         .layer(from_fn_with_state(state.clone(), body_limit_middleware));
+    // Step7：GET /search 读口（只读 FTS，认证 + search 方法授权）。
+    // Step7: the GET /search read surface (read-only FTS, authenticated with
+    // the search method permission).
+    let search = Router::new()
+        .route("/search", get(http_search::search))
+        .layer(from_fn_with_state(state.clone(), auth::auth_middleware));
     Router::new()
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
         .merge(feedback)
+        .merge(search)
         .with_state(state)
 }

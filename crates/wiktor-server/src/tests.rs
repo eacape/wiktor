@@ -711,3 +711,84 @@ async fn a17_metrics_have_fixed_names_and_no_user_labels() {
         assert!(!text.contains(forbidden), "metrics leaked {forbidden:?}");
     }
 }
+
+// Step7 A9/A7：GET /search 读口——search 权限 key 命中 FTS；feedback-only key
+// 403；无 key 401。
+// Step7 A9/A7: the GET /search read surface — a search-authorized key hits
+// FTS; a feedback-only key gets 403; no key gets 401.
+#[tokio::test]
+async fn search_endpoint_authenticates_authorizes_and_returns_hits() {
+    use wiktor_core::seed;
+    use wiktor_core::types::PublishStatus;
+
+    let (state, kernel) = state_with_search_key().await;
+    // 直接 seed 一页 accepted 页（bypass HTTP /seed——本步无 seed 端点）。
+    // Seeds one accepted page directly via the kernel (no HTTP /seed endpoint
+    // exists this step).
+    let page = seed::parse_page(
+        "---\npage_id: milk-tea:drink:test\nentity_id: milk-tea:drink:test\nentity_type: drink\ntitle: 珍珠奶茶(大杯)\n---\n## 概述\n\n- 珍珠奶茶 大杯\n",
+    )
+    .unwrap();
+    kernel
+        .seed_pages(&page, "milk-tea", PublishStatus::Accepted)
+        .unwrap();
+    let router = build_router(state);
+
+    // 无 key → 401。
+    // No key → 401.
+    let (status, _) = send_json(
+        &router,
+        get_request("/search?q=%E7%8F%8D%E7%8F%A0&domain=milk-tea"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // search 权限 key → 200 且命中该页（FTS）。
+    // The search-authorized key → 200 with the page hit (FTS).
+    let mut req = get_request("/search?q=%E7%8F%8D%E7%8F%A0&domain=milk-tea&top_k=10");
+    let headers = req.headers_mut();
+    headers.insert("authorization", "Bearer search-key".parse().unwrap());
+    let (status, body) = send_json(&router, req).await;
+    assert_eq!(status, StatusCode::OK);
+    let hits = body["hits"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h["title"].as_str() == Some("珍珠奶茶(大杯)")),
+        "FTS search must hit the seeded page, got {:?}",
+        hits
+    );
+
+    // feedback-only key（旧格式）→ 403（方法授权）。
+    // The feedback-only key (legacy format) → 403 (method authorization).
+    let mut req = get_request("/search?q=%E7%8F%8D%E7%8F%A0&domain=milk-tea");
+    let headers = req.headers_mut();
+    headers.insert("authorization", "Bearer legacy-key".parse().unwrap());
+    let (status, body) = send_json(&router, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"]["code"], "PERMISSION_DENIED");
+}
+
+/// 构造带 search + feedback 权限 key 的 state（含一个 feedback-only 旧 key）。
+/// Builds a state with a search+feedback key (plus one feedback-only legacy
+/// key).
+async fn state_with_search_key() -> (Arc<ServerState>, Arc<wiktor_core::SqliteKernel>) {
+    let kernel = Arc::new(wiktor_core::SqliteKernel::open_in_memory().unwrap());
+    let keys = ApiKeys::parse(
+        r#"{
+            "milk-tea":{"secret":"search-key","methods":["search","feedback"]},
+            "legacy":{"secret":"legacy-key","methods":["feedback"]}
+        }"#,
+    )
+    .unwrap();
+    let clock = crate::state::MockClock::new(1000);
+    let health = crate::state::KernelHealthCheck {
+        kernel: kernel.clone(),
+    };
+    let state = Arc::new(ServerState::with_parts(
+        kernel.clone(),
+        keys,
+        clock,
+        Arc::new(health),
+    ));
+    (state, kernel)
+}
