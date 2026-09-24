@@ -26,6 +26,13 @@ pub enum Error {
     VectorStore(String),
     #[error("qdrant connection error: {0}")]
     QdrantConnection(String),
+    /// 外部插件/服务错误（STEP10 B4：Meilisearch 等可选出口用；与 QdrantConnection
+    /// 并列，插件不回传未类型化的任意错误）。
+    /// External plugin/service error (STEP10 B4: used by optional outlets like
+    /// Meilisearch; sits alongside QdrantConnection, so plugins never surface an
+    /// untyped arbitrary error).
+    #[error("external service error: {0}")]
+    External(String),
 
     #[error("compilation error: {0}")]
     Compilation(String),

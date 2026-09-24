@@ -1,0 +1,22 @@
+[package]
+name = "wiktor-vector-qdrant"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Wiktor 可插拔向量后端：Qdrant 外部服务（插件点 3 实现）。"
+license.workspace = true
+repository.workspace = true
+keywords = ["vector", "qdrant", "search", "embedding"]
+categories = ["database"]
+# 依赖规则（MASTER-PLAN §8）：插件只依赖 core，不依赖 server/feedback。
+# Dependency rule (MASTER-PLAN §8): a plugin depends only on core, not on
+# server/feedback.
+[dependencies]
+wiktor-core = { path = "../wiktor-core" }
+qdrant-client = { workspace = true }
+async-trait = "0.1"
+blake3 = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

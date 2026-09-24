@@ -1,6 +1,3 @@
-use crate::traits::{DistanceMetric, VectorHit, VectorMetadata, VectorPoint, VectorStore};
-use crate::types::error::{Error, Result};
-use crate::types::EntityId;
 use async_trait::async_trait;
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::value::Kind;
@@ -10,9 +7,13 @@ use qdrant_client::qdrant::{
     UpsertPointsBuilder, Value, VectorParamsBuilder,
 };
 use qdrant_client::Qdrant;
+use wiktor_core::traits::{DistanceMetric, VectorHit, VectorMetadata, VectorPoint, VectorStore};
+use wiktor_core::types::error::{Error, Result};
+use wiktor_core::types::EntityId;
 
-/// Qdrant 向量后端（v3.2 起为 Wiktor 默认向量服务）。
-/// Qdrant vector backend (the default Wiktor vector service since v3.2).
+/// Qdrant 向量后端（v3.2 起为 Wiktor 默认向量服务；本 crate 从 wiktor-core 拆出）。
+/// Qdrant vector backend (the default Wiktor vector service since v3.2; split out
+/// of wiktor-core into this plugin crate, STEP10 B3).
 ///
 /// 设计要点：
 /// Design points:
@@ -268,8 +269,8 @@ fn payload_to_metadata(payload: &std::collections::HashMap<String, Value>) -> Ve
         entity_id: str_of(payload.get("entity_id")),
         page_id: str_of(payload.get("page_id")),
         chunk_type: match str_of(payload.get("chunk_type")).as_str() {
-            "section" => crate::traits::ChunkType::Section,
-            _ => crate::traits::ChunkType::Summary,
+            "section" => wiktor_core::traits::ChunkType::Section,
+            _ => wiktor_core::traits::ChunkType::Summary,
         },
         content_hash: str_of(payload.get("content_hash")),
         generation: u64_of(payload.get("generation")),

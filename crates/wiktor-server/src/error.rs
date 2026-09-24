@@ -47,7 +47,7 @@ pub fn grpc_status(err: &Error, fallback_desc: &str) -> tonic::Status {
         Error::CompileFailure(_) | Error::Compilation(_) | Error::QualityBelowThreshold { .. } => {
             tonic::Status::failed_precondition(fallback_desc.to_string())
         }
-        Error::VectorStore(_) | Error::QdrantConnection(_) => {
+        Error::VectorStore(_) | Error::QdrantConnection(_) | Error::External(_) => {
             tonic::Status::unavailable(fallback_desc.to_string())
         }
         Error::Database(_)
@@ -84,7 +84,7 @@ pub fn http_error(err: &Error) -> (axum::http::StatusCode, &'static str) {
             axum::http::StatusCode::UNPROCESSABLE_ENTITY,
             code::FAILED_PRECONDITION,
         ),
-        Error::VectorStore(_) | Error::QdrantConnection(_) => (
+        Error::VectorStore(_) | Error::QdrantConnection(_) | Error::External(_) => (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             code::UNAVAILABLE,
         ),

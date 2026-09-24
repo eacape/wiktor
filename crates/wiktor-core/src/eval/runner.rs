@@ -44,7 +44,7 @@
 //! disabled.
 
 use crate::eval::metrics::{decide, evaluate_variant, Decision, SampleRun, VariantMetrics};
-use crate::eval::{GoldenFilters, GoldenQuery, GoldenSet};
+use crate::eval::{GoldenFilterCondition, GoldenFilters, GoldenQuery, GoldenSet};
 use crate::kernel::qug_store::{load_active_qug, QugStore};
 use crate::kernel::SqliteKernel;
 use crate::query_engine::hybrid::RRF_K_DEFAULT;
@@ -107,47 +107,44 @@ pub struct EvalOutcome {
     pub kind_counts: std::collections::BTreeMap<String, usize>,
 }
 
-/// golden `filters` → 事实平面 [`Filters`]（键名映射与 Step2 集成测试同构：
-/// price→price、sugar→sugar_level、size→size、ingredients/exclude_ingredients
-/// → ingredient_ids）。
-/// Golden `filters` → fact-plane [`Filters`] (same key mapping as the Step2
-/// integration test: price→price, sugar→sugar_level, size→size,
-/// ingredients/exclude_ingredients→ingredient_ids).
+/// golden `filters` → 事实平面 [`Filters`]（**逐条透传字段名**，不再硬编码
+/// price→price / sugar→sugar_level / ingredients→ingredient_ids 映射，STEP10
+/// D3；tech-docs 的 topic/level/format/audience_years/tags 同样适用）。
+/// Golden `filters` → fact-plane [`Filters`] (**field names pass through**; the
+/// price→price / sugar→sugar_level / ingredients→ingredient_ids mapping is
+/// gone, STEP10 D3; tech-docs's topic/level/format/audience_years/tags work too).
 pub fn golden_filters_to_filters(f: &GoldenFilters) -> Filters {
-    let mut conditions = Vec::new();
-    if f.price_min.is_some() || f.price_max.is_some() {
-        conditions.push(FilterCondition::NumericRange {
-            field: "price".into(),
-            min: f.price_min,
-            max: f.price_max,
-        });
+    Filters {
+        conditions: f
+            .conditions
+            .iter()
+            .map(|c| match c {
+                GoldenFilterCondition::NumericRange { field, min, max } => {
+                    FilterCondition::NumericRange {
+                        field: field.clone(),
+                        min: *min,
+                        max: *max,
+                    }
+                }
+                GoldenFilterCondition::TextEquals { field, value } => FilterCondition::TextEquals {
+                    field: field.clone(),
+                    value: value.clone(),
+                },
+                GoldenFilterCondition::RefContains { field, refs } => {
+                    FilterCondition::RefContains {
+                        field: field.clone(),
+                        refs: refs.clone(),
+                    }
+                }
+                GoldenFilterCondition::RefExcludes { field, refs } => {
+                    FilterCondition::RefExcludes {
+                        field: field.clone(),
+                        refs: refs.clone(),
+                    }
+                }
+            })
+            .collect(),
     }
-    if f.sugar_min.is_some() || f.sugar_max.is_some() {
-        conditions.push(FilterCondition::NumericRange {
-            field: "sugar_level".into(),
-            min: f.sugar_min,
-            max: f.sugar_max,
-        });
-    }
-    if let Some(size) = &f.size {
-        conditions.push(FilterCondition::TextEquals {
-            field: "size".into(),
-            value: size.clone(),
-        });
-    }
-    if !f.ingredients.is_empty() {
-        conditions.push(FilterCondition::RefContains {
-            field: "ingredient_ids".into(),
-            refs: f.ingredients.clone(),
-        });
-    }
-    if !f.exclude_ingredients.is_empty() {
-        conditions.push(FilterCondition::RefExcludes {
-            field: "ingredient_ids".into(),
-            refs: f.exclude_ingredients.clone(),
-        });
-    }
-    Filters { conditions }
 }
 
 /// 执行三档评测（spec §8 批5；不写 CLI，CLI 接线属批6）。
@@ -671,8 +668,11 @@ qug:
                 &["milk-tea:drink:taro"],
                 &[],
                 GoldenFilters {
-                    sugar_max: Some(10.0),
-                    ..Default::default()
+                    conditions: vec![GoldenFilterCondition::NumericRange {
+                        field: "sugar_level".into(),
+                        min: None,
+                        max: Some(10.0),
+                    }],
                 },
             ),
         ])
@@ -838,8 +838,11 @@ qug:
                 &["milk-tea:drink:taro"],
                 &[],
                 GoldenFilters {
-                    sugar_max: Some(10.0),
-                    ..Default::default()
+                    conditions: vec![GoldenFilterCondition::NumericRange {
+                        field: "sugar_level".into(),
+                        min: None,
+                        max: Some(10.0),
+                    }],
                 },
             ),
         ]);
@@ -958,14 +961,36 @@ qug:
 
     #[test]
     fn golden_filters_map_to_fact_plane_conditions() {
+        // 字段名直接透传（STEP10 D3）：不再有 price→price / sugar→sugar_level /
+        // ingredients→ingredient_ids 的硬编码映射；任何领域字段都按原样表达。
+        // Field names pass through (STEP10 D3): the price→price / sugar→sugar_level
+        // / ingredients→ingredient_ids mapping is gone; any domain field is kept
+        // as-is.
         let f = GoldenFilters {
-            price_min: Some(5.0),
-            price_max: Some(20.0),
-            sugar_min: Some(0.0),
-            sugar_max: Some(30.0),
-            size: Some("中杯".into()),
-            ingredients: vec!["milk-tea:ingredient:pearl".into()],
-            exclude_ingredients: vec!["milk-tea:ingredient:cheese-foam".into()],
+            conditions: vec![
+                GoldenFilterCondition::NumericRange {
+                    field: "price".into(),
+                    min: Some(5.0),
+                    max: Some(20.0),
+                },
+                GoldenFilterCondition::NumericRange {
+                    field: "sugar_level".into(),
+                    min: Some(0.0),
+                    max: Some(30.0),
+                },
+                GoldenFilterCondition::TextEquals {
+                    field: "size".into(),
+                    value: "中杯".into(),
+                },
+                GoldenFilterCondition::RefContains {
+                    field: "ingredient_ids".into(),
+                    refs: vec!["milk-tea:ingredient:pearl".into()],
+                },
+                GoldenFilterCondition::RefExcludes {
+                    field: "ingredient_ids".into(),
+                    refs: vec!["milk-tea:ingredient:cheese-foam".into()],
+                },
+            ],
         };
         let filters = golden_filters_to_filters(&f);
         assert_eq!(filters.conditions.len(), 5);
@@ -995,6 +1020,49 @@ qug:
                 if field == "ingredient_ids" && refs.len() == 1
         ));
         assert!(golden_filters_to_filters(&GoldenFilters::default()).is_empty());
+    }
+
+    #[test]
+    fn tech_docs_style_filters_pass_field_names_through() {
+        // 证明第二领域（tech-docs）的过滤字段（level/format/audience_years）也能
+        // 通用表达，无需任何 milk-tea 特化（STEP10 A3）。
+        // Proves a second domain (tech-docs) filter fields (level/format/
+        // audience_years) are expressible generically without any milk-tea
+        // specialization (STEP10 A3).
+        let f = GoldenFilters {
+            conditions: vec![
+                GoldenFilterCondition::TextEquals {
+                    field: "level".into(),
+                    value: "beginner".into(),
+                },
+                GoldenFilterCondition::NumericRange {
+                    field: "audience_years".into(),
+                    min: Some(0.0),
+                    max: Some(3.0),
+                },
+                GoldenFilterCondition::RefExcludes {
+                    field: "tags".into(),
+                    refs: vec!["tech-docs:technology:sqlite".into()],
+                },
+            ],
+        };
+        let filters = golden_filters_to_filters(&f);
+        assert_eq!(filters.conditions.len(), 3);
+        assert!(matches!(
+            &filters.conditions[0],
+            FilterCondition::TextEquals { field, value }
+                if field == "level" && value == "beginner"
+        ));
+        assert!(matches!(
+            &filters.conditions[1],
+            FilterCondition::NumericRange { field, min: Some(0.0), max: Some(3.0) }
+                if field == "audience_years"
+        ));
+        assert!(matches!(
+            &filters.conditions[2],
+            FilterCondition::RefExcludes { field, refs }
+                if field == "tags" && refs == &["tech-docs:technology:sqlite"]
+        ));
     }
 
     #[tokio::test]

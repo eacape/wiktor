@@ -3,15 +3,16 @@
 //!
 //! 组装 `traits` + `schema` 的实际执行内核：`sqlite`（SQLite 单连接
 //! Mutex 串行化 + WAL/foreign_keys pragma）、`compile_store`（Step 4 编译管线
-//! 专用事务接口，admit/claim/heartbeat/recover/publish/failure）、
-//! `qdrant_vector`（默认向量后端，feature-gated）与 `mock_vector`（进程内暴力
-//! 扫描，评测基线）。
+//! 专用事务接口，admit/claim/heartbeat/recover/publish/failure）与
+//! `mock_vector`（进程内暴力扫描，评测基线）。Qdrant 后端已拆出为独立插件
+//! crate `wiktor-vector-qdrant`（STEP10 B3，插件只依赖 core）。
 //! Assembles the concrete execution kernel from `traits` + `schema`: `sqlite`
 //! (single-connection SQLite serialized via Mutex + WAL/foreign_keys pragmas),
 //! `compile_store` (Step 4 compile-pipeline transactional API:
-//! admit/claim/heartbeat/recover/publish/failure), `qdrant_vector` (the default
-//! vector backend, feature-gated) and `mock_vector` (in-process brute-force scan,
-//! evaluation baseline).
+//! admit/claim/heartbeat/recover/publish/failure) and `mock_vector` (in-process
+//! brute-force scan, the evaluation baseline). The Qdrant backend was split into
+//! the `wiktor-vector-qdrant` plugin crate (STEP10 B3; plugins depend only on
+//! core).
 
 // pub(crate)：executor（compile 模块）复用预算估算公式 estimate_budget_units，
 // 避免双实现漂移（Step 4 §8.4）。
@@ -19,7 +20,6 @@
 // budget formula cannot drift between two implementations (Step 4 §8.4).
 pub(crate) mod compile_store;
 mod mock_vector;
-mod qdrant_vector;
 // pub：Step 5 批2 的 QUG 存储层（QugStore trait + SqliteKernel 实现 +
 // build_and_publish_qug 编排），供 CLI 后续批次直接使用；query_engine 不依赖
 // diesel，故编排落在本模块（spec step5 §4.1）。批3 追加运行时加载入口
@@ -76,6 +76,3 @@ pub use feedback_store::{
 // Step 6 batch 2: the query-log write entry (used by the QueryEngine) — the
 // payload type and the default-domain constant.
 pub use sqlite::{QueryLogInsert, DEFAULT_QUERY_LOG_DOMAIN};
-
-#[cfg(feature = "vector-qdrant")]
-pub use qdrant_vector::QdrantVectorStore;

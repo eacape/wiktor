@@ -1,0 +1,31 @@
+# Domain pack for the technical-documentation reference dataset.
+# 技术文档参考数据集的领域包（第二个官方领域包，验证领域包插件点对非电商域可扩展）。
+name: tech-docs
+version: "0.1.0"
+
+entities:
+  - name: document
+    source: jsonl://docs.jsonl
+    id_field: entity_id
+    type_field: topic
+    fields:
+      - { name: title, field_type: text, filterable: false }
+      - { name: description, field_type: text, filterable: false }
+      - { name: topic, field_type: text, filterable: true }
+      - { name: level, field_type: text, filterable: true }
+      - { name: format, field_type: text, filterable: true }
+      - { name: audience_years, field_type: numeric, filterable: true }
+      - { name: tags, field_type: reflist, filterable: true }
+
+compile:
+  quality_threshold: 0.75
+  max_recompiles: 2
+
+query:
+  filters: [topic, level, format, audience_years, tags]
+
+qug:
+  enabled: true
+  max_depth: 2
+  candidate_multiplier: 5
+  intent_templates: intents.yaml

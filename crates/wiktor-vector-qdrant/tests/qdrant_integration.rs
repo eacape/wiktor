@@ -3,15 +3,18 @@
 //!
 //! 运行方式：
 //! Run with:
-//!   WIKTOR_QDRANT_URL=http://127.0.0.1:6334 cargo test --features vector-qdrant -- --include-ignored
+//!   WIKTOR_QDRANT_URL=http://127.0.0.1:6334 cargo test -p wiktor-vector-qdrant -- --include-ignored
 //!
 //! 连接失败时 skip 而非失败（CI 可能无 qdrant）。
 //! Connection failures skip rather than fail (CI may not provide qdrant).
+//!
+//! 迁移自 wiktor-core/tests/qdrant_integration.rs（STEP10 B3）。
 
-use wiktor_core::kernel::QdrantVectorStore;
-use wiktor_core::traits::{ChunkType, DistanceMetric, VectorMetadata, VectorPoint, VectorStore};
+use wiktor_core::types::error::Error;
 use wiktor_core::types::EntityId;
-use wiktor_core::Error;
+use wiktor_vector_qdrant::{
+    ChunkType, DistanceMetric, QdrantVectorStore, VectorMetadata, VectorPoint, VectorStore,
+};
 
 fn env_url() -> String {
     std::env::var("WIKTOR_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6334".to_string())

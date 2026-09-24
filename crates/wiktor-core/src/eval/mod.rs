@@ -148,38 +148,53 @@ impl GoldenKind {
     }
 }
 
-/// golden 记录的扁平过滤表示（与 Step2 集成测试的 `GoldenFilters` 同构，键名
-/// 沿用现有文件；`price_min/price_max`→price、`sugar_min/sugar_max`→sugar_level、
-/// `size`→size、`ingredients/exclude_ingredients`→ingredient_ids，恰好覆盖
-/// domain.yaml `query.filters` 白名单的四个事实字段）。
-/// Flat filter representation of a golden record (isomorphic to the Step2
-/// integration test's `GoldenFilters`; key names follow the existing file:
-/// `price_min/price_max`→price, `sugar_min/sugar_max`→sugar_level, `size`→size,
-/// `ingredients/exclude_ingredients`→ingredient_ids — exactly covering the four
-/// fact fields of the domain.yaml `query.filters` whitelist).
+/// golden 记录的单条过滤条件，**按事实字段名通用表达**（不再硬编码 milk-tea
+/// 的 price/sugar/size/ingredients，STEP10 D3）。与内核事实平面
+/// [`FilterCondition`] 同构，字段名直接透传，任何领域（如 tech-docs 的
+/// topic/level/format/audience_years/tags）都能表达自己的过滤。
+/// A single golden filter condition, expressed generically by fact-field name
+/// (no longer hardcoding milk-tea's price/sugar/size/ingredients, STEP10 D3).
+/// It is isomorphic to the kernel fact-plane [`FilterCondition`]; field names
+/// pass through, so any domain (e.g. tech-docs's topic/level/format/
+/// audience_years/tags) can express its own filters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GoldenFilterCondition {
+    NumericRange {
+        field: String,
+        min: Option<f64>,
+        max: Option<f64>,
+    },
+    TextEquals {
+        field: String,
+        value: String,
+    },
+    RefContains {
+        field: String,
+        refs: Vec<String>,
+    },
+    RefExcludes {
+        field: String,
+        refs: Vec<String>,
+    },
+}
+
+/// golden 记录的领域通用过滤表示：一个事实字段条件列表。默认空；milk-tea 的
+/// legacy `{}` filters 映射为空条件列表。
+/// A domain-generic filter representation for a golden record: a list of
+/// fact-field conditions. Empty by default; the milk-tea legacy `{}` filters
+/// map to an empty condition list.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GoldenFilters {
-    pub price_min: Option<f64>,
-    pub price_max: Option<f64>,
-    pub sugar_min: Option<f64>,
-    pub sugar_max: Option<f64>,
-    pub size: Option<String>,
-    pub ingredients: Vec<String>,
-    pub exclude_ingredients: Vec<String>,
+    pub conditions: Vec<GoldenFilterCondition>,
 }
 
 impl GoldenFilters {
     /// 是否完全为空（无任何过滤条件）。
     /// Whether it is entirely empty (no filter condition at all).
     pub fn is_empty(&self) -> bool {
-        self.price_min.is_none()
-            && self.price_max.is_none()
-            && self.sugar_min.is_none()
-            && self.sugar_max.is_none()
-            && self.size.is_none()
-            && self.ingredients.is_empty()
-            && self.exclude_ingredients.is_empty()
+        self.conditions.is_empty()
     }
 }
 
@@ -721,7 +736,7 @@ mod tests {
         for (kind, n) in plan {
             for i in 1..=n {
                 lines.push(format!(
-                    r#"{{"id":"{kind}-{i:02}","query":"{kind} probe {i:02}","kind":"{kind}","expected_entity_ids":["milk-tea:ingredient:taro-ball"],"must_exclude_entity_ids":["milk-tea:ingredient:pearl"],"filters":{{"price_max":10}}}}"#
+                    r#"{{"id":"{kind}-{i:02}","query":"{kind} probe {i:02}","kind":"{kind}","expected_entity_ids":["milk-tea:ingredient:taro-ball"],"must_exclude_entity_ids":["milk-tea:ingredient:pearl"],"filters":{{"conditions":[{{"type":"numeric_range","field":"price","max":10}}]}}}}"#
                 ));
             }
         }
@@ -887,7 +902,7 @@ mod tests {
         let three = r#"{"id":"a-1c","query":"芋圆","kind":"synonym","expected_entity_ids":["milk-tea:ingredient:taro-ball"]}"#;
         // 同一查询、不同 filters → 不同去重键，不计数。
         // Same query, different filters → different dedup key, not counted.
-        let other_filters = r#"{"id":"a-2","query":"芋圆","kind":"attribute_filter","expected_entity_ids":["milk-tea:ingredient:taro-ball"],"filters":{"price_max":20}}"#;
+        let other_filters = r#"{"id":"a-2","query":"芋圆","kind":"attribute_filter","expected_entity_ids":["milk-tea:ingredient:taro-ball"],"filters":{"conditions":[{"type":"numeric_range","field":"price","max":20}]}}"#;
         let text = format!("{one}\n{other_filters}\n{two}\n{three}");
         let err = load_str(&text).unwrap_err();
         assert_validation(err, "appears 3 times");

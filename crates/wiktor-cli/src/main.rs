@@ -142,6 +142,12 @@ enum Command {
         #[command(subcommand)]
         command: commands::domain::DomainCommand,
     },
+    /// Export accepted pages to an external search engine (optional outlet).
+    /// 把 accepted 页导出到外部检索引擎（可选出口）。
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -151,6 +157,32 @@ enum QugCommand {
     /// 从 accepted 页与意图配置派生五类边并事务发布图（hash 命中复用；
     /// --force / --dry-run；退出码见 D7）。
     Build(commands::qug::BuildArgs),
+}
+
+/// `wiktor export` 的外部检索引擎出口（STEP10 B4，D6）。
+/// External search-engine outlets of `wiktor export` (STEP10 B4, D6).
+#[derive(Subcommand)]
+enum ExportCommand {
+    /// Mirror accepted pages into Meilisearch (env: WIKTOR_MEILISEARCH_URL /
+    /// WIKTOR_MEILISEARCH_API_KEY; index = --index or the domain name). Requires
+    /// the `export-meilisearch` feature.
+    /// 把 accepted 页镜像到 Meilisearch（env：WIKTOR_MEILISEARCH_URL /
+    /// WIKTOR_MEILISEARCH_API_KEY；index = --index 或 domain 名）。需要
+    /// `export-meilisearch` feature。
+    Meilisearch {
+        /// SQLite database path (default ./wiktor.db)
+        /// SQLite 数据库路径（默认 ./wiktor.db）
+        #[arg(long, default_value = "wiktor.db")]
+        db: PathBuf,
+        /// domain.yaml path (mandatory)
+        /// domain.yaml 路径（必填）
+        #[arg(long)]
+        domain: PathBuf,
+        /// Meilisearch index uid (default: the domain name from domain.yaml)
+        /// Meilisearch index uid（默认：domain.yaml 的 domain 名）
+        #[arg(long)]
+        index: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,14 +272,24 @@ async fn main() -> Result<()> {
         }
         Command::Vector { command } => match command {
             VectorCommand::Ping { url, api_key } => {
-                let store =
-                    wiktor_core::QdrantVectorStore::from_config(&url, api_key.as_deref(), 768)?;
-                let health = store
-                    .client()
-                    .health_check()
-                    .await
-                    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-                println!("qdrant ok: {}", health.version);
+                #[cfg(feature = "vector-qdrant")]
+                {
+                    let store = wiktor_vector_qdrant::QdrantVectorStore::from_config(
+                        &url,
+                        api_key.as_deref(),
+                        768,
+                    )?;
+                    let health = store
+                        .client()
+                        .health_check()
+                        .await
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                    println!("qdrant ok: {}", health.version);
+                }
+                #[cfg(not(feature = "vector-qdrant"))]
+                {
+                    anyhow::bail!("vector-qdrant feature is disabled (build without --no-default-features to use qdrant)");
+                }
             }
             VectorCommand::Build {
                 domain,
@@ -281,6 +323,11 @@ async fn main() -> Result<()> {
         Command::Eval(args) => finish(commands::eval::run(args).await?)?,
         Command::Feedback { command } => finish(commands::feedback::run(command).await?)?,
         Command::Domain { command } => finish(commands::domain::run(command).await?)?,
+        Command::Export { command } => match command {
+            ExportCommand::Meilisearch { db, domain, index } => {
+                cmd_export_meilisearch(&db, &domain, index.as_deref()).await?;
+            }
+        },
         #[cfg(feature = "server")]
         Command::Serve {
             db,
@@ -415,6 +462,7 @@ pub(crate) async fn cmd_seed(
 /// 构建向量索引：把域内全部 accepted 页嵌入并写入向量库。默认走真实 HTTP
 /// 嵌入器（embedding-http feature，环境变量配置）；`--deterministic` 强制用
 /// 本地 token-hash 基线（离线）。
+#[cfg(feature = "vector-qdrant")]
 async fn cmd_vector_build(
     domain_yaml: &Path,
     db: &Path,
@@ -465,14 +513,15 @@ async fn cmd_vector_build(
     let dim = embedder.embed(&first_text).await?.len();
 
     // qdrant 地址/key 与 vector ping 同源（环境变量）。CLI 恒开
-    // vector-qdrant feature（wiktor-core 依赖带上），store 恒为 QdrantVectorStore。
+    // vector-qdrant feature（wiktor-vector-qdrant 插件依赖带上），store 恒为
+    // QdrantVectorStore。
     // The qdrant address/key share the same env sources as `vector ping`. The CLI
-    // always enables the vector-qdrant feature (via the wiktor-core dependency),
-    // so the store is always QdrantVectorStore.
+    // always enables the vector-qdrant feature (via the wiktor-vector-qdrant
+    // plugin dependency), so the store is always QdrantVectorStore.
     let url =
         std::env::var("WIKTOR_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6334".to_string());
     let api_key = std::env::var("WIKTOR_QDRANT_API_KEY").ok();
-    let store = Arc::new(wiktor_core::QdrantVectorStore::from_config(
+    let store = Arc::new(wiktor_vector_qdrant::QdrantVectorStore::from_config(
         &url,
         api_key.as_deref(),
         dim,
@@ -499,7 +548,7 @@ async fn cmd_vector_build(
         // shape as vector rebuild/idempotent overwrite.
         let entity = wiktor_core::types::EntityId::from_key(&page.entity_id)?;
         let point_id =
-            wiktor_core::QdrantVectorStore::point_id(&entity, "summary", page.generation);
+            wiktor_vector_qdrant::QdrantVectorStore::point_id(&entity, "summary", page.generation);
         points.push(wiktor_core::traits::VectorPoint {
             id: point_id,
             vector,
@@ -534,6 +583,58 @@ async fn cmd_vector_build(
         );
     }
     Ok(())
+}
+
+/// vector build 需要 qdrant 向量后端插件；无 `vector-qdrant` feature 时明确
+/// 报错（而非静默回退）。
+/// `vector build` requires the qdrant vector-backend plugin; without the
+/// `vector-qdrant` feature this fails explicitly (rather than silently falling
+/// back).
+#[cfg(not(feature = "vector-qdrant"))]
+async fn cmd_vector_build(
+    _domain_yaml: &Path,
+    _db: &Path,
+    _collection_override: Option<&str>,
+    _limit: Option<usize>,
+    _deterministic: bool,
+    _json: bool,
+) -> Result<()> {
+    anyhow::bail!(
+        "vector build requires the vector-qdrant feature (enable it; don't build with --no-default-features)"
+    )
+}
+
+/// 把 accepted 页镜像到 Meilisearch（`wiktor export meilisearch`，STEP10 B4）。
+/// Requires the `export-meilisearch` feature (off by default; the external engine
+/// is an optional outlet).
+#[cfg(feature = "export-meilisearch")]
+async fn cmd_export_meilisearch(db: &Path, domain_yaml: &Path, index: Option<&str>) -> Result<()> {
+    let yaml_text = std::fs::read_to_string(domain_yaml)
+        .with_context(|| format!("read {}", domain_yaml.display()))?;
+    let config: DomainConfig =
+        serde_yaml_ng::from_str(&yaml_text).map_err(|e| anyhow!("parse domain.yaml: {e}"))?;
+    let index = index
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| config.name.clone());
+    let kernel = SqliteKernel::open(db)?;
+    let pages = kernel.accepted_page_vectors(&config.name)?;
+    let exporter = wiktor_adapter_meilisearch::MeilisearchExporter::from_env(&index)
+        .map_err(|e| anyhow!("meilisearch exporter: {e}"))?;
+    exporter
+        .ensure_index()
+        .await
+        .map_err(|e| anyhow!("ensure index: {e}"))?;
+    let n = exporter
+        .export_pages(&pages)
+        .await
+        .map_err(|e| anyhow!("export pages: {e}"))?;
+    println!("export meilisearch: index={index} pages={n}");
+    Ok(())
+}
+
+#[cfg(not(feature = "export-meilisearch"))]
+async fn cmd_export_meilisearch(_db: &Path, _domain: &Path, _index: Option<&str>) -> Result<()> {
+    anyhow::bail!("export meilisearch requires the export-meilisearch feature (build with --features export-meilisearch)")
 }
 
 /// 页面向量嵌入文本（title + body，与查询侧 terms 拼接同一素材面）。

@@ -1,0 +1,134 @@
+{"query": "API 设计", "expected_hits": ["tech-docs:concept:api-design"], "filters": {}}
+{"query": "语义化版本", "expected_hits": ["tech-docs:concept:semantic-versioning"], "filters": {}}
+{"query": "HTTP 协议", "expected_hits": ["tech-docs:concept:http"], "filters": {}}
+{"query": "gRPC", "expected_hits": ["tech-docs:concept:grpc"], "filters": {}}
+{"query": "RPC", "expected_hits": ["tech-docs:concept:rpc"], "filters": {}}
+{"query": "数据库索引", "expected_hits": ["tech-docs:concept:database-indexing"], "filters": {}}
+{"query": "幂等性", "expected_hits": ["tech-docs:concept:idempotency"], "filters": {}}
+{"query": "可观测性", "expected_hits": ["tech-docs:concept:observability"], "filters": {}}
+{"query": "向后兼容", "expected_hits": ["tech-docs:concept:backward-compatibility"], "filters": {}}
+{"query": "限流", "expected_hits": ["tech-docs:concept:rate-limiting"], "filters": {}}
+{"query": "SQLite", "expected_hits": ["tech-docs:technology:sqlite"], "filters": {}}
+{"query": "SQLite WAL", "expected_hits": ["tech-docs:technology:sqlite-wal"], "filters": {}}
+{"query": "SQLite FTS5", "expected_hits": ["tech-docs:technology:sqlite-fts5"], "filters": {}}
+{"query": "Tokio", "expected_hits": ["tech-docs:technology:tokio"], "filters": {}}
+{"query": "tonic", "expected_hits": ["tech-docs:technology:tonic"], "filters": {}}
+{"query": "Qdrant", "expected_hits": ["tech-docs:technology:qdrant"], "filters": {}}
+{"query": "错误处理", "expected_hits": ["tech-docs:practice:error-handling"], "filters": {}}
+{"query": "文档即代码", "expected_hits": ["tech-docs:practice:documentation-as-code"], "filters": {}}
+{"query": "测试驱动开发", "expected_hits": ["tech-docs:practice:test-driven"], "filters": {}}
+{"query": "监控实践", "expected_hits": ["tech-docs:practice:monitoring"], "filters": {}}
+{"query": "接口设计", "expected_hits": ["tech-docs:concept:api-design"], "filters": {}}
+{"query": "版本号规范", "expected_hits": ["tech-docs:concept:semantic-versioning"], "filters": {}}
+{"query": "超文本传输协议", "expected_hits": ["tech-docs:concept:http"], "filters": {}}
+{"query": "嵌入式数据库", "expected_hits": ["tech-docs:technology:sqlite"], "filters": {}}
+{"query": "写前日志", "expected_hits": ["tech-docs:technology:sqlite-wal"], "filters": {}}
+{"query": "全文索引", "expected_hits": ["tech-docs:technology:sqlite-fts5"], "filters": {}}
+{"query": "异步运行时", "expected_hits": ["tech-docs:technology:tokio"], "filters": {}}
+{"query": "向量数据库", "expected_hits": ["tech-docs:technology:qdrant"], "filters": {}}
+{"query": "异常处理", "expected_hits": ["tech-docs:practice:error-handling"], "filters": {}}
+{"query": "文档代码化", "expected_hits": ["tech-docs:practice:documentation-as-code"], "filters": {}}
+{"query": "测试驱动开发", "expected_hits": ["tech-docs:practice:test-driven"], "filters": {}}
+{"query": "运维监控", "expected_hits": ["tech-docs:practice:monitoring"], "filters": {}}
+{"query": "流量控制", "expected_hits": ["tech-docs:concept:rate-limiting"], "filters": {}}
+{"query": "聚簇索引", "expected_hits": ["tech-docs:concept:database-indexing"], "filters": {}}
+{"id": "synonym-01", "query": "接口设计", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:api-design"], "filters": {}, "notes": "alias of API 设计"}
+{"id": "synonym-02", "query": "接口规范", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:api-design"], "filters": {}, "notes": "alias of API 设计"}
+{"id": "synonym-03", "query": "SemVer", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:semantic-versioning"], "filters": {}, "notes": "alias of 语义化版本"}
+{"id": "synonym-04", "query": "版本号规范", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:semantic-versioning"], "filters": {}, "notes": "alias of 语义化版本"}
+{"id": "synonym-05", "query": "超文本传输协议", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:http"], "filters": {}, "notes": "alias of HTTP 协议"}
+{"id": "synonym-06", "query": "HTTPS", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:http"], "filters": {}, "notes": "alias of HTTP 协议"}
+{"id": "synonym-07", "query": "GRPC", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:grpc"], "filters": {}, "notes": "alias of gRPC"}
+{"id": "synonym-08", "query": "远程过程调用框架", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:grpc"], "filters": {}, "notes": "alias of gRPC"}
+{"id": "synonym-09", "query": "远程调用", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:rpc"], "filters": {}, "notes": "alias of RPC"}
+{"id": "synonym-10", "query": "过程调用", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:rpc"], "filters": {}, "notes": "alias of RPC"}
+{"id": "synonym-11", "query": "索引", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:database-indexing"], "filters": {}, "notes": "alias of 数据库索引"}
+{"id": "synonym-12", "query": "聚簇索引", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:database-indexing"], "filters": {}, "notes": "alias of 数据库索引"}
+{"id": "synonym-13", "query": "幂等", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:idempotency"], "filters": {}, "notes": "alias of 幂等性"}
+{"id": "synonym-14", "query": "重复执行", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:idempotency"], "filters": {}, "notes": "alias of 幂等性"}
+{"id": "synonym-15", "query": "观测性", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:observability"], "filters": {}, "notes": "alias of 可观测性"}
+{"id": "synonym-16", "query": "监控", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:observability"], "filters": {}, "notes": "alias of 可观测性"}
+{"id": "synonym-17", "query": "兼容性", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {}, "notes": "alias of 向后兼容"}
+{"id": "synonym-18", "query": "回兼容", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {}, "notes": "alias of 向后兼容"}
+{"id": "synonym-19", "query": "限速", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:rate-limiting"], "filters": {}, "notes": "alias of 限流"}
+{"id": "synonym-20", "query": "流量控制", "kind": "synonym", "expected_entity_ids": ["tech-docs:concept:rate-limiting"], "filters": {}, "notes": "alias of 限流"}
+{"id": "synonym-21", "query": "SQLite 数据库", "kind": "synonym", "expected_entity_ids": ["tech-docs:technology:sqlite"], "filters": {}, "notes": "alias of SQLite"}
+{"id": "synonym-22", "query": "嵌入式数据库", "kind": "synonym", "expected_entity_ids": ["tech-docs:technology:sqlite"], "filters": {}, "notes": "alias of SQLite"}
+{"id": "synonym-23", "query": "写前日志", "kind": "synonym", "expected_entity_ids": ["tech-docs:technology:sqlite-wal"], "filters": {}, "notes": "alias of SQLite WAL"}
+{"id": "synonym-24", "query": "WAL", "kind": "synonym", "expected_entity_ids": ["tech-docs:technology:sqlite-wal"], "filters": {}, "notes": "alias of SQLite WAL"}
+{"id": "synonym-25", "query": "FTS5", "kind": "synonym", "expected_entity_ids": ["tech-docs:technology:sqlite-fts5"], "filters": {}, "notes": "alias of SQLite FTS5"}
+{"id": "intent-01", "query": "版本兼容", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-02", "query": "向后兼容", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-03", "query": "远程过程调用", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:grpc"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-04", "query": "过程调用", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:rpc"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-05", "query": "全文搜索", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:sqlite-fts5"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-06", "query": "数据库存储", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:sqlite"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-07", "query": "异步编程框架", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:tokio"], "filters": {}, "notes": "phrase/expansion match"}
+{"id": "intent-08", "query": "版本号", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:semantic-versioning"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-09", "query": "请求响应", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:http"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-10", "query": "IDL", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:grpc"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-11", "query": "倒排", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:sqlite-fts5"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-12", "query": "WAL 模式", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:sqlite-wal"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-13", "query": "异步", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:tokio"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-14", "query": "向量", "kind": "intent", "expected_entity_ids": ["tech-docs:technology:qdrant"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-15", "query": "令牌桶", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:rate-limiting"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-16", "query": "幂等键", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:idempotency"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-17", "query": "链路", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:observability"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-18", "query": "重试", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:idempotency"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-19", "query": "契约", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:api-design"], "filters": {}, "notes": "phrase match"}
+{"id": "intent-20", "query": "破坏性变更", "kind": "intent", "expected_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {}, "notes": "phrase match"}
+{"id": "negation-01", "query": "不要API 设计", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:api-design"], "filters": {}, "notes": "exclude API 设计"}
+{"id": "negation-02", "query": "不要语义化版本", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:semantic-versioning"], "filters": {}, "notes": "exclude 语义化版本"}
+{"id": "negation-03", "query": "不要HTTP 协议", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:http"], "filters": {}, "notes": "exclude HTTP 协议"}
+{"id": "negation-04", "query": "不要gRPC", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:grpc"], "filters": {}, "notes": "exclude gRPC"}
+{"id": "negation-05", "query": "不要RPC", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:rpc"], "filters": {}, "notes": "exclude RPC"}
+{"id": "negation-06", "query": "不要数据库索引", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:database-indexing"], "filters": {}, "notes": "exclude 数据库索引"}
+{"id": "negation-07", "query": "不要幂等性", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:idempotency"], "filters": {}, "notes": "exclude 幂等性"}
+{"id": "negation-08", "query": "不要可观测性", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:observability"], "filters": {}, "notes": "exclude 可观测性"}
+{"id": "negation-09", "query": "不要向后兼容", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {}, "notes": "exclude 向后兼容"}
+{"id": "negation-10", "query": "不要限流", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:concept:rate-limiting"], "filters": {}, "notes": "exclude 限流"}
+{"id": "negation-11", "query": "不要SQLite", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:technology:sqlite"], "filters": {}, "notes": "exclude SQLite"}
+{"id": "negation-12", "query": "不要SQLite WAL", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:technology:sqlite-wal"], "filters": {}, "notes": "exclude SQLite WAL"}
+{"id": "negation-13", "query": "不要SQLite FTS5", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:technology:sqlite-fts5"], "filters": {}, "notes": "exclude SQLite FTS5"}
+{"id": "negation-14", "query": "不要Tokio", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:technology:tokio"], "filters": {}, "notes": "exclude Tokio"}
+{"id": "negation-15", "query": "不要tonic", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:technology:tonic"], "filters": {}, "notes": "exclude tonic"}
+{"id": "negation-16", "query": "不要Qdrant", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:technology:qdrant"], "filters": {}, "notes": "exclude Qdrant"}
+{"id": "negation-17", "query": "不要错误处理", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:practice:error-handling"], "filters": {}, "notes": "exclude 错误处理"}
+{"id": "negation-18", "query": "不要文档即代码", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:practice:documentation-as-code"], "filters": {}, "notes": "exclude 文档即代码"}
+{"id": "negation-19", "query": "不要测试驱动开发", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:practice:test-driven"], "filters": {}, "notes": "exclude 测试驱动开发"}
+{"id": "negation-20", "query": "不要监控实践", "kind": "negation", "expected_entity_ids": [], "must_exclude_entity_ids": ["tech-docs:practice:monitoring"], "filters": {}, "notes": "exclude 监控实践"}
+{"id": "attribute-filter-01", "query": "API 设计", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:api-design"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on API 设计"}
+{"id": "attribute-filter-02", "query": "语义化版本", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:semantic-versioning"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on 语义化版本"}
+{"id": "attribute-filter-03", "query": "HTTP 协议", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:http"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on HTTP 协议"}
+{"id": "attribute-filter-04", "query": "gRPC", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:grpc"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on gRPC"}
+{"id": "attribute-filter-05", "query": "RPC", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:rpc"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on RPC"}
+{"id": "attribute-filter-06", "query": "数据库索引", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:database-indexing"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on 数据库索引"}
+{"id": "attribute-filter-07", "query": "幂等性", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:idempotency"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on 幂等性"}
+{"id": "attribute-filter-08", "query": "可观测性", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:observability"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on 可观测性"}
+{"id": "attribute-filter-09", "query": "向后兼容", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:backward-compatibility"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on 向后兼容"}
+{"id": "attribute-filter-10", "query": "限流", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:concept:rate-limiting"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on 限流"}
+{"id": "attribute-filter-11", "query": "SQLite", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:technology:sqlite"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on SQLite"}
+{"id": "attribute-filter-12", "query": "SQLite WAL", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:technology:sqlite-wal"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on SQLite WAL"}
+{"id": "attribute-filter-13", "query": "SQLite FTS5", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:technology:sqlite-fts5"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on SQLite FTS5"}
+{"id": "attribute-filter-14", "query": "Tokio", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:technology:tokio"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on Tokio"}
+{"id": "attribute-filter-15", "query": "tonic", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:technology:tonic"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on tonic"}
+{"id": "attribute-filter-16", "query": "Qdrant", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:technology:qdrant"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on Qdrant"}
+{"id": "attribute-filter-17", "query": "错误处理", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:practice:error-handling"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on 错误处理"}
+{"id": "attribute-filter-18", "query": "文档即代码", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:practice:documentation-as-code"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on 文档即代码"}
+{"id": "attribute-filter-19", "query": "测试驱动开发", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:practice:test-driven"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "beginner"}]}, "notes": "level filter on 测试驱动开发"}
+{"id": "attribute-filter-20", "query": "监控实践", "kind": "attribute_filter", "expected_entity_ids": ["tech-docs:practice:monitoring"], "filters": {"conditions": [{"type": "text_equals", "field": "level", "value": "advanced"}]}, "notes": "level filter on 监控实践"}
+{"id": "negative-01", "query": "不存在的概念术语1", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-02", "query": "不存在的概念术语2", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-03", "query": "不存在的概念术语3", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-04", "query": "不存在的概念术语4", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-05", "query": "不存在的概念术语5", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-06", "query": "不存在的概念术语6", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-07", "query": "不存在的概念术语7", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-08", "query": "不存在的概念术语8", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-09", "query": "不存在的概念术语9", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-10", "query": "不存在的概念术语10", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-11", "query": "不存在的概念术语11", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-12", "query": "不存在的概念术语12", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-13", "query": "不存在的概念术语13", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-14", "query": "不存在的概念术语14", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}
+{"id": "negative-15", "query": "不存在的概念术语15", "kind": "negative", "expected_entity_ids": [], "filters": {}, "notes": "zero-hit negative"}

@@ -2868,6 +2868,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiktor-adapter-meilisearch"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "wiktor-core",
+]
+
+[[package]]
 name = "wiktor-cli"
 version = "0.1.0"
 dependencies = [
@@ -2881,9 +2895,11 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wiktor-adapter-meilisearch",
  "wiktor-core",
  "wiktor-feedback",
  "wiktor-server",
+ "wiktor-vector-qdrant",
 ]
 
 [[package]]
@@ -2899,7 +2915,6 @@ dependencies = [
  "libsqlite3-sys",
  "petgraph 0.6.5",
  "pulldown-cmark 0.12.2",
- "qdrant-client",
  "reqwest",
  "semver",
  "serde",
@@ -2947,6 +2962,18 @@ dependencies = [
  "tracing",
  "wiktor-core",
  "wiktor-feedback",
+]
+
+[[package]]
+name = "wiktor-vector-qdrant"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "blake3",
+ "qdrant-client",
+ "tokio",
+ "uuid",
+ "wiktor-core",
 ]
 
 [[package]]

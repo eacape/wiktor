@@ -92,7 +92,8 @@ pub(crate) fn classify_error(err: &Error) -> i32 {
         | Error::Database(_)
         | Error::Io(_)
         | Error::VectorStore(_)
-        | Error::QdrantConnection(_) => EXIT_RUN_FAILURE,
+        | Error::QdrantConnection(_)
+        | Error::External(_) => EXIT_RUN_FAILURE,
         // Internal / Serialization / 其余未列出变体 = 未分类内部错误 → 4。
         // Internal / Serialization / every other unlisted variant = unclassified
         // internal error → 4.

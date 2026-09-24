@@ -35,7 +35,7 @@ use wiktor_core::kernel::{MockVectorStore, SqliteKernel};
 use wiktor_core::query_engine::hybrid::RRF_K_DEFAULT;
 use wiktor_core::traits::{DistanceMetric, DomainConfig, VectorStore};
 use wiktor_core::types::error::Error;
-use wiktor_core::{QdrantVectorStore, QueryEmbedder};
+use wiktor_core::QueryEmbedder;
 
 use super::{load_domain_config_checked, load_intents_bytes_checked, report_error, EXIT_OK};
 use crate::embed;
@@ -298,7 +298,9 @@ async fn run_with_mock(
 /// `$WIKTOR_QDRANT_API_KEY` (default http://127.0.0.1:6334), same sources as
 /// `vector ping`; connection/collection errors are run failures (exit 1). The
 /// dimension comes from the embedder (dynamic for real embeddings; fixed at
-/// 768 for the deterministic one).
+/// 768 for the deterministic one). It assembles the `wiktor-vector-qdrant`
+/// plugin (STEP10 B3).
+#[cfg(feature = "vector-qdrant")]
 async fn run_with_qdrant(
     kernel: Arc<SqliteKernel>,
     embedder: Arc<dyn QueryEmbedder>,
@@ -311,7 +313,7 @@ async fn run_with_qdrant(
     let url =
         std::env::var("WIKTOR_QDRANT_URL").unwrap_or_else(|_| "http://127.0.0.1:6334".to_string());
     let api_key = std::env::var("WIKTOR_QDRANT_API_KEY").ok();
-    let store = Arc::new(QdrantVectorStore::from_config(
+    let store = Arc::new(wiktor_vector_qdrant::QdrantVectorStore::from_config(
         &url,
         api_key.as_deref(),
         dim,
@@ -329,6 +331,24 @@ async fn run_with_qdrant(
         eval_config,
     )
     .await
+}
+
+/// `wiktor eval` 的 qdrant 路径需要 `vector-qdrant` feature；缺失时明确报错。
+/// The qdrant path of `wiktor eval` requires the `vector-qdrant` feature; when
+/// missing, fail explicitly.
+#[cfg(not(feature = "vector-qdrant"))]
+async fn run_with_qdrant(
+    _kernel: Arc<SqliteKernel>,
+    _embedder: Arc<dyn QueryEmbedder>,
+    _dim: usize,
+    _config: &DomainConfig,
+    _intents_bytes: &[u8],
+    _golden: &GoldenSet,
+    _eval_config: &EvalConfig,
+) -> wiktor_core::Result<EvalOutcome> {
+    Err(wiktor_core::types::error::Error::Validation(
+        "eval requires the vector-qdrant feature (don't build with --no-default-features)".into(),
+    ))
 }
 
 /// 指标数字格式（与报告 `num()` 同口径：6 位小数，None → "-"）。

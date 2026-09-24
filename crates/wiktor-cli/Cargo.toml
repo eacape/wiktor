@@ -11,9 +11,18 @@ name = "wiktor"
 path = "src/main.rs"
 
 [dependencies]
-wiktor-core = { path = "../wiktor-core", features = ["vector-qdrant"] }
+wiktor-core = { path = "../wiktor-core" }
 wiktor-feedback = { path = "../wiktor-feedback" }
 wiktor-server = { path = "../wiktor-server", optional = true }
+# 向量后端插件（STEP10 B3）：qdrant 已拆出为独立 crate，CLI 是装配者负责依赖
+# 它；feature `vector-qdrant` 默认开启。
+# Vector-backend plugin (STEP10 B3): qdrant was split into its own crate; the CLI
+# is the assembler and depends on it; the `vector-qdrant` feature is default-on.
+wiktor-vector-qdrant = { path = "../wiktor-vector-qdrant", optional = true }
+# Meilisearch 出口插件（STEP10 B4）：可选依赖，feature `export-meilisearch` 开启。
+# The Meilisearch outlet plugin (STEP10 B4): optional dep behind the
+# `export-meilisearch` feature.
+wiktor-adapter-meilisearch = { path = "../wiktor-adapter-meilisearch", optional = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -30,7 +39,7 @@ tracing-subscriber = { workspace = true }
 # llm-openai: forwards to the same-named wiktor-core feature (spec §12 steps 6/7);
 # the CLI enables it by default; without it `--provider openai/ollama` errors
 # explicitly while mock runs offline (A23).
-default = ["llm-openai", "embedding-http"]
+default = ["llm-openai", "embedding-http", "vector-qdrant"]
 llm-openai = ["wiktor-core/llm-openai"]
 # embedding-http：转发真实嵌入客户端（真实效果实验；key/端点/模型走环境变量）。
 # CLI 默认开启；`vector build` 在无该 feature 时自动退化为确定性嵌入器。
@@ -38,6 +47,13 @@ llm-openai = ["wiktor-core/llm-openai"]
 # key/endpoint/model come from env vars). Enabled by default; `vector build`
 # degrades to the deterministic embedder without it.
 embedding-http = ["wiktor-core/embedding-http"]
+# vector-qdrant：装配 qdrant 向量后端插件（STEP10 B3）。
+vector-qdrant = ["dep:wiktor-vector-qdrant"]
+# export-meilisearch：装配 Meilisearch 出口插件（STEP10 B4；默认关闭，外部引擎
+# 是可选插件）。
+# export-meilisearch: assembles the Meilisearch outlet plugin (STEP10 B4; off by
+# default — the external engine is an optional plugin).
+export-meilisearch = ["dep:wiktor-adapter-meilisearch"]
 server = ["dep:wiktor-server"]
 
 [dev-dependencies]

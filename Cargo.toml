@@ -5,6 +5,8 @@ members = [
     "crates/wiktor-cli",
     "crates/wiktor-feedback",
     "crates/wiktor-server",
+    "crates/wiktor-vector-qdrant",
+    "crates/wiktor-adapter-meilisearch",
 ]
 
 [workspace.package]
@@ -31,7 +33,9 @@ serde_yaml_ng = "0.10"
 gray_matter = "0.2"
 pulldown-cmark = "0.12"
 
-# 向量检索（qdrant 外部服务，optional dependency in wiktor-core）
+# 向量检索（qdrant 外部服务，wiktor-vector-qdrant 插件 crate 使用；core 不再依赖）
+# Vector search (the qdrant external service, used by the wiktor-vector-qdrant
+# plugin crate; core no longer depends on it)
 qdrant-client = { version = "1.19", default-features = false }
 
 # 哈希与 ID

@@ -47,8 +47,6 @@ pub mod schema;
 pub mod seed;
 pub mod traits;
 pub mod types;
-#[cfg(feature = "vector-qdrant")]
-pub use kernel::QdrantVectorStore;
 pub use kernel::{MockVectorStore, SqliteKernel};
 pub use query_engine::{QueryEmbedder, QueryEngine};
 pub use traits::*;

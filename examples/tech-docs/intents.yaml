@@ -1,0 +1,24 @@
+# Intent templates for the technical-documentation reference dataset.
+# 技术文档参考数据集的意图模板。
+#
+# Each entry has phrases plus exactly one rule:
+# 每个条目由短语 + 恰好一个规则组成：
+#   expansion  -> IntentTemplate edge (appends terms/filters)
+#   attribute  -> AttributePropagation edge (structured filter on the fact plane)
+#   negation   -> Negation edge (RefExcludes on a reflist field)
+version: "0.1.0"
+intents:
+  - id: version_compat
+    phrases: ["版本兼容", "向后兼容"]
+    expansion:
+      text: "兼容性"
+  - id: beginner
+    phrases: ["入门指南", "新手文档"]
+    attribute:
+      field: level
+      equals: "beginner"
+  - id: no_sqlite
+    phrases: ["不要数据库", "不用数据库"]
+    negation:
+      field: tags
+      refs: ["tech-docs:technology:sqlite"]

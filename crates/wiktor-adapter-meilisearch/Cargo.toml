@@ -1,0 +1,26 @@
+[package]
+name = "wiktor-adapter-meilisearch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Wiktor 可选插件：把 accepted 页镜像到 Meilisearch（外部检索引擎出口）。"
+license.workspace = true
+repository.workspace = true
+keywords = ["meilisearch", "search", "export", "adapter"]
+categories = ["database"]
+# 依赖规则（MASTER-PLAN §8）：插件只依赖 core + 自身传输依赖，不依赖
+# server/feedback（STEP10 D5，B4）。reqwest 复用 rustls 栈。
+# Dependency rule (MASTER-PLAN §8): a plugin depends only on core + its own
+# transport, not on server/feedback (STEP10 D5, B4). reqwest reuses the rustls
+# stack.
+[dependencies]
+wiktor-core = { path = "../wiktor-core" }
+reqwest = { workspace = true, features = ["json"] }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
