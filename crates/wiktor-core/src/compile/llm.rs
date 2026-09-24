@@ -592,6 +592,7 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     fn knowledge() -> RawEntity {
         let mut fields = BTreeMap::new();
@@ -617,12 +618,15 @@ mod tests {
         )
     }
 
-    /// 计数 Mock LlmClient：固定响应/失败脚本 + 调用计数（断言单请求语义）。
+    /// 计数 Mock LlmClient：固定响应/失败脚本 + 调用计数（断言单请求语义），
+    /// 并记录最近请求的 system（断言 `compile.prompt` 真正进入请求）。
     /// Counting mock LlmClient: a fixed response/failure script plus a call
-    /// counter (asserts single-request semantics).
+    /// counter (asserts single-request semantics), capturing the latest
+    /// request's system (asserts `compile.prompt` really reaches the request).
     struct MockLlm {
         response: std::result::Result<String, CompileFailure>,
         calls: AtomicU64,
+        last_system: Mutex<Option<String>>,
     }
 
     impl MockLlm {
@@ -630,16 +634,21 @@ mod tests {
             Self {
                 response: Ok(json.to_string()),
                 calls: AtomicU64::new(0),
+                last_system: Mutex::new(None),
             }
         }
         fn err(failure: CompileFailure) -> Self {
             Self {
                 response: Err(failure),
                 calls: AtomicU64::new(0),
+                last_system: Mutex::new(None),
             }
         }
         fn count(&self) -> u64 {
             self.calls.load(Ordering::Relaxed)
+        }
+        fn last_system(&self) -> Option<String> {
+            self.last_system.lock().unwrap().clone()
         }
     }
 
@@ -647,9 +656,10 @@ mod tests {
     impl LlmClient for MockLlm {
         async fn complete(
             &self,
-            _request: LlmRequest,
+            request: LlmRequest,
         ) -> std::result::Result<LlmResponse, CompileFailure> {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            *self.last_system.lock().unwrap() = Some(request.system);
             match &self.response {
                 Ok(json) => Ok(LlmResponse {
                     json: json.clone(),
@@ -692,6 +702,30 @@ mod tests {
         );
         assert_eq!(page.content_hash, "");
         assert_eq!(page.wiki.content, "## 概述\n\n- 啵啵[[ref:r1]]\n");
+    }
+
+    // compile.prompt 生效：请求 system 使用 ctx.prompt_template（自定义 prompt
+    // 真正进入模型请求并参与 content_hash，而非硬编码 system_prompt()）。
+    // compile.prompt takes effect: the request system uses ctx.prompt_template
+    // (a custom prompt really reaches the model request and joins the
+    // content_hash, instead of the hard-coded system_prompt()).
+    #[tokio::test]
+    async fn custom_prompt_reaches_the_request() {
+        let custom = "你是自定义编译提示词 // custom compile prompt".to_string();
+        let mock = Arc::new(MockLlm::ok(&legal_envelope()));
+        let compiler = LlmCompiler {
+            client: mock.clone(),
+            policy: CompilePolicy::default(),
+        };
+        let mut c = ctx();
+        c.prompt_template = custom.clone();
+        compiler.compile(knowledge(), &c).await.unwrap();
+        assert_eq!(mock.count(), 1);
+        assert_eq!(mock.last_system(), Some(custom));
+        assert_ne!(
+            mock.last_system().as_deref(),
+            Some(system_prompt().as_str())
+        );
     }
 
     // 类型化失败直通：Retryable/Permanent 不被适配器吞掉或改类。
