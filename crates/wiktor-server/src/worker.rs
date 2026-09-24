@@ -109,9 +109,11 @@ impl CompileWorker {
         Ok(Self::new(kernel, executor, schema))
     }
 
-    /// 启动 worker 任务（回收一次 → 常驻循环），随 cancel 退出并 drain。
-    /// Spawns the worker task (one recovery → resident loop), exiting with the
-    /// cancel token after a final drain.
+    /// 启动 worker 任务（启动时回收一次 + spawn 周期 LeaseReaper → 常驻消费
+    /// 循环），随 cancel 退出并 drain（reaper cancel + join）。
+    /// Spawns the worker task (one startup recovery + a periodic LeaseReaper →
+    /// the resident consume loop), exiting with the cancel token after a final
+    /// drain (the reaper is cancelled and joined).
     pub fn spawn(self, cancel: CancellationToken) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let now = self.clock.unix_seconds();
@@ -123,7 +125,30 @@ impl CompileWorker {
                 ),
                 Err(e) => tracing::warn!(error = %e, "worker startup lease recovery failed"),
             }
+            // 周期 reaper（spec step7 §6.2 / Step8 §6.3 D8）：崩溃/失败遗留的
+            // running 租约必须周期回收，否则永久卡死。cancel + join 与
+            // executor::run 同一模式。
+            // Periodic reaper (spec step7 §6.2 / Step8 §6.3 D8): running leases
+            // orphaned by crashes/failures must be recovered periodically or they
+            // wedge forever. Cancel + join, the same pattern as executor::run.
+            let reaper_cancel = CancellationToken::new();
+            let reaper = wiktor_core::compile::lease::LeaseReaper::new(
+                self.kernel.clone(),
+                self.clock.clone(),
+                std::time::Duration::from_secs(30),
+            );
+            let reaper_handle = {
+                let reaper = reaper.clone();
+                let cancel = reaper_cancel.clone();
+                tokio::spawn(async move { reaper.run_until_cancelled(cancel).await })
+            };
             self.run_loop(cancel).await;
+            reaper_cancel.cancel();
+            match reaper_handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "worker lease reaper ended with error"),
+                Err(e) => tracing::warn!(error = %e, "worker lease reaper panicked"),
+            }
         })
     }
 

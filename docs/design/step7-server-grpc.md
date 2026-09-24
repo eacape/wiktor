@@ -265,3 +265,12 @@ worker 并发默认 1；读取 `WIKTOR_COMPILE_WORKERS`，要求 1..=8，否则�
 | STEP7-008 | API key methods 字符串拼写错误或空集合。 | 启动 fail-closed；新增权限必须同时更新 proto mapping、表、测试和英文 spec。 |
 | STEP7-009 | worker shutdown 时任务处于 running。 | cancel 后由 reaper drain/recover；最终由 lease token fencing 裁决，不直接标 succeeded。 |
 | STEP7-010 | 外部向量索引滞后 SQLite generation。 | 继续遵循 MASTER-PLAN generation 对齐与可重建契约；Search handler 不自行补写向量。 |
+
+### 实际实现偏差（2026-09-23，B4/B5 落地后登记）
+
+| ID | 偏差 | 处理 |
+|---|---|---|
+| STEP7-011 | server 侧 Compile.Admit/Worker 的 compiler 固定为 MockCompiler（离线评价基准）。 | B4 明确离线：`assemble_source` 为 server 独立装配入口（DOMAIN.yaml → policy/schema/ctx，与 CLI 语义一致，不依赖 CLI crate）；真实 LLM provider 经 `--provider` 装配路径留待 serve 层 feature 切换，不影响 search/status/审核等无编译器依赖的服务。 |
+| STEP7-012 | serve 搜索装配当前用 MockVectorStore + QUG=None。 | 离线验收注入 mock（STEP7-003 纪律）；真实 qdrant/HTTP 嵌入装配沿用 CLI `vector build` 的 env 路径，未在 serve 层重复接线；请求路径无静默切换远程服务。 |
+| STEP7-013 | `process_claimed_task` 窄接口签名不带 CancellationToken（spec STEP7-002 建议带）。 | 取消语义归上层 worker（`spawn` 外层 cancel + reaper drain）；core 窄接口保持最小面；任务终态由 publish/failure 的 kernel fencing CAS 裁决，不因取消而旁路。 |
+| STEP7-014 | legacy `WIKTOR_SERVER` 环境变量：旧 bin 的 gRPC 地址/域包经 `WIKTOR_GRPC_ADDR` / `WIKTOR_DOMAIN_PACK` / `WIKTOR_SOURCE_PATH` 注入，未新增 --grpc flag。 | 保持旧 bin 参数面 `--db --listen` 不变（STEP7-007），扩展面全走环境变量；CLI `serve` 提供显式 flag。 |

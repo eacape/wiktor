@@ -227,3 +227,12 @@ Implementation deviations append rows; they do not rewrite existing rows or hide
 | STEP7-008 | API method spelling or empty sets are invalid. | Fail startup closed; every new permission updates proto mapping, tables, tests, and this English spec. |
 | STEP7-009 | Worker shutdown can leave a task running. | Cancel then let reaper drain/recover; lease-token fencing decides the terminal owner; never mark succeeded directly. |
 | STEP7-010 | External vector index may lag SQLite generation. | Follow the MASTER-PLAN generation-alignment and rebuildability contract; Search does not repair vectors itself. |
+
+### Actual implementation deviations (registered 2026-09-23, after B4/B5 landed)
+
+| ID | Deviation | Handling |
+|---|---|---|
+| STEP7-011 | The server-side Compile.Admit/Worker compiler is pinned to MockCompiler (the offline acceptance baseline). | B4 is explicitly offline: `assemble_source` is a server-local assembly entry (DOMAIN.yaml → policy/schema/ctx, semantics identical to the CLI, no dependency on the CLI crate); the real-LLM provider assembly path (via `--provider`) stays on the serve-layer feature switch and does not affect compiler-free services such as search/status/review. |
+| STEP7-012 | The serve search assembly currently uses MockVectorStore + QUG=None. | Offline acceptance injects mocks (STEP7-003 discipline); the real qdrant/HTTP-embedding assembly reuses the CLI `vector build` env path and is not re-wired at the serve layer; the request path never silently switches remote services. |
+| STEP7-013 | The `process_claimed_task` narrow-interface signature carries no CancellationToken (spec STEP7-002 suggested one). | Cancellation semantics rest with the upper worker (outer `spawn` cancel + reaper drain); the core narrow interface stays minimal; a task's terminal state is decided by the publish/failure kernel fencing CAS, never bypassed by cancellation. |
+| STEP7-014 | Legacy `WIKTOR_SERVER` env: the old bin's gRPC address/domain pack come via `WIKTOR_GRPC_ADDR` / `WIKTOR_DOMAIN_PACK` / `WIKTOR_SOURCE_PATH`, not a new --grpc flag. | The old bin's `--db --listen` surface is preserved (STEP7-007); all extensions go through env vars; the CLI `serve` exposes explicit flags. |
