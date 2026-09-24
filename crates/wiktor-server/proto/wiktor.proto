@@ -1,0 +1,221 @@
+// Wiktor v1 gRPC 服务面（Step 7 落地依赖 #7，spec step7 §4）。
+// The Wiktor v1 gRPC service surface (Step 7 dependency #7, spec step7 §4).
+//
+// 字段号固定后不得复用；新增字段只追加。所有字符串有服务端预算（§4）：
+// domain 128 / query text 16 KiB / filters JSON 16 KiB / page size 1..=100 /
+// task id / review id 为正整数。
+// Field numbers are frozen once used; new fields are only appended. Every
+// string has a server-side budget (§4): domain 128 / query text 16 KiB /
+// filters JSON 16 KiB / page size 1..=100 / task id / review id positive ints.
+syntax = "proto3";
+
+package wiktor.v1;
+
+// 检索服务：混合检索（QUG 改写 → 过滤下推 → FTS5 + 向量 → RRF 融合）。
+// Search service: hybrid retrieval (QUG rewrite → filter pushdown → FTS5 +
+// vector → RRF fusion).
+service Search {
+  rpc Search(SearchRequest) returns (SearchResponse);
+}
+
+// 编译服务：Admit 只创建 compile_tasks 并返回汇总（不含模型调用）；后台
+// CompileWorker 异步消费，状态经 Status 轮询。
+// Compile service: Admit only creates compile_tasks and returns a summary (no
+// model calls); a background CompileWorker consumes asynchronously and Status
+// polls it.
+service Compile {
+  rpc Admit(CompileAdmitRequest) returns (CompileAdmitResponse);
+  rpc Status(CompileStatusRequest) returns (CompileStatusResponse);
+}
+
+// QUG 构建服务：同步执行一次 bounded build/publish。
+// QUG build service: one synchronous bounded build/publish.
+service QugBuild {
+  rpc Build(QugBuildRequest) returns (QugBuildResponse);
+}
+
+// 审核服务：List / Approve / Ignore；reviewer 取认证 label，不接受客户端传。
+// Review service: List / Approve / Ignore; the reviewer comes from the auth
+// label, never from the client.
+service Review {
+  rpc List(ReviewListRequest) returns (ReviewListResponse);
+  rpc Approve(ReviewDecisionRequest) returns (ReviewDecisionResponse);
+  rpc Ignore(ReviewDecisionRequest) returns (ReviewDecisionResponse);
+}
+
+// 兼容检查服务：只读 preflight，不建任务不写 review。
+// Compatibility check service: read-only preflight, no task/review writes.
+service Compatibility {
+  rpc Check(CompatibilityCheckRequest) returns (CompatibilityCheckResponse);
+}
+
+// 状态服务：schema 版本 + 行数摘要。
+// Status service: schema version + row-count summary.
+service Status {
+  rpc Get(StatusRequest) returns (StatusResponse);
+}
+
+// —— Search ——
+
+message SearchRequest {
+  string domain = 1;
+  string text = 2;
+  string filters_json = 3;
+  uint32 top_k = 4;
+}
+
+message SearchResponse {
+  repeated SearchHit hits = 1;
+  optional RewrittenQuery rewritten = 2;
+  bool rewrite_failure = 3;
+  string diagnostics_json = 4;
+  uint64 latency_ms = 5;
+  int64 log_id = 6;
+}
+
+message SearchHit {
+  string page_id = 1;
+  string entity_id = 2;
+  float score = 3;
+  string title = 4;
+}
+
+message RewrittenQuery {
+  repeated string expanded_terms = 1;
+  string filters_json = 2;
+  repeated string boost_entity_ids = 3;
+}
+
+// —— Compile ——
+
+message CompileAdmitRequest {
+  string domain = 1;
+  string source_path = 2;
+  string source_format = 3;
+  string domain_pack_path = 4;
+  string domain_pack_version = 5;
+  bool force = 6;
+  uint32 max_entities = 7;
+  string options_json = 8;
+}
+
+message CompileAdmitResponse {
+  CompileTaskSummary summary = 1;
+}
+
+message CompileTaskSummary {
+  string run_id = 1;
+  uint32 scanned = 2;
+  uint32 admitted = 3;
+  uint32 skipped = 4;
+  repeated int64 task_ids = 5;
+}
+
+message CompileStatusRequest {
+  int64 task_id = 1;
+  string domain = 2;
+}
+
+message CompileStatusResponse {
+  int64 task_id = 1;
+  string domain = 2;
+  string entity_id = 3;
+  string status = 4;
+  string result = 5;
+  uint32 attempt_count = 6;
+  uint32 retry_count = 7;
+  uint32 recompile_count = 8;
+  string error_code = 9;
+  int64 updated_at = 10;
+  int64 lease_expires_at = 11;
+}
+
+// —— QugBuild ——
+
+message QugBuildRequest {
+  string domain = 1;
+  string domain_version = 2;
+  string qug_config_json = 3;
+  bytes intents_yaml = 4;
+  string domain_config_json = 5;
+  bool force = 6;
+}
+
+message QugBuildResponse {
+  string domain = 1;
+  string source_hash = 2;
+  uint32 edge_count = 3;
+  bool published = 4;
+  bool reused = 5;
+}
+
+// —— Review ——
+
+message ReviewListRequest {
+  string domain = 1;
+  string status = 2;
+  uint32 limit = 3;
+}
+
+message ReviewItem {
+  int64 review_id = 1;
+  string domain = 2;
+  string action = 3;
+  string status = 4;
+  string subject_json = 5;
+  string reason_json = 6;
+  int64 created_at = 7;
+  int64 reviewed_at = 8;
+  string reviewed_by = 9;
+  int64 compile_task_id = 10;
+}
+
+message ReviewListResponse {
+  repeated ReviewItem items = 1;
+}
+
+message ReviewDecisionRequest {
+  int64 review_id = 1;
+  string domain = 2;
+}
+
+message ReviewDecisionResponse {
+  ReviewItem item = 1;
+}
+
+// —— Compatibility ——
+
+message CompatibilityCheckRequest {
+  string domain = 1;
+  string domain_config_json = 2;
+  bool include_artifacts = 3;
+}
+
+message CompatibilityCheckResponse {
+  bool compatible = 1;
+  CompatibilityReport report = 2;
+}
+
+message CompatibilityReport {
+  repeated CompatibilityFinding findings = 1;
+  string current_versions_json = 2;
+}
+
+message CompatibilityFinding {
+  string code = 1;
+  string component = 2;
+  string expected = 3;
+  string actual = 4;
+  string message = 5;
+}
+
+// —— Status ——
+
+message StatusRequest {}
+
+message StatusResponse {
+  string schema_version = 1;
+  bool healthy = 2;
+  map<string, uint64> row_counts = 3;
+  string server_version = 4;
+}

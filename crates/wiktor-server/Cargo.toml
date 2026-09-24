@@ -32,6 +32,18 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 blake3 = { workspace = true }
 
+# gRPC 面（Step 7 落地依赖 #7，spec step7 §3 D1/D12）：tonic 主协议 + tonic-prost
+# 消息 + prost；仅本 crate 直接依赖，core 不引 gRPC（§1 非目标）。
+# gRPC surface (Step 7 dependency #7, spec step7 §3 D1/D12): tonic as the
+# primary protocol + tonic-prost messages + prost; only this crate depends on
+# them directly, core never imports gRPC (§1 non-goal).
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
 [dev-dependencies]
 # tower oneshot + http-body-util：离线（不联网）的 router 请求/响应驱动，验证
 # A5–A8/A17。

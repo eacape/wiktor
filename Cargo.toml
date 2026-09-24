@@ -86,11 +86,23 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 clap = { version = "4.5", features = ["derive", "env"] }
 
 # HTTP server（Step 6 批5，spec step6 §3 D2：axum 0.7 + tower 0.5，仅
-# POST /feedback、GET /health、GET /metrics 三路 endpoint，不引 tonic）。
+# POST /feedback、GET /health、GET /metrics 三路 endpoint）。
 # HTTP server (Step 6 batch 5, spec step6 §3 D2: axum 0.7 + tower 0.5, only the
-# three endpoints POST /feedback, GET /health, GET /metrics; no tonic).
+# three endpoints POST /feedback, GET /health, GET /metrics).
 axum = "0.7"
 tower = "0.5"
+
+# gRPC（Step 7 落地依赖 #7，spec step7 §3 D1/D12：tonic 主协议 + prost 消息；
+# 仅 wiktor-server 直接依赖，core 不引 gRPC；tonic-prost-build 需 protoc 生成
+# 代码——tonic-build 0.14 已把 prost codegen 迁到独立的 tonic-prost-build）。
+# gRPC (Step 7 dependency #7, spec step7 §3 D1/D12: tonic as the primary
+# protocol + prost messages; only wiktor-server depends on it directly, core
+# never imports gRPC; tonic-prost-build needs protoc to generate code —
+# tonic-build 0.14 moved prost codegen to the separate tonic-prost-build crate).
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
 
 # 测试（Step 6 批5）：tower oneshot 的响应体收集，与 axum 0.7 的 http-body 1.x
 # 配套（http-body-util 0.1 是 axum 0.7 的既有传递配套版本）。

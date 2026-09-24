@@ -58,11 +58,22 @@
 //! never held across await — no DB lock in this crate crosses an await point).
 
 pub mod auth;
+pub mod error;
 pub mod metrics;
 pub mod rate_limit;
 pub mod state;
 #[cfg(test)]
 mod tests;
+
+// Step 7 落地依赖 #7（spec step7 §3 D1/D12）：tonic gRPC 服务面。proto 生成
+// 代码经 tonic::include_proto! 引入（见 grpc.rs），六 service 实现放
+// services/ 子模块。core 不依赖本模块（§1 非目标）。
+// Step 7 dependency #7 (spec step7 §3 D1/D12): the tonic gRPC service surface.
+// The proto-generated code is pulled in via tonic::include_proto! (see
+// grpc.rs); the six service implementations live under services/. core never
+// depends on this module (§1 non-goal).
+pub mod grpc;
+pub mod services;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

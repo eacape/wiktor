@@ -65,7 +65,11 @@ fn env() -> Env {
 }
 
 fn keys() -> ApiKeys {
-    ApiKeys::parse(r#"{"milk-tea":"s3cret-milk-tea"}"#).unwrap()
+    // Step7 D2：HTTP feedback 测试沿用旧格式 key（仅 feedback 权限），
+    // 语义不变。
+    // Step7 D2: the HTTP feedback tests reuse the legacy-format key (feedback
+    // only), semantics unchanged.
+    ApiKeys::parse_legacy(r#"{"milk-tea":"s3cret-milk-tea"}"#).unwrap()
 }
 
 fn insert_log(kernel: &SqliteKernel, domain: &str) -> i64 {
