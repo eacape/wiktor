@@ -522,6 +522,8 @@ wiktor/                          # Cargo workspace 单仓
 
 11. 性能与实证收口（criterion 基准 + 反馈闭环迭代实证 + QUG vs 静态跨域复测）+ Web console（本地形态，从"远期 Web UI"拉入）✅（Step 11 已交付，2026-09-25；①`criterion` 三档基准：逐查询 P99 ≤ 2ms 全达标（纯FTS<20ms/混合<50ms/含QUG<60ms，`docs/design/step11-benchmarks(.en).md` §7）；②反馈闭环迭代实证：零召回盲点 → 分析器检出 → 补编译 → recall@1 0→1（集成测试 `feedback_loop_iteration.rs`）；③QUG vs 静态跨域复测：milk-tea/tech-docs 两域 gain_pp(B→C) 均 <5pp → disabled，静态基线 A 显著低于 C（`qug_vs_static.rs`）；④`wiktor domain list` CLI 与 `GET /metrics` 增补；⑤Web console 新 crate `wiktor-console`（feature `console` 默认关，`wiktor console --db --listen`）：in-process 读 `SqliteKernel` + `/` 返回 `docs/console_ui/code.html` 原型视觉 + `/api/overview|tasks|reviews|qug|search|domains`（search 与 CLI 同源 QueryEngine 返回 QueryDiagnostics），端到端 curl 实测 PASS；TUI（ratatui）暂缓（crates.io 不可达）；实现偏差见 `docs/design/step11-console(.en).md` §7（STEP11-001..005））
 
+12. TUI（补 Step11 欠账）+ console 前端真实数据 + 生产部署编排 ✅（Step 12 已交付，2026-09-25；①`wiktor tui`（feature `tui`，ratatui 0.29 + crossterm 0.28）：四 Tab（仪表盘/任务/审阅/查询）与 Web console 同源数据面（in-process kernel 读 + QueryEngine 混合 fallback），state 纯函数 + TestBackend 测试，键盘导航（1-4/Tab/Enter/q）；②console 前端接真实数据：`/api/overview` 增 due 任务状态计数，`code.html` 挂 `data-live` 标记 + vanilla fetch 渲染层（15s 轮询、offline 徽标回退、检索框接 `POST /api/search` 渲染 hits 与 fts/vector/rrf_k 分路诊断），浏览器实测真实 seed 数据渲染 PASS；③生产部署编排 `deploy/`：`wiktor-server`/`wiktor-console` systemd 单元（沙箱对齐 litestream，loopback 监听）+ `wiktor.env.example`（WIKTOR_API_KEYS）+ `install-wiktor.sh`（服务器 release 构建，幂等）+ `smoke-deploy.sh` + bring-up runbook，Linux Debian 13 实机部署验收；前置：rsproxy 镜像解锁 crates.io（STEP11-001/005 根因解除）；偏差见 `docs/design/step12-tui-console-prod(.en).md` §7（STEP12-001..004））
+
 ## 变更记录
 
 **v3.1（2026-09-20）相对 v3**：

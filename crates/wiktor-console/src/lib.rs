@@ -23,6 +23,12 @@ use wiktor_core::kernel::{MockVectorStore, SqliteKernel};
 use wiktor_core::query_engine::QueryEngine;
 use wiktor_core::traits::{DistanceMetric, VectorStore as _};
 
+/// TUI console（STEP12 B1，feature `tui`）：与 Web console 同源数据面的终端形态。
+/// The TUI console (STEP12 B1, feature `tui`): the terminal form sharing the
+/// Web console's data plane.
+#[cfg(feature = "tui")]
+pub mod tui;
+
 /// console 共享状态：一个只读 SqliteKernel + 同源混合检索引擎 + 静态资源目录。
 /// The console's shared state: one read-only SqliteKernel + the same-source
 /// hybrid query engine + a static dir.
@@ -128,16 +134,34 @@ async fn index_html(State(s): State<ConsoleState>) -> impl IntoResponse {
     }
 }
 
-/// `GET /api/overview`：schema + 行数 + 编译任务计数 + 审阅 pending 数。
-/// `GET /api/overview`: schema + row counts + compile-task counts + review-pending.
+/// `GET /api/overview`：schema + 行数 + 审阅 pending 数 + due 任务状态计数
+/// （STEP12 B2：前端状态机五胶囊的真实数据源；计数遍历 due 任务快照）。
+/// `GET /api/overview`: schema + row counts + review-pending + due-task status
+/// counts (STEP12 B2: the real data source for the frontend's five state pills;
+/// the counts walk the due-task snapshots).
 async fn overview(State(s): State<ConsoleState>) -> impl IntoResponse {
     let schema = s.kernel.schema_version().unwrap_or_default();
     let rows = s.kernel.row_counts().unwrap_or_default();
     let pending = s.kernel.count_pending_reviews().unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    let mut status_counts = std::collections::BTreeMap::new();
+    for id in s
+        .kernel
+        .list_due_compile_task_ids(now, 100)
+        .unwrap_or_default()
+    {
+        if let Ok(Some(st)) = s.kernel.compile_task_status(id) {
+            *status_counts.entry(st.status).or_insert(0u64) += 1;
+        }
+    }
     Json(serde_json::json!({
         "schema_version": schema,
         "row_counts": rows,
         "review_pending": pending,
+        "task_status_counts": status_counts,
     }))
 }
 

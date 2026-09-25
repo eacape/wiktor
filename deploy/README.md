@@ -73,6 +73,61 @@ litestream ltx -config /etc/litestream.yml /srv/wiktor/data/wiktor.db
 3. 校验恢复库：`PRAGMA integrity_check`=ok、关键表存在、`wiktor status --db <恢复库>`
 4. 人工确认后，维护窗口内原子替换主库路径并重启 server → litestream
 
+## Wiktor 服务部署（Step12）/ Wiktor service deployment (Step12)
+
+> 依据 `docs/design/step12-tui-console-prod.md` §4 B3（EN `step12-tui-console-prod.en.md`）。
+> Per `docs/design/step12-tui-console-prod.md` §4 B3 (EN:
+> `step12-tui-console-prod.en.md`).
+
+### 新增文件 / New files
+
+| 文件 | 作用 |
+|---|---|
+| `install-wiktor.sh` | 服务器 release 构建（`-j2`）→ 安装 `/usr/local/bin/wiktor` + 两个 systemd 单元 → 生成 env（幂等，不覆盖已有）→ `enable --now` |
+| `wiktor-server.service` | `wiktor serve`（HTTP 8080 + gRPC 50051，沙箱与 litestream.service 对齐，数据 `/srv/wiktor/data`） |
+| `wiktor-console.service` | `wiktor console`（只读监督面，仅绑 `127.0.0.1:8081`） |
+| `wiktor.env.example` | `/etc/wiktor/wiktor.env` 模板：`WIKTOR_API_KEYS`（方法级 key）+ `WIKTOR_COMPILE_WORKERS` |
+| `smoke-deploy.sh` | 部署冒烟：systemd 活性 / `/health` 200 / 无 key 401、有 key 200 / console 200（全 PASS → `SMOKE PASS`） |
+
+### Bring-up runbook（全新机器 / fresh box）
+
+```sh
+# 0. Rust 工具链（服务器构建需要；Debian 13 建议 rustup + 国内镜像，
+#    见 wiktor-project 记忆的 rsproxy/ tuna 配置）
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+
+# 1. 上传本仓库到 /srv/wiktor（代码纪律：本机 commit → Linux apply → push）
+# 2. （2G 内存机器）加 swap 再构建，避免 release OOM：
+fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+
+# 3. 安装（构建 + 装 unit + 起服务；首次会生成 /etc/wiktor/wiktor.env）
+sudo ./deploy/install-wiktor.sh
+
+# 4. 编辑 /etc/wiktor/wiktor.env：把 WIKTOR_API_KEYS 的 secret 换成强随机值，
+#    然后 systemctl restart wiktor-server
+# 5. 冒烟（本机 loopback；全部 PASS 才算部署完成）
+sudo ./deploy/smoke-deploy.sh
+
+# 6. 远程访问 console（只走 SSH 隧道，不暴露公网）：
+ssh -L 8081:127.0.0.1:8081 root@<host>   # 本机浏览器打开 http://127.0.0.1:8081
+#    公网暴露 HTTP/gRPC = 改单元监听为 0.0.0.0 + 云防火墙放行 + 强 key
+```
+
+### 升级 / Upgrade
+
+```sh
+cd /srv/wiktor && git pull   # 或 apply 新 patch
+sudo ./deploy/install-wiktor.sh   # 重建 + 重装 + 重启（幂等）
+sudo ./deploy/smoke-deploy.sh
+```
+
+### 与 litestream 的顺序 / Ordering with litestream
+
+- 先 `backup-preflight.sh` → `restore-drill.sh` 验证备份链，再长期起服务；灾难恢复流程见上文（先停 `wiktor-server litestream` 再 restore）。
+- Validate the backup chain (`backup-preflight.sh` → `restore-drill.sh`) before
+  running services long-term; disaster recovery stops `wiktor-server litestream`
+  first (see above).
+
 ## 边界 / 非目标
 
 - 不做 Raft / 自动 failover / 跨机热备：只保证单写库持续复制 + 可恢复。

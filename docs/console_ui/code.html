@@ -339,6 +339,7 @@
 <main class="flex-1 flex flex-col h-full overflow-hidden bg-background">
 <!-- SECTION A: TOP QUICK METRICS & PIPELINE HEALTH BAR -->
 <section class="border-b border-outline-variant bg-surface-container-lowest px-space-md py-space-xs flex flex-wrap items-center justify-between gap-space-sm shrink-0">
+<span data-live="offline-badge" class="hidden px-1.5 py-0.5 bg-error-container/30 text-error border border-error rounded font-code-sm text-[10px] uppercase">offline · 原型数据</span>
 <!-- Metric 1: Active Domain Packs -->
 <div class="flex items-center gap-space-sm px-space-sm py-1 border-r border-outline-variant pr-space-md">
 <span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Domain Packs:</span>
@@ -351,9 +352,9 @@
 <div class="flex items-center gap-space-sm px-space-sm py-1 border-r border-outline-variant pr-space-md">
 <span class="font-label-sm text-label-sm text-on-surface-variant uppercase">Lease &amp; Tasks:</span>
 <div class="flex items-center gap-1 font-code-sm text-code-sm">
-<span class="text-on-surface font-semibold">142 Tasks</span>
+<span class="text-on-surface font-semibold" data-live="tasks-count">142 Tasks</span>
 <span class="text-outline">|</span>
-<span class="text-tertiary">Token 68.4%</span>
+<span class="text-tertiary" data-live="pages-count">Token 68.4%</span>
 <span class="text-[10px] text-outline">(熔断: 85%)</span>
 </div>
 </div>
@@ -371,7 +372,7 @@
 <span class="w-2 h-2 rounded-full bg-tertiary animate-ping"></span>
             Review Queue:
           </span>
-<a class="px-space-sm py-0.5 bg-tertiary-container/20 text-tertiary border border-tertiary font-code-sm text-code-sm rounded hover:bg-tertiary-container/30 transition-colors" href="#arbitration">
+<a class="px-space-sm py-0.5 bg-tertiary-container/20 text-tertiary border border-tertiary font-code-sm text-code-sm rounded hover:bg-tertiary-container/30 transition-colors" href="#arbitration" data-live="review-pill">
             3 Pages Awaiting Arbitration →
           </a>
 </div>
@@ -398,23 +399,23 @@
 <div class="grid grid-cols-5 gap-space-xs font-code-sm text-code-sm mb-space-md">
 <div class="bg-surface-container border border-outline-variant p-space-xs rounded flex flex-col items-center">
 <span class="text-[10px] text-on-surface-variant font-label-sm">CLAIMED</span>
-<span class="text-on-surface font-bold text-sm">12</span>
+<span class="text-on-surface font-bold text-sm" data-live="pill-claimed">12</span>
 </div>
 <div class="bg-surface-container border border-primary/50 p-space-xs rounded flex flex-col items-center">
 <span class="text-[10px] text-primary font-label-sm">COMPILING</span>
-<span class="text-primary font-bold text-sm">8</span>
+<span class="text-primary font-bold text-sm" data-live="pill-compiling">8</span>
 </div>
 <div class="bg-surface-container border border-outline-variant p-space-xs rounded flex flex-col items-center">
 <span class="text-[10px] text-on-surface-variant font-label-sm">SCORED</span>
-<span class="text-on-surface font-bold text-sm">118</span>
+<span class="text-on-surface font-bold text-sm" data-live="pill-scored">118</span>
 </div>
 <div class="bg-tertiary-container/20 border border-tertiary p-space-xs rounded flex flex-col items-center">
 <span class="text-[10px] text-tertiary font-label-sm">REVIEW QUEUE</span>
-<span class="text-tertiary font-bold text-sm">3</span>
+<span class="text-tertiary font-bold text-sm" data-live="pill-review">3</span>
 </div>
 <div class="bg-surface-container border border-outline-variant p-space-xs rounded flex flex-col items-center">
 <span class="text-[10px] text-on-surface-variant font-label-sm">DEAD-LETTER</span>
-<span class="text-outline font-bold text-sm">0</span>
+<span class="text-outline font-bold text-sm" data-live="pill-dead">0</span>
 </div>
 </div>
 <!-- Dense Task Stream Table (Ratatui style) -->
@@ -432,7 +433,7 @@
 <th class="py-1 px-space-sm text-right">Action</th>
 </tr>
 </thead>
-<tbody class="divide-y divide-outline-variant/40">
+<tbody class="divide-y divide-outline-variant/40" data-live="tasks-tbody">
 <!-- Row 1: Review Needed -->
 <tr class="hover:bg-surface-container-high/60 transition-colors bg-surface-container/30">
 <td class="py-1 px-space-sm font-medium text-primary">#cmp-9841</td>
@@ -627,16 +628,18 @@
 <div class="mb-space-md">
 <div class="relative flex items-center">
 <span class="absolute left-3 font-code-md text-code-md text-primary select-none">query&gt;</span>
-<input class="w-full bg-surface-container-lowest border border-outline-variant focus:border-primary text-on-surface pl-16 pr-20 py-1.5 rounded font-code-sm text-code-sm outline-none transition-colors" readonly="" type="text" value="“退款流程超时如何触发人工客服？”"/>
-<button class="absolute right-1.5 px-space-sm py-1 bg-primary-container text-on-primary-container font-label-sm text-label-sm font-semibold rounded hover:bg-primary">
+<input class="w-full bg-surface-container-lowest border border-outline-variant focus:border-primary text-on-surface pl-16 pr-20 py-1.5 rounded font-code-sm text-code-sm outline-none transition-colors" type="text" id="live-search-input" placeholder="输入检索词，Enter 或 TEST EXEC 执行" value=""/>
+<button id="live-search-btn" class="absolute right-1.5 px-space-sm py-1 bg-primary-container text-on-primary-container font-label-sm text-label-sm font-semibold rounded hover:bg-primary">
                   TEST EXEC
                 </button>
 </div>
 <div class="flex items-center justify-between mt-1 px-1 font-code-sm text-code-sm text-outline">
 <span>Filter Pushdown: <code class="text-on-surface-variant">tenant_id="cn-north", domain="milk-tea"</code></span>
-<span class="text-primary">Matched: 24 chunks</span>
+<span class="text-primary" data-live="search-diagnostics">Matched: 24 chunks</span>
 </div>
 </div>
+<!-- Live Search Results (STEP12 B2: filled from POST /api/search) -->
+<div id="live-search-results" class="hidden mb-space-md border border-outline-variant rounded bg-surface-container-lowest p-space-sm font-code-sm text-code-sm"></div>
 <!-- Live RRF Multi-Path Contribution Visualizer -->
 <div class="space-y-space-sm">
 <!-- Route 1: BM25 / FTS5 Full-Text -->
@@ -704,7 +707,7 @@
 </div>
 <!-- Graph Metric Header Badges -->
 <div class="flex items-center gap-space-sm font-code-sm text-code-sm text-on-surface-variant mb-space-md">
-<span class="px-2 py-0.5 bg-surface-container border border-outline-variant rounded">1,842 Active Nodes</span>
+<span class="px-2 py-0.5 bg-surface-container border border-outline-variant rounded" data-live="qug-pages">1,842 Active Nodes</span>
 <span class="px-2 py-0.5 bg-surface-container border border-outline-variant rounded">5 Edge Types</span>
 <span class="px-2 py-0.5 bg-surface-container border border-outline-variant rounded text-primary">Intent/Entity/Negation</span>
 </div>
@@ -803,4 +806,143 @@
       }
     });
   </script>
-</body></html>
+<script>
+      // STEP12 B2（D4）：渲染层——把面板接到真实 /api/* 数据。无构建步骤；
+      // 任何 fetch 失败 → 显示 offline 徽标并保留原型静态文案（优雅回退）。
+      // STEP12 B2 (D4): the rendering layer — wires the panels to the real
+      // /api/* data. No build step; any fetch failure shows the offline badge
+      // and keeps the prototype's static copy (graceful fallback).
+      (function () {
+        "use strict";
+        var q = function (sel) { return document.querySelector(sel); };
+        var set = function (sel, text) {
+          var el = q(sel);
+          if (el) el.textContent = text;
+        };
+        var esc = function (s) {
+          var d = document.createElement("div");
+          d.textContent = s == null ? "" : String(s);
+          return d.innerHTML;
+        };
+
+        function fetchJson(path, opts) {
+          var ctrl = new AbortController();
+          var timer = setTimeout(function () { ctrl.abort(); }, 4000);
+          return fetch(path, Object.assign({ signal: ctrl.signal }, opts || {})).then(function (r) {
+            clearTimeout(timer);
+            if (!r.ok) throw new Error("HTTP " + r.status);
+            return r.json();
+          });
+        }
+
+        function offline(on) {
+          var badge = q('[data-live="offline-badge"]');
+          if (badge) badge.classList.toggle("hidden", !on);
+        }
+
+        function renderTasks() {
+          fetchJson("/api/tasks").then(function (data) {
+            var tbody = q('[data-live="tasks-tbody"]');
+            if (!tbody) return;
+            var rows = (data.tasks || []).slice(0, 20).map(function (t) {
+              var pill =
+                '<span class="px-1.5 py-0.2 rounded text-[10px] bg-surface-container text-primary border border-primary/40">' +
+                esc(t.status) + "</span>";
+              return (
+                '<tr class="hover:bg-surface-container-high/60 transition-colors">' +
+                '<td class="py-1 px-space-sm font-medium text-primary">#' + esc(t.task_id) + "</td>" +
+                '<td class="py-1 px-space-sm text-on-surface">' + esc(t.entity_id) + "</td>" +
+                '<td class="py-1 px-space-sm text-on-surface-variant">—</td>' +
+                '<td class="py-1 px-space-sm text-on-surface-variant">—</td>' +
+                '<td class="py-1 px-space-sm">—</td>' +
+                '<td class="py-1 px-space-sm">—</td>' +
+                '<td class="py-1 px-space-sm">' + pill + "</td>" +
+                '<td class="py-1 px-space-sm text-right text-outline">—</td>' +
+                "</tr>"
+              );
+            });
+            if (rows.length) tbody.innerHTML = rows.join("");
+          }).catch(function () { /* 任务表失败不置 offline（overview 已兜底） */ });
+        }
+
+        function renderOverview() {
+          fetchJson("/api/overview")
+            .then(function (data) {
+              offline(false);
+              var rc = data.row_counts || {};
+              set('[data-live="tasks-count"]', (rc.compile_tasks != null ? rc.compile_tasks : "–") + " Tasks");
+              set('[data-live="pages-count"]', (rc.pages != null ? rc.pages : "–") + " Pages");
+              set('[data-live="review-pill"]', (data.review_pending || 0) + " Pages Awaiting Arbitration →");
+              var counts = data.task_status_counts || {};
+              var c = function (k) { return counts[k] != null ? counts[k] : 0; };
+              // 状态机五胶囊：due 任务真实状态计数 + 审阅 pending。
+              set('[data-live="pill-claimed"]', c("claimed"));
+              set('[data-live="pill-compiling"]', c("compiling"));
+              set('[data-live="pill-scored"]', c("scored"));
+              set('[data-live="pill-review"]', data.review_pending || 0);
+              set('[data-live="pill-dead"]', c("dead"));
+              renderTasks();
+            })
+            .catch(function () { offline(true); });
+          fetchJson("/api/qug")
+            .then(function (data) {
+              set('[data-live="qug-pages"]', (data.published_pages != null ? data.published_pages : "–") + " Published Pages · gen " + (data.generations != null ? data.generations : "–"));
+            })
+            .catch(function () { /* QUG 徽标失败保持原型文案 */ });
+        }
+
+        function runSearch() {
+          var input = q("#live-search-input");
+          var box = q("#live-search-results");
+          if (!input || !box || !input.value.trim()) return;
+          fetchJson("/api/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ q: input.value.trim(), top_k: 5 }),
+          })
+            .then(function (data) {
+              var diag = q('[data-live="search-diagnostics"]');
+              if (data.error) {
+                if (diag) diag.textContent = "Search error: " + data.error;
+                return;
+              }
+              if (diag) {
+                var d = data.diagnostics || {};
+                diag.textContent =
+                  "Matched: " + (data.hits || []).length + " hits · fts " + (d.fts_count || 0) +
+                  " / vec " + (d.vector_count || 0) + " / rrf_k " + (d.rrf_k || 0) +
+                  " · " + (data.latency_ms || 0) + "ms";
+              }
+              var hits = (data.hits || []).map(function (h) {
+                return (
+                  '<div class="flex items-center justify-between py-0.5 border-b border-outline-variant/40">' +
+                  '<span class="text-on-surface">' + esc(h.title) + "</span>" +
+                  '<span class="text-primary">' + esc(h.entity_id) + " · " + (h.score || 0).toFixed(4) + "</span>" +
+                  "</div>"
+                );
+              });
+              box.innerHTML = hits.length
+                ? hits.join("")
+                : '<div class="text-outline">（无命中 no hits）</div>';
+              box.classList.remove("hidden");
+            })
+            .catch(function (e) {
+              if (q('[data-live="search-diagnostics"]')) {
+                q('[data-live="search-diagnostics"]').textContent = "Search failed: " + e.message;
+              }
+            });
+        }
+
+        var btn = q("#live-search-btn");
+        var input = q("#live-search-input");
+        if (btn) btn.addEventListener("click", runSearch);
+        if (input)
+          input.addEventListener("keydown", function (e) {
+            if (e.key === "Enter") runSearch();
+          });
+
+        renderOverview();
+        setInterval(renderOverview, 15000);
+      })();
+    </script>
+  </body></html>

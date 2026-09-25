@@ -40,5 +40,5 @@ For the endpoint contract and implementation deviations (STEP11-001..005, coveri
 ## 3. Boundaries
 
 - The console is a **read-only supervisory surface**: `POST /api/search` goes through the same QueryEngine as CLI `wiktor search` (the query log is persisted to `query_logs` as usual); other than that it writes nothing — compile/review writes stay in the CLI/server.
-- `code.html` is currently a visual prototype (it fetches nothing); wiring the panels to `/api/*` is a later iteration — the JSON contract is stable and ready to consume.
-- The TUI (`wiktor tui`, ratatui) is an optional feature and is deferred (STEP11-005); it reuses the same read APIs.
+- **`code.html` is wired to real data (Step12 B2)**: when served by `wiktor console`, the panels poll `/api/*` via vanilla fetch and render (15s interval + the live search box); when the API is unreachable they fall back to the prototype's static copy with an `offline` badge — opening the file directly from disk always shows the prototype state.
+- The TUI (`wiktor tui`, ratatui, feature `tui`) shipped in Step12 B1: the same data plane as the Web console, four tabs with keyboard navigation; see `docs/design/step12-tui-console-prod(.en).md`.

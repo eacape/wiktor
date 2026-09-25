@@ -63,6 +63,10 @@ export-meilisearch = ["dep:wiktor-adapter-meilisearch"]
 # console：装配 Web console 插件（STEP11 B5）。
 console = ["dep:wiktor-console"]
 server = ["dep:wiktor-server"]
+# tui：装配 TUI console（STEP12 B1；转发 wiktor-console 的 tui feature）。
+# tui: assembles the TUI console (STEP12 B1; forwards wiktor-console's tui
+# feature).
+tui = ["dep:wiktor-console", "wiktor-console/tui"]
 
 [dev-dependencies]
 tempfile = { workspace = true }

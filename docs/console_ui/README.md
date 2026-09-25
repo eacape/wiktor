@@ -40,5 +40,5 @@ curl -X POST -H 'Content-Type: application/json' \
 ## 3. 边界
 
 - console 是**只读监督界面**：`POST /api/search` 走与 CLI `wiktor search` 同源的 QueryEngine（查询日志照常落 `query_logs`），除此之外不写任何表；编译/审阅等写操作留在 CLI/server。
-- `code.html` 当前是视觉原型（不取数）；把面板接到 `/api/*` 属后续迭代，JSON 契约已稳定可直接对接。
-- TUI（`wiktor tui`，ratatui）为可选 feature，暂缓交付（STEP11-005），复用同一组读 API。
+- **`code.html` 已接真实数据（Step12 B2）**：由 `wiktor console` 提供服务时，面板经 vanilla fetch 轮询 `/api/*` 并渲染（15s 间隔 + 检索框实时查）；API 不可达时自动回退原型静态文案并显示 `offline` 徽标——直接双击打开本地文件时始终是原型态。
+- TUI（`wiktor tui`，ratatui，feature `tui`）于 Step12 B1 交付：与 Web console 同一数据面，四 Tab 键盘导航；见 `docs/design/step12-tui-console-prod(.en).md`。

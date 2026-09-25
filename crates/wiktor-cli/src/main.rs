@@ -165,6 +165,15 @@ enum Command {
         #[arg(long)]
         static_dir: Option<PathBuf>,
     },
+    /// Run the TUI console (terminal dashboard; reads the DB read-only).
+    /// Requires the `tui` feature.
+    /// 运行 TUI console（终端仪表盘；只读读库）。需要 `tui` feature。
+    Tui {
+        /// SQLite database path (default ./wiktor.db)
+        /// SQLite 数据库路径（默认 ./wiktor.db）
+        #[arg(long, default_value = "wiktor.db")]
+        db: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -358,6 +367,14 @@ async fn main() -> Result<()> {
             anyhow::bail!(
                 "wiktor console requires the console feature (build with --features console)"
             )
+        }
+        #[cfg(feature = "tui")]
+        Command::Tui { db } => {
+            wiktor_console::tui::run(&db).await?;
+        }
+        #[cfg(not(feature = "tui"))]
+        Command::Tui { .. } => {
+            anyhow::bail!("wiktor tui requires the tui feature (build with --features tui)")
         }
         #[cfg(feature = "server")]
         Command::Serve {

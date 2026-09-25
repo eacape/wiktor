@@ -1,0 +1,26 @@
+# Wiktor Step12 — wiktor-console systemd unit（spec step12 §4 B3，D5）。
+# 只读监督面，只绑 127.0.0.1:8081；远程访问走 SSH 隧道（README runbook），
+# 不暴露公网。
+# Wiktor Step12 — the wiktor-console systemd unit (spec step12 §4 B3, D5).
+# A read-only supervisory surface bound to 127.0.0.1:8081 only; remote access
+# goes through an SSH tunnel (README runbook), never exposed publicly.
+[Unit]
+Description=Wiktor Web console (read-only supervision)
+After=network-online.target wiktor-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wiktor
+Group=wiktor
+ExecStart=/usr/local/bin/wiktor console --db /srv/wiktor/data/wiktor.db --listen 127.0.0.1:8081
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/wiktor/data
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+# Wiktor Step12 — wiktor-server systemd unit（spec step12 §4 B3，D5）。
+# 沙箱对齐 litestream.service：ProtectSystem=strict + 白名单读写数据目录；
+# 监听固定 127.0.0.1（公网暴露 = 改这里 + 防火墙放行）。
+# Wiktor Step12 — the wiktor-server systemd unit (spec step12 §4 B3, D5).
+# Sandboxing aligns with litestream.service: ProtectSystem=strict + an
+# allowlisted writable data dir; listens on 127.0.0.1 (public exposure = edit
+# here + open the firewall).
+#
+# 安装：install-wiktor.sh 会写入 /etc/systemd/system/ 并 enable --now；
+# 手动安装后执行：systemctl daemon-reload && systemctl enable --now wiktor-server
+# Installed by install-wiktor.sh into /etc/systemd/system/ and enabled; after a
+# manual install: systemctl daemon-reload && systemctl enable --now wiktor-server
+[Unit]
+Description=Wiktor server (HTTP + gRPC)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wiktor
+Group=wiktor
+EnvironmentFile=/etc/wiktor/wiktor.env
+ExecStart=/usr/local/bin/wiktor serve --db /srv/wiktor/data/wiktor.db --listen-http 127.0.0.1:8080 --listen-grpc 127.0.0.1:50051 --domain /srv/wiktor/examples/tech-docs/domain.yaml
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/wiktor/data
+
+[Install]
+WantedBy=multi-user.target
