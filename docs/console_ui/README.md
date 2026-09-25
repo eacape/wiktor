@@ -40,5 +40,5 @@ curl -X POST -H 'Content-Type: application/json' \
 ## 3. 边界
 
 - console 是**只读监督界面**：`POST /api/search` 走与 CLI `wiktor search` 同源的 QueryEngine（查询日志照常落 `query_logs`），除此之外不写任何表；编译/审阅等写操作留在 CLI/server。
-- **`code.html` 是纯真实数据界面（Step12 B2 + STEP12-005 重设计）**：四个 Tab（概览/编译任务/审阅队列/检索）全部渲染 `/api/*` 实时数据（15s 轮询），零 mock 内容；API 不可达时显示 offline 徽标并保留最后已知数据；英文为默认语言，右上角一键切换中文（localStorage 持久化）；单文件、无构建步骤、无 CDN 依赖。
+- **`code.html` 是纯真实数据界面（Step12 B2 + STEP12-005 重设计）**：四个 Tab（概览/编译任务/审阅队列/检索）全部渲染 `/api/*` 实时数据（15s 轮询），零 mock 内容；API 不可达时显示 offline 徽标并保留最后已知数据；英文为默认语言，右上角一键切换中文；暗色默认、可切亮色主题（均经 localStorage 持久化，主题未设置时跟随系统偏好）；单文件、无构建步骤、无 CDN 依赖，品牌蛛网 icon 内联。
 - TUI（`wiktor tui`，ratatui，feature `tui`）于 Step12 B1 交付：与 Web console 同一数据面，四 Tab 键盘导航；见 `docs/design/step12-tui-console-prod(.en).md`。
