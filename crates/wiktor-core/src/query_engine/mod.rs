@@ -217,7 +217,7 @@ pub trait QueryEmbedder: Send + Sync {
 
 /// 查询引擎：编排 QUG、候选域、FTS、向量、RRF 与日志。
 /// Query engine: orchestrates QUG, candidate scope, FTS, vectors, RRF and logging.
-pub struct QueryEngine<V: VectorStore> {
+pub struct QueryEngine<V: VectorStore + ?Sized> {
     pub kernel: Arc<SqliteKernel>,
     pub vector_store: Arc<V>,
     pub qug: Option<Arc<QugGraph>>,
@@ -260,7 +260,7 @@ pub struct QueryEngine<V: VectorStore> {
     pub filter_relaxer: Option<Arc<dyn FilterRelaxer>>,
 }
 
-impl<V: VectorStore> QueryEngine<V> {
+impl<V: VectorStore + ?Sized> QueryEngine<V> {
     /// 构造并校验参数（candidate_multiplier 1..=20）。
     /// Constructs the engine and validates parameters (candidate_multiplier 1..=20).
     pub fn new(

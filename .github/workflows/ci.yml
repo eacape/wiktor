@@ -1,0 +1,36 @@
+# Wiktor Step13 D6：CI 门禁——与本机收口门完全一致（fmt/clippy/test，含
+# console tui feature）。protoc 为 wiktor-server（tonic-prost-build）构建所需。
+# Wiktor Step13 D6: the CI gates — identical to the local closeout gates
+# (fmt/clippy/tests, including the console tui feature). protoc is required to
+# build wiktor-server (tonic-prost-build).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+      - name: clippy（workspace 全目标，含默认 feature）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: clippy（console tui feature，Step12 B1）
+        run: cargo clippy -p wiktor-console --features tui --all-targets -- -D warnings
+      - name: test（workspace）
+        run: cargo test --workspace
+      - name: test（console tui feature）
+        run: cargo test -p wiktor-console --features tui

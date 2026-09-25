@@ -32,6 +32,10 @@ use std::fmt;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
+use wiktor_core::embedding::deterministic::DeterministicEmbedder;
+use wiktor_core::kernel::MockVectorStore;
+use wiktor_core::query_engine::QueryEngine;
+use wiktor_core::traits::VectorStore;
 use wiktor_core::SqliteKernel;
 
 use crate::rate_limit::FixedWindowLimiter;
@@ -384,12 +388,18 @@ impl HealthCheck for KernelHealthCheck {
 
 /// 共享服务状态（handler/middleware 经 `Arc<ServerState>` 取用；DB 句柄是
 /// kernel，反馈方法走 `FeedbackStore` trait，见 `crate::lib` 的 handler）。
+/// Step13 D2：混合检索 engine 挂到状态上，HTTP `GET /search` 与 gRPC Search
+/// 共享同一实例（检索日志/诊断一处产生）。
 /// The shared server state (used by handlers/middleware through
 /// `Arc<ServerState>`; the DB handle is the kernel and feedback methods go
 /// through the `FeedbackStore` trait, see the handlers in `crate::lib`).
+/// Step13 D2: the hybrid retrieval engine hangs off the state so HTTP
+/// `GET /search` and the gRPC Search share one instance (query logs and
+/// diagnostics originate in one place).
 pub struct ServerState {
     pub kernel: Arc<SqliteKernel>,
     pub keys: ApiKeys,
+    pub engine: Arc<QueryEngine<dyn VectorStore>>,
     pub limiter: FixedWindowLimiter,
     pub metrics: Arc<crate::metrics::Metrics>,
     pub clock: Arc<dyn Clock>,
@@ -400,26 +410,61 @@ impl ServerState {
     /// 生产构造（D8 默认：60s 窗口 120 次；系统时钟；内核健康探针）。
     /// Production constructor (D8 defaults: 120 requests per 60s window; system
     /// clock; kernel health probe).
-    pub fn new(kernel: Arc<SqliteKernel>, keys: ApiKeys) -> Self {
+    pub fn new(
+        kernel: Arc<SqliteKernel>,
+        keys: ApiKeys,
+        engine: Arc<QueryEngine<dyn VectorStore>>,
+    ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let health = Arc::new(KernelHealthCheck {
             kernel: kernel.clone(),
         });
-        Self::with_parts(kernel, keys, clock, health)
+        Self::with_engine(kernel, keys, clock, health, engine)
     }
 
-    /// 全量构造（测试注入 MockClock / 失败健康探针，A8/A17）。
+    /// 全量构造（测试注入 MockClock / 失败健康探针，A8/A17）。engine 用缺省
+    /// Mock + 确定性嵌入组装并置 `fts_only`（测试只考 FTS 召回路，避免向
+    /// 量路要求预建集合；同步构造无需 async ensure）。
     /// Full constructor (tests inject a MockClock / a failing health probe,
-    /// A8/A17).
+    /// A8/A17). The engine is assembled from the default Mock store + the
+    /// deterministic embedder with `fts_only` set (tests exercise only the FTS
+    /// recall path, so no pre-created collection is needed and the constructor
+    /// stays synchronous).
     pub fn with_parts(
         kernel: Arc<SqliteKernel>,
         keys: ApiKeys,
         clock: Arc<dyn Clock>,
         health: Arc<dyn HealthCheck>,
     ) -> Self {
+        let store: Arc<dyn VectorStore> = Arc::new(MockVectorStore::new());
+        let mut engine = QueryEngine::new(
+            kernel.clone(),
+            store,
+            None,
+            Arc::new(DeterministicEmbedder::new(768)),
+            "default",
+            5,
+            60,
+        )
+        .expect("default test engine assembles");
+        engine.fts_only = true;
+        Self::with_engine(kernel, keys, clock, health, Arc::new(engine))
+    }
+
+    /// 全量构造（engine 由调用方注入，Step13 D2 生产路径）。
+    /// Full constructor (the engine is injected by the caller — the Step13 D2
+    /// production path).
+    pub fn with_engine(
+        kernel: Arc<SqliteKernel>,
+        keys: ApiKeys,
+        clock: Arc<dyn Clock>,
+        health: Arc<dyn HealthCheck>,
+        engine: Arc<QueryEngine<dyn VectorStore>>,
+    ) -> Self {
         ServerState {
             kernel,
             keys,
+            engine,
             limiter: FixedWindowLimiter::new(clock.clone(), 60, 120),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             clock,

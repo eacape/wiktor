@@ -6,14 +6,13 @@
 //! domain pack. Both the legacy `wiktor-server` bin and the CLI `wiktor serve`
 //! delegate to this entry.
 
-use std::path::Path;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use wiktor_core::embedding::deterministic::DeterministicEmbedder;
 use wiktor_core::kernel::{MockVectorStore, SqliteKernel};
-use wiktor_core::query_engine::QueryEngine;
+use wiktor_core::query_engine::{QueryEmbedder, QueryEngine};
 use wiktor_core::traits::{DistanceMetric, VectorStore};
 
 use crate::services::compatibility::CompatibilityService;
@@ -25,27 +24,47 @@ use crate::services::status::StatusService;
 use crate::state::{ApiKeys, ServerState};
 use crate::worker::CompileWorker;
 
-/// 服务启动参数（B5）。
-/// Server startup options (B5).
+/// 服务启动参数（B5；Step13 D1 增注入口）。
+/// Server startup options (B5; injection points added in Step13 D1).
 pub struct ServeOptions {
     pub db: std::path::PathBuf,
     pub listen_http: String,
     pub listen_grpc: String,
     pub domain_pack: Option<std::path::PathBuf>,
     pub source_path: Option<String>,
+    /// 注入向量后端（Step13 D1）：None → Mock（现状）；qdrant 等具体实现由
+    /// CLI 装配者按 env 构建，server 只认 core trait（Step10 插件边界）。
+    /// The injected vector backend (Step13 D1): None → Mock (status quo);
+    /// concrete implementations such as qdrant are built by the CLI assembler
+    /// from env, while the server only knows the core traits (the Step10
+    /// plugin boundary).
+    pub vector_store: Option<Arc<dyn VectorStore>>,
+    /// 注入查询嵌入器：None → 确定性嵌入（离线基线）。
+    /// The injected query embedder: None → the deterministic embedder (the
+    /// offline baseline).
+    pub embedder: Option<Arc<dyn QueryEmbedder>>,
+    /// 注入持久化 QUG 图（CLI 经 load_active_qug 加载；None → qug 缺席，
+    /// 显式混合 fallback）。
+    /// The injected persistent QUG graph (loaded by the CLI via
+    /// load_active_qug; None → the graph is absent with an explicit hybrid
+    /// fallback).
+    pub qug: Option<Arc<wiktor_core::query_engine::qug::QugGraph>>,
 }
 
 /// 启动双 listener（HTTP + gRPC）并按需启动编译 worker。
+/// Step13 D1/D2：engine 先装配（可注入），与 ServerState 共享给 HTTP /search
+/// 与 gRPC Search。
 /// Starts both listeners (HTTP + gRPC) and optionally the compile worker.
+/// Step13 D1/D2: the engine is assembled first (injectable) and shared with
+/// both HTTP /search and the gRPC Search through ServerState.
 pub async fn run_server(options: ServeOptions) -> Result<(), String> {
     let keys = ApiKeys::from_env().map_err(|e| e.to_string())?;
     let kernel = Arc::new(
         SqliteKernel::open(&options.db)
             .map_err(|e| format!("open database {}: {e}", options.db.display()))?,
     );
-    let state = Arc::new(ServerState::new(kernel.clone(), keys.clone()));
+    let (state, search) = assemble_state_and_search(kernel.clone(), keys.clone(), &options).await?;
     let http = crate::build_router(state);
-    let search = assemble_search(kernel.clone(), options.domain_pack.as_deref())?;
     let grpc = crate::grpc::router(
         keys,
         search,
@@ -96,36 +115,69 @@ pub async fn run_server(options: ServeOptions) -> Result<(), String> {
     Ok(())
 }
 
-fn assemble_search(
+/// 装配共享 engine + ServerState + gRPC Search 服务（Step13 D1/D2）。
+/// 注入项缺省回退：Mock 向量库 + 确定性嵌入（离线基线），qug=None。
+/// Assembles the shared engine + ServerState + the gRPC Search service
+/// (Step13 D1/D2). Injection defaults fall back to the Mock vector store + the
+/// deterministic embedder (the offline baseline) with qug=None.
+async fn assemble_state_and_search(
     kernel: Arc<SqliteKernel>,
-    domain_pack: Option<&Path>,
-) -> Result<SearchService<MockVectorStore>, String> {
-    let domain = domain_pack
+    keys: ApiKeys,
+    options: &ServeOptions,
+) -> Result<(Arc<ServerState>, SearchService<dyn VectorStore>), String> {
+    let domain = options
+        .domain_pack
+        .as_deref()
         .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|yaml| serde_yaml_ng::from_str::<wiktor_core::traits::DomainConfig>(&yaml).ok())
-        .map(|config| config.name)
+        .and_then(|yaml| serde_yaml_ng::from_str::<wiktor_core::traits::DomainConfig>(&yaml).ok());
+    let domain_name = domain
+        .as_ref()
+        .map(|config| config.name.clone())
         .unwrap_or_else(|| "default".to_string());
-    let store = Arc::new(MockVectorStore::new());
-    let store_for_collection = store.clone();
-    let domain_for_collection = domain.clone();
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async move {
-            store_for_collection
-                .ensure_collection(&domain_for_collection, 768, DistanceMetric::Cosine)
-                .await
-        })
-    })
-    .map_err(|e| format!("ensure vector collection: {e}"))?;
-    let qug = None;
-    let engine = QueryEngine::new(
-        kernel,
-        store,
-        qug,
-        Arc::new(DeterministicEmbedder::new(768)),
-        &domain,
-        5,
-        60,
-    )
-    .map_err(|e| format!("assemble query engine: {e}"))?;
-    Ok(SearchService::new(Arc::new(engine), 16 * 1024))
+    let store: Arc<dyn VectorStore> = match &options.vector_store {
+        Some(store) => store.clone(),
+        None => Arc::new(MockVectorStore::new()),
+    };
+    let embedder: Arc<dyn QueryEmbedder> = match &options.embedder {
+        Some(embedder) => embedder.clone(),
+        None => Arc::new(DeterministicEmbedder::new(768)),
+    };
+    // 维度探测：对探测串嵌入一次取长度（与 cmd_vector_build 同模式；确定性嵌
+    // 入恒 768，HttpEmbedder 按远端模型实测维度）。
+    // Dimension probe: embed the probe string once and take the length (the
+    // same pattern as cmd_vector_build; the deterministic embedder is always
+    // 768 while HttpEmbedder reflects the remote model's measured dimension).
+    let probe = embedder
+        .embed("wiktor-collection-dimension-probe")
+        .await
+        .map_err(|e| format!("embed dimension probe: {e}"))?;
+    let dim = probe.len();
+    store
+        .ensure_collection(&domain_name, dim, DistanceMetric::Cosine)
+        .await
+        .map_err(|e| format!("ensure vector collection: {e}"))?;
+    // QUG 图注入（CLI 已按 active build 加载，A7 语义由加载方承担）；域配置在
+    // 场时 candidate_multiplier 与 config 同源冻结。
+    // The QUG graph is injected (loaded from the active build by the CLI; the
+    // A7 semantics belong to the loader). With a domain config present, the
+    // candidate_multiplier is frozen from the same config.
+    let candidate_multiplier = domain
+        .as_ref()
+        .map(|config| config.qug.candidate_multiplier)
+        .filter(|_| options.qug.is_some())
+        .unwrap_or(5);
+    let engine = Arc::new(
+        QueryEngine::new(
+            kernel.clone(),
+            store,
+            options.qug.clone(),
+            embedder,
+            &domain_name,
+            candidate_multiplier,
+            60,
+        )
+        .map_err(|e| format!("assemble query engine: {e}"))?,
+    );
+    let state = Arc::new(ServerState::new(kernel, keys, engine.clone()));
+    Ok((state, SearchService::new(engine, 16 * 1024)))
 }

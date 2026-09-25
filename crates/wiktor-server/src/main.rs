@@ -74,6 +74,14 @@ async fn run() -> Result<(), String> {
             .ok()
             .map(std::path::PathBuf::from),
         source_path: std::env::var("WIKTOR_SOURCE_PATH").ok(),
+        // 旧 bin 无注入能力（Step13 D1：注入面在 CLI 装配者）——恒走缺省
+        // Mock + 确定性嵌入。
+        // The legacy bin has no injection capability (Step13 D1: the
+        // injection surface lives in the CLI assembler) — it always uses the
+        // default Mock + deterministic embedder.
+        vector_store: None,
+        embedder: None,
+        qug: None,
     })
     .await
 }

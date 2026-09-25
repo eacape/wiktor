@@ -1,13 +1,15 @@
-//! HTTP `GET /search` 读口（spec step7 §3 D3/D5，§6.1）：只读 FTS 检索，
-//! 与 gRPC `Search` 对齐字段形状（hits/rewrite_failure/diagnostics/latency/
-//! log_id 的 HTTP JSON 形态）。走 kernel 同步 `search`（spawn_blocking 包裹，
-//! 锁不跨 await）；认证复用 Step6 middleware，方法授权用 `search` 权限。
-//! The HTTP `GET /search` read surface (spec step7 §3 D3/D5, §6.1): a read-only
-//! FTS search whose fields align with the gRPC `Search` (the HTTP JSON shape of
-//! hits/rewrite_failure/diagnostics/latency/log_id). It uses the kernel's
-//! synchronous `search` (wrapped in spawn_blocking so locks never cross an
-//! await point); auth reuses the Step6 middleware with the `search` method
-//! permission.
+//! HTTP `GET /search` 读口（spec step7 §3 D3/D5，§6.1；Step13 D2 升级）：与
+//! gRPC `Search` 共享同一 QueryEngine（混合检索：QUG/过滤下推/FTS+向量/RRF），
+//! 检索照常落 `query_logs`（反馈闭环的数据前提），响应字段形状不变——
+//! diagnostics_json/log_id 从占位变为真实值。认证复用 Step6 middleware，方法
+//! 授权用 `search` 权限。
+//! The HTTP `GET /search` read surface (spec step7 §3 D3/D5, §6.1; upgraded in
+//! Step13 D2): it shares the same QueryEngine as the gRPC `Search` (hybrid
+//! retrieval: QUG / filter pushdown / FTS+vector / RRF) and persists
+//! `query_logs` as usual — the data prerequisite for the feedback loop. The
+//! response field shape is unchanged, with diagnostics_json/log_id going from
+//! placeholders to real values. Auth reuses the Step6 middleware with the
+//! `search` method permission.
 
 use std::sync::Arc;
 
@@ -16,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use wiktor_core::types::{Filters, SearchHit};
+use wiktor_core::types::{Filters, Query, SearchHit};
 
 /// GET /search 查询参数。
 /// The GET /search query parameters.
@@ -52,9 +54,11 @@ pub struct SearchResponse {
     pub log_id: Option<i64>,
 }
 
-/// GET /search handler：只读 FTS，认证经 middleware，`search` 方法权限。
-/// The GET /search handler: read-only FTS, authenticated by the middleware,
-/// authorized for the `search` method.
+/// GET /search handler：经共享 QueryEngine 的混合检索（Step13 D2），认证经
+/// middleware，`search` 方法权限。
+/// The GET /search handler: hybrid retrieval through the shared QueryEngine
+/// (Step13 D2), authenticated by the middleware, authorized for the `search`
+/// method.
 pub async fn search(
     State(state): State<Arc<crate::state::ServerState>>,
     axum::extract::Extension(authed): axum::extract::Extension<crate::auth::AuthedKey>,
@@ -103,37 +107,29 @@ pub async fn search(
         },
         _ => Filters::empty(),
     };
-    let kernel = state.kernel.clone();
-    let text = params.q.clone();
-    let domain = params.domain.clone();
-    let started = std::time::Instant::now();
-    let outcome = tokio::task::spawn_blocking(move || {
-        kernel.search(&text, &filters, params.top_k, Some(&domain))
-    })
-    .await;
-    let hits = match outcome {
-        Ok(Ok(hits)) => hits,
-        Ok(Err(e)) => {
+    let query = Query {
+        text: params.q,
+        filters,
+        top_k: params.top_k,
+        domain: Some(params.domain),
+    };
+    let result = match state.engine.search(&query).await {
+        Ok(result) => result,
+        Err(e) => {
             let (status, code) = crate::error::http_error(&e);
             return crate::error_json(status, code, "search failed").into_response();
         }
-        Err(e) => {
-            tracing::error!(error = %e, "search task join failed");
-            return crate::error_json(
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                crate::error::code::INTERNAL,
-                "search task failed",
-            )
-            .into_response();
-        }
     };
     let resp = SearchResponse {
-        hits,
-        rewritten: None,
-        rewrite_failure: false,
-        diagnostics_json: serde_json::json!({}),
-        latency_ms: started.elapsed().as_millis() as u64,
-        log_id: None,
+        hits: result.hits,
+        rewritten: result
+            .rewritten
+            .as_ref()
+            .map(|r| serde_json::to_value(r).unwrap_or_default()),
+        rewrite_failure: result.rewrite_failure,
+        diagnostics_json: serde_json::to_value(&result.diagnostics).unwrap_or_default(),
+        latency_ms: result.latency_ms,
+        log_id: result.log_id,
     };
     (axum::http::StatusCode::OK, Json(resp)).into_response()
 }

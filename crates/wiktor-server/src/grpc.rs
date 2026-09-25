@@ -17,9 +17,9 @@ pub mod v1 {
 /// Registers the six services on a tonic Router, each bound to its method
 /// permission's interceptor (Step7 §3.1 method-permission mapping + D3 shared
 /// semantics).
-pub fn router<V: wiktor_core::traits::VectorStore + 'static>(
+pub fn router(
     keys: crate::state::ApiKeys,
-    search: crate::services::search::SearchService<V>,
+    search: crate::services::search::SearchService<dyn wiktor_core::traits::VectorStore>,
     compile: crate::services::compile::CompileService,
     qug: crate::services::qug_build::QugBuildService,
     review: crate::services::review::ReviewService,

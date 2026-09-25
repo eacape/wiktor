@@ -110,6 +110,7 @@ pub fn router(state: ConsoleState) -> Router {
         .route("/api/tasks", get(tasks))
         .route("/api/reviews", get(reviews))
         .route("/api/qug", get(qug))
+        .route("/api/quality", get(quality))
         .route("/api/search", post(search))
         .route("/api/domains", get(domains))
         .with_state(state)
@@ -227,6 +228,18 @@ async fn qug(State(s): State<ConsoleState>) -> impl IntoResponse {
     }))
 }
 
+/// `GET /api/quality`：五维质量均值聚合（Step13 B2/D3；STEP11-003 占位的
+/// 真实实现）——kernel `quality_summary()` 只读聚合 `page_quality`。
+/// `GET /api/quality`: the five-dimension quality average aggregate (Step13
+/// B2/D3; the real implementation of the STEP11-003 placeholder) — the kernel's
+/// `quality_summary()` aggregates `page_quality` read-only.
+async fn quality(State(s): State<ConsoleState>) -> impl IntoResponse {
+    match s.kernel.quality_summary() {
+        Ok(summary) => Json(serde_json::to_value(&summary).unwrap_or_default()),
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
 /// `POST /api/search`：经 QueryEngine 的真实混合检索（与 CLI `wiktor search`
 /// 同源），返回命中 + `QueryDiagnostics` 分路诊断（rewrite/fts/vector/rrf_k）。
 /// 请求体：`{"q": "...", "top_k": 5, "domain": "可选"}`。
@@ -285,12 +298,14 @@ async fn search(
     Json(payload)
 }
 
-/// `GET /api/domains`：领域包列表（由调用方注入静态已知，或经 core
-/// domain 发现；此处返回一个空数组，供前端占位——真实领域发现由
-/// `wiktor domain list` CLI 提供）。
-/// `GET /api/domains`: domain-pack list (injected statically by the caller, or
-/// from core discovery; returns an empty array here as a placeholder — the real
-/// discovery is `wiktor domain list`).
-async fn domains() -> impl IntoResponse {
-    Json(serde_json::json!({ "domains": [] }))
+/// `GET /api/domains`：领域发现（Step13 B2/D3；STEP11-004 占位的真实实现）
+/// ——kernel `list_domains()` 按 domain 分组统计 pages。
+/// `GET /api/domains`: domain discovery (Step13 B2/D3; the real implementation
+/// of the STEP11-004 placeholder) — the kernel's `list_domains()` groups and
+/// counts pages by domain.
+async fn domains(State(s): State<ConsoleState>) -> impl IntoResponse {
+    match s.kernel.list_domains() {
+        Ok(domains) => Json(serde_json::json!({ "domains": domains })),
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
 }

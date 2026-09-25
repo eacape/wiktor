@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use diesel::connection::Connection;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -67,6 +68,66 @@ struct TextRow {
 struct CountRow {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     n: i64,
+}
+
+/// 五维质量均值聚合（quality_summary 返回；公开监督读面）。
+/// The five-dimension quality average aggregate (returned by quality_summary;
+/// a public supervisory read surface).
+#[derive(Debug, Clone, Serialize)]
+pub struct QualitySummary {
+    pub count: i64,
+    pub coverage: Option<f64>,
+    pub citation: Option<f64>,
+    pub schema_compliance: Option<f64>,
+    pub density: Option<f64>,
+    pub consistency: Option<f64>,
+    pub consistency_samples: i64,
+    pub overall: Option<f64>,
+}
+
+/// quality_summary 的 SQL 行映射（AVG 对空表返回 NULL → Option）。
+/// The SQL row mapping for quality_summary (AVG yields NULL on an empty table
+/// → Option).
+#[derive(QueryableByName)]
+struct QualitySummaryRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    count: i64,
+    // AVG 对空表返回 NULL：可空均值一律 Nullable<Double>（对齐 QualityRow 模式）。
+    // AVG returns NULL on an empty table: nullable averages use Nullable<Double>
+    // (aligned with the QualityRow pattern).
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    coverage: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    citation: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    schema_compliance: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    density: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    consistency: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    consistency_samples: i64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    overall: Option<f64>,
+}
+
+/// 领域统计（list_domains 返回；公开监督读面）。
+/// A domain stat (returned by list_domains; a public supervisory read
+/// surface).
+#[derive(Debug, Clone, Serialize)]
+pub struct DomainStat {
+    pub domain: String,
+    pub pages: i64,
+}
+
+/// list_domains 的 SQL 行映射。
+/// The SQL row mapping for list_domains.
+#[derive(QueryableByName)]
+struct DomainStatRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    domain: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    pages: i64,
 }
 
 /// Step 6 批2：新写入查询日志的 domain 缺省值（spec step6 §6：缺省
@@ -223,6 +284,60 @@ impl SqliteKernel {
         let mut conn = self.conn.lock().unwrap();
         diesel::connection::SimpleConnection::batch_execute(&mut *conn, sql)?;
         Ok(())
+    }
+
+    /// 五维质量均值聚合（Step13 B2，spec step13 §4 B2/D3）：`page_quality`
+    /// 全表只读聚合。`consistency` 可空——SQL AVG 忽略 NULL，样本数单列返回；
+    /// 无行时各均值为 `None`。console `/api/quality` 的数据源（只读监督面，
+    /// 不新增写路径）。
+    /// Five-dimension quality average aggregate (Step13 B2, spec step13 §4
+    /// B2/D3): a read-only full-table aggregate of `page_quality`. `consistency`
+    /// is nullable — SQL AVG skips NULLs and the sample count is reported
+    /// separately; with no rows every average is `None`. This feeds the
+    /// console's `/api/quality` (a read-only supervisory surface; no new write
+    /// paths).
+    pub fn quality_summary(&self) -> Result<QualitySummary> {
+        let mut conn = self.conn.lock().unwrap();
+        let row: QualitySummaryRow = diesel::sql_query(
+            "SELECT COUNT(*) AS count, AVG(coverage) AS coverage, AVG(citation) AS citation, \
+             AVG(schema_compliance) AS schema_compliance, AVG(density) AS density, \
+             AVG(consistency) AS consistency, COUNT(consistency) AS consistency_samples, \
+             AVG(overall) AS overall FROM page_quality",
+        )
+        .get_result(&mut *conn)?;
+        Ok(QualitySummary {
+            count: row.count,
+            coverage: row.coverage,
+            citation: row.citation,
+            schema_compliance: row.schema_compliance,
+            density: row.density,
+            consistency: row.consistency,
+            consistency_samples: row.consistency_samples,
+            overall: row.overall,
+        })
+    }
+
+    /// 领域发现（Step13 B2，spec step13 §4 B2/D3）：pages 按 domain 分组计数，
+    /// 页数降序、domain 升序稳定排序。console `/api/domains` 的真实数据源
+    /// （替代 STEP11-004 的占位空数组；只读）。
+    /// Domain discovery (Step13 B2, spec step13 §4 B2/D3): pages grouped and
+    /// counted by domain, ordered stably by pages desc then domain asc. This is
+    /// the real data source for the console's `/api/domains` (replacing the
+    /// STEP11-004 placeholder empty array; read-only).
+    pub fn list_domains(&self) -> Result<Vec<DomainStat>> {
+        let mut conn = self.conn.lock().unwrap();
+        let rows: Vec<DomainStatRow> = diesel::sql_query(
+            "SELECT domain AS domain, COUNT(*) AS pages FROM pages \
+             GROUP BY domain ORDER BY pages DESC, domain ASC",
+        )
+        .load(&mut *conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| DomainStat {
+                domain: r.domain,
+                pages: r.pages,
+            })
+            .collect())
     }
 
     /// 写入一条完整查询日志并返回实际 `log_id`（Step 6 批2，spec step6 §6）。

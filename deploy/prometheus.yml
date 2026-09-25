@@ -1,0 +1,26 @@
+# Wiktor Step13 D5：Prometheus 抓取配置（最小单机形态）。
+# 部署（Debian）：apt install prometheus 后，把本文件复制为
+# /etc/prometheus/prometheus.yml（或 merge scrape 段）并 systemctl reload
+# prometheus。/metrics 已是 Prometheus 文本格式（Step6 起，6 个固定指标，
+# 用户输入不作 label）。
+# Wiktor Step13 D5: the Prometheus scrape config (minimal single-node form).
+# Deploy (Debian): after `apt install prometheus`, copy this file to
+# /etc/prometheus/prometheus.yml (or merge the scrape section) and
+# `systemctl reload prometheus`. /metrics is already Prometheus text format
+# (since Step6; 6 fixed metrics, no user input as labels).
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts-wiktor.yml
+
+scrape_configs:
+  - job_name: wiktor-server
+    static_configs:
+      - targets:
+          - "127.0.0.1:8080"
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - "127.0.0.1:9090"

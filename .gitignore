@@ -11,3 +11,11 @@
 .idea/
 .zcode/
 .qdrant-initialized
+
+# 运行时数据目录（生产机 /srv/wiktor 仓库内的演练残留等，不入库）。
+# Runtime data dirs (e.g. drill leftovers inside /srv/wiktor on the prod box).
+/data/
+
+# feedback analyze 的报告三件套默认输出目录（./feedback-reports），不入库。
+# The default output dir for the feedback-analyze report trio (./feedback-reports).
+/feedback-reports/

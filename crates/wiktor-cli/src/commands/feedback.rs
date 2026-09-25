@@ -52,6 +52,7 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 use wiktor_core::kernel::feedback_store::ReviewStatus;
 use wiktor_core::kernel::SqliteKernel;
+use wiktor_core::DataSource;
 use wiktor_feedback::report::{render_json, write_report_files};
 use wiktor_feedback::{
     FeedbackAnalyzer, FeedbackStore, FeedbackWindow, ReviewItem, StandardFeedbackAnalyzer,
@@ -156,6 +157,18 @@ pub struct AnalyzeArgs {
     /// stdout 输出报告 JSON（单对象）；日志走 stderr
     #[arg(long)]
     pub json: bool,
+    /// Optional domain-pack path (STEP13-002): deterministically enrich
+    /// zero-recall `supplemental_compile` suggestions with a matched source
+    /// entity (normalized query == normalized entity title; the smallest
+    /// entity_id wins on ties) so `review approve` can queue the supplemental
+    /// compile. On a miss the report-shaped subject is kept unchanged (approve
+    /// rejects it — fail-closed, content must exist first).
+    /// 可选领域包路径（STEP13-002）：为 zero_recall 的 `supplemental_compile`
+    /// 建议做确定性实体增强（归一化查询 == 归一化实体标题；同题取最小
+    /// entity_id），使 `review approve` 可排队补编译。未命中保持报告形
+    /// subject 不变（approve 拒绝——fail-closed，内容必须先行存在）。
+    #[arg(long, value_name = "PATH")]
+    pub domain_pack: Option<String>,
 }
 
 /// `wiktor feedback list` 参数（§8 参数表）。
@@ -378,7 +391,7 @@ async fn run_analyze(args: AnalyzeArgs) -> Result<i32> {
     // —— Enqueue suggestions (UNIQUE conflicts skipped → repeated analysis is
     //       idempotent, A12; serialization failure → 4) ——
     let created_at = unix_now();
-    let inputs = match report
+    let mut inputs = match report
         .suggested_reviews
         .iter()
         .map(|s| s.to_review_suggestion_input(created_at))
@@ -387,6 +400,21 @@ async fn run_analyze(args: AnalyzeArgs) -> Result<i32> {
         Ok(i) => i,
         Err(e) => return Ok(report_error(command, e)),
     };
+    // —— STEP13-002：领域包增强（可选）。zero_recall 建议确定性回填实体
+    // subject，使 approve 可排队补编译；未命中保持报告形（fail-closed）。
+    // —— STEP13-002: optional domain-pack enrichment. Zero-recall suggestions
+    // are deterministically backfilled with an entity subject so approve can
+    // queue the supplemental compile; misses keep the report shape
+    // (fail-closed).
+    if let Some(pack) = args.domain_pack.as_deref() {
+        match enrich_zero_recall_inputs(pack, &mut inputs).await {
+            Ok(n) if n > 0 => eprintln!(
+                "wiktor {command}: enriched {n} zero-recall suggestion(s) from domain pack {pack}"
+            ),
+            Ok(_) => {}
+            Err(e) => return Ok(report_error(command, e)),
+        }
+    }
     let new_ids = match store.insert_review_suggestions(&args.domain, &inputs) {
         Ok(ids) => ids,
         Err(e) => return Ok(report_error(command, e)),
@@ -597,6 +625,217 @@ fn run_ignore(args: IgnoreArgs) -> Result<i32> {
     Ok(EXIT_OK)
 }
 
+// ===== STEP13-002：zero_recall 建议的领域包 subject 增强 =====
+// ===== STEP13-002: domain-pack subject enrichment for zero-recall suggestions =====
+
+/// 归一化标题/查询用于确定性匹配：小写并去空白、全/半角括号、连字符、下划线、
+/// 顿号/逗号/冒号。只服务「查询文本上等于某实体标题」规则，不做模糊检索。
+/// Normalizes a title/query for deterministic matching: lowercased with
+/// whitespace, full/half-width parentheses, dashes, underscores and
+/// enumerator/comma/colon separators removed. Only serves the "query textually
+/// equals an entity title" rule — no fuzzy retrieval.
+fn normalize_for_title_match(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !c.is_whitespace()
+                && !matches!(c, '（' | '）' | '(' | ')' | '-' | '_' | '、' | '，' | ',')
+                && !matches!(c, '：' | ':')
+        })
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// 增强用的领域包只读装配（与 server `assemble_source` 同源：yaml →
+/// DomainConfig → 单实体 → policy/ctx/schema/实体列表；prompt 缺省回落内置
+/// source-ref-v1 模板）。路径解析：相对路径基于 domain.yaml 所在目录。
+/// Read-only domain-pack assembly for enrichment (the same source as the
+/// server's `assemble_source`: yaml → DomainConfig → single entity →
+/// policy/ctx/schema/entities; an absent prompt falls back to the built-in
+/// source-ref-v1 template). Relative paths resolve against the domain.yaml's
+/// directory.
+struct EnrichmentPack {
+    ctx: wiktor_core::types::CompileContext,
+    policy: wiktor_core::traits::CompilePolicy,
+    schema: wiktor_core::traits::EntitySchema,
+    entities: Vec<wiktor_core::types::RawEntity>,
+}
+
+async fn load_enrichment_pack(pack_path: &str) -> Result<EnrichmentPack, wiktor_core::Error> {
+    let config: wiktor_core::traits::DomainConfig =
+        super::load_domain_config_checked(std::path::Path::new(pack_path))?;
+    let domain_dir = std::path::Path::new(pack_path)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let entity_cfg = match config.entities.len() {
+        1 => config.entities[0].clone(),
+        0 => {
+            return Err(wiktor_core::Error::InvalidConfig(
+                "domain pack declares no entities".into(),
+            ))
+        }
+        n => {
+            return Err(wiktor_core::Error::InvalidConfig(format!(
+                "subject enrichment supports single-entity packs only; {n} entities declared"
+            )))
+        }
+    };
+    let policy = config.compile_policy.clone();
+    policy.validate()?;
+    let prompt_template = match &config.compile_prompt {
+        Some(rel) => {
+            let path = if std::path::Path::new(rel).is_absolute() {
+                std::path::PathBuf::from(rel)
+            } else {
+                domain_dir.join(rel)
+            };
+            std::fs::read_to_string(&path).map_err(|e| {
+                wiktor_core::Error::InvalidConfig(format!("read prompt {}: {e}", path.display()))
+            })?
+        }
+        None => wiktor_core::compile::contract::system_prompt(),
+    };
+    let identity = config.identity()?;
+    let ctx = wiktor_core::compile::config::build_context(
+        &config.version,
+        &prompt_template,
+        "",
+        "",
+        config.quality_threshold,
+        config.compile_output_contract == "require_source_refs",
+        identity
+            .schema_version
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+        identity
+            .prompt_version
+            .as_ref()
+            .map(ToString::to_string)
+            .as_deref(),
+    );
+    let source = wiktor_core::data::JsonlDataSource::from_config(&entity_cfg, domain_dir)?;
+    let schema = source.schema();
+    // 有界分页拉全量实体（单批 1000，循环到空游标）。
+    // Paged bounded fetch of all entities (1000 per batch, loop to the empty
+    // cursor).
+    let mut entities = Vec::new();
+    let mut cursor = None;
+    loop {
+        let batch = source.fetch(cursor).await?;
+        let exhausted = batch.is_empty();
+        entities.extend(batch);
+        if exhausted {
+            break;
+        }
+        cursor = Some(wiktor_core::Cursor {
+            offset: entities.len(),
+            batch_size: wiktor_core::data::DEFAULT_BATCH_SIZE,
+        });
+    }
+    Ok(EnrichmentPack {
+        ctx,
+        policy,
+        schema,
+        entities,
+    })
+}
+
+/// 为 `supplemental_compile` + `zero_recall` 的建议做确定性实体增强。匹配规则：
+/// 归一化后查询 == 实体 `title` 字段；命中多个取 entity_id 字典序最小（确定性
+/// tie-break）。命中则把 subject 重写为五必需字段（entity_id/source_revision/
+/// domain_pack_version/source_json/dependencies_json，与 kernel approve 校验同
+/// 形状）并保留原报告键（normalized_query/log_ids/occurrences/avg_latency_ms）
+/// 供审计追溯；未命中保持报告形 subject 不变（approve 拒绝 = fail-closed）。
+/// 注意：增强改变 UNIQUE(domain,action,subject_json) 幂等键成分——同一批次内
+/// 增强 subject 幂等，但混用带/不带 `--domain-pack` 的分析可能并存两种 subject
+/// 的建议行（报告形行保留为盲点记录，approve 校验拒绝）。
+/// Deterministic entity enrichment for `supplemental_compile` + `zero_recall`
+/// suggestions. Match rule: after normalization the query equals the entity's
+/// `title` field; with multiple hits the lexicographically smallest entity_id
+/// wins (deterministic tie-break). On a hit the subject is rewritten to the
+/// five required fields (entity_id/source_revision/domain_pack_version/
+/// source_json/dependencies_json — the same shape the kernel approve
+/// validation expects) while the original report keys (normalized_query/
+/// log_ids/occurrences/avg_latency_ms) are preserved for audit; on a miss the
+/// report-shaped subject stays unchanged (approve rejects it — fail-closed).
+/// Note: enrichment changes the UNIQUE(domain,action,subject_json) idempotency
+/// key — enriched subjects are idempotent within a batch, but analyses mixing
+/// with/without `--domain-pack` can carry both subject shapes side by side
+/// (the report-shaped row stays as the blind-spot record; approve rejects it).
+async fn enrich_zero_recall_inputs(
+    pack_path: &str,
+    inputs: &mut [wiktor_core::kernel::feedback_store::ReviewSuggestionInput],
+) -> Result<usize, wiktor_core::Error> {
+    if inputs.is_empty() {
+        return Ok(0);
+    }
+    let pack = load_enrichment_pack(pack_path).await?;
+    let pack_version = pack.ctx.domain_pack_version.clone();
+    let title_norms: Vec<(String, usize)> = pack
+        .entities
+        .iter()
+        .enumerate()
+        .filter_map(|(i, raw)| {
+            raw.fields
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|t| (normalize_for_title_match(t), i))
+        })
+        .collect();
+    let mut enriched = 0usize;
+    for input in inputs.iter_mut() {
+        if input.action != "supplemental_compile" {
+            continue;
+        }
+        let reason: serde_json::Value = match serde_json::from_str(&input.reason_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if reason.get("signal").and_then(|s| s.as_str()) != Some("zero_recall") {
+            continue;
+        }
+        let subject: serde_json::Value = match serde_json::from_str(&input.subject_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if subject.get("entity_id").is_some() {
+            // 已是实体形（对重复分析幂等）。
+            // Already entity-shaped (idempotent for repeated analysis).
+            continue;
+        }
+        let Some(query) = subject.get("normalized_query").and_then(|q| q.as_str()) else {
+            continue;
+        };
+        let norm = normalize_for_title_match(query);
+        let winner = title_norms
+            .iter()
+            .filter(|(t, _)| *t == norm)
+            .map(|(_, i)| *i)
+            .min_by_key(|i| pack.entities[*i].id.to_key());
+        let Some(idx) = winner else {
+            continue;
+        };
+        let raw = &pack.entities[idx];
+        let deps = serde_json::json!({
+            "context": pack.ctx.clone(),
+            "policy": pack.policy.clone(),
+            "schema": {
+                "entity_type": pack.schema.entity_type,
+                "fields": pack.schema.fields,
+            },
+        });
+        let mut merged = subject.clone();
+        merged["entity_id"] = serde_json::Value::String(raw.id.to_key());
+        merged["source_revision"] = serde_json::json!(raw.source_revision);
+        merged["domain_pack_version"] = serde_json::Value::String(pack_version.clone());
+        merged["source_json"] = serde_json::Value::String(serde_json::to_string(raw)?);
+        merged["dependencies_json"] = serde_json::Value::String(serde_json::to_string(&deps)?);
+        input.subject_json = serde_json::to_string(&merged)?;
+        enriched += 1;
+    }
+    Ok(enriched)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,6 +868,7 @@ mod tests {
             out_dir: Some(out_dir.to_path_buf()),
             min_events: MIN_EVENTS_DEFAULT,
             json: false,
+            domain_pack: None,
         }
     }
 
@@ -751,6 +991,7 @@ mod tests {
             out_dir: Some(dir.path().join("reports")),
             min_events: MIN_EVENTS_DEFAULT,
             json: false,
+            domain_pack: None,
         })
     }
 
@@ -788,6 +1029,7 @@ mod tests {
                 out_dir: Some(dir.path().join("reports")),
                 min_events: bad,
                 json: false,
+                domain_pack: None,
             });
             assert_eq!(run(args).await.unwrap(), super::super::EXIT_USAGE);
         }
@@ -1330,5 +1572,154 @@ mod tests {
             }),
         };
         assert_eq!(run(args).await.unwrap(), super::super::EXIT_CONFIG);
+    }
+
+    // ===== STEP13-002：领域包 subject 增强 =====
+    // ===== STEP13-002: domain-pack subject enrichment =====
+
+    /// 写一个最小 demo 领域包（单实体 document：两条同题 doc + 一条异题 doc），
+    /// 返回 domain.yaml 路径。
+    /// Writes a minimal demo domain pack (single document entity: two
+    /// same-title docs plus one differently-titled doc), returning the
+    /// domain.yaml path.
+    fn write_enrichment_pack(dir: &std::path::Path) -> String {
+        let pack = dir.join("domain.yaml");
+        std::fs::write(
+            &pack,
+            "name: demo-loop\n\
+             version: \"0.2.0\"\n\
+             entities:\n\
+             \x20 - name: document\n\
+             \x20   source: jsonl://docs.jsonl\n\
+             \x20   id_field: entity_id\n\
+             \x20   type_field: topic\n\
+             \x20   fields:\n\
+             \x20     - { name: title, field_type: text, filterable: false }\n\
+             \x20     - { name: topic, field_type: text, filterable: true }\n\
+             compile:\n\
+             \x20 quality_threshold: 0.75\n\
+             \x20 max_recompiles: 2\n\
+             query:\n\
+             \x20 filters: [topic]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("docs.jsonl"),
+            concat!(
+                r#"{"entity_id":"demo-loop:document:doc_0002","title":"gRPC 快速上手（concept）","topic":"demo-loop:concept:grpc","source_revision":1}"#,
+                "\n",
+                r#"{"entity_id":"demo-loop:document:doc_0001","title":"gRPC 快速上手（concept）","topic":"demo-loop:concept:grpc","source_revision":1}"#,
+                "\n",
+                r#"{"entity_id":"demo-loop:document:doc_0003","title":"索引原理（reference）","topic":"demo-loop:concept:indexing","source_revision":1}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        pack.to_string_lossy().into_owned()
+    }
+
+    fn zero_recall_input(
+        query: &str,
+    ) -> wiktor_core::kernel::feedback_store::ReviewSuggestionInput {
+        wiktor_core::kernel::feedback_store::ReviewSuggestionInput {
+            action: "supplemental_compile".into(),
+            source_log_ids_json: "[1]".into(),
+            subject_json: serde_json::json!({
+                "domain": "demo-loop",
+                "normalized_query": query,
+                "log_ids": [1],
+                "occurrences": 1,
+                "avg_latency_ms": 0.0,
+            })
+            .to_string(),
+            reason_json: r#"{"signal":"zero_recall"}"#.into(),
+            created_at: 1234,
+        }
+    }
+
+    // STEP13-002：同题两实体 → 字典序最小 entity_id（doc_0001）；subject 含五
+    // 必需字段 + 保留报告键，source_json/dependencies_json 按 approve 校验形状
+    // 可回读。
+    // STEP13-002: two same-title entities → the lexicographically smallest
+    // entity_id (doc_0001); the subject carries the five required fields plus
+    // the preserved report keys, with source_json/dependencies_json readable
+    // back in the approve-validation shape.
+    #[tokio::test]
+    async fn enrich_matches_title_and_tie_breaks_lowest_entity_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = write_enrichment_pack(dir.path());
+        let mut inputs = vec![zero_recall_input("gRPC 快速上手（concept）")];
+        let n = enrich_zero_recall_inputs(&pack, &mut inputs).await.unwrap();
+        assert_eq!(n, 1);
+        let s: serde_json::Value = serde_json::from_str(&inputs[0].subject_json).unwrap();
+        assert_eq!(s["entity_id"], "demo-loop:document:doc_0001");
+        assert_eq!(s["source_revision"], 1);
+        assert_eq!(s["domain_pack_version"], "0.2.0");
+        assert_eq!(s["normalized_query"], "gRPC 快速上手（concept）");
+        let raw: wiktor_core::types::RawEntity =
+            serde_json::from_str(s["source_json"].as_str().unwrap()).unwrap();
+        assert_eq!(raw.id.to_key(), "demo-loop:document:doc_0001");
+        let deps: serde_json::Value =
+            serde_json::from_str(s["dependencies_json"].as_str().unwrap()).unwrap();
+        assert_eq!(deps["schema"]["entity_type"], "document");
+        assert_eq!(deps["context"]["domain_pack_version"], "0.2.0");
+        assert!(deps["policy"].is_object());
+    }
+
+    // STEP13-002：归一化跨全/半角括号与空白差异（查询变体仍命中同题实体）。
+    // STEP13-002: normalization spans full/half-width parentheses and
+    // whitespace differences (a query variant still hits the same-title
+    // entity).
+    #[tokio::test]
+    async fn enrich_normalization_spans_paren_and_space_variants() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = write_enrichment_pack(dir.path());
+        let mut inputs = vec![zero_recall_input("grpc 快速上手 (concept)")];
+        let n = enrich_zero_recall_inputs(&pack, &mut inputs).await.unwrap();
+        assert_eq!(n, 1);
+        let s: serde_json::Value = serde_json::from_str(&inputs[0].subject_json).unwrap();
+        assert_eq!(s["entity_id"], "demo-loop:document:doc_0001");
+    }
+
+    // STEP13-002：未命中 → 报告形 subject 原样保留（fail-closed）。
+    // STEP13-002: no hit → the report-shaped subject is kept as-is
+    // (fail-closed).
+    #[tokio::test]
+    async fn enrich_leaves_unmatched_subject_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = write_enrichment_pack(dir.path());
+        let mut inputs = vec![zero_recall_input("不存在的标题")];
+        let before = inputs[0].subject_json.clone();
+        let n = enrich_zero_recall_inputs(&pack, &mut inputs).await.unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(inputs[0].subject_json, before);
+    }
+
+    // STEP13-002：非 zero_recall 信号 / 非 supplemental_compile 动作不增强。
+    // STEP13-002: non-zero_recall signals / non-supplemental actions are not
+    // enriched.
+    #[tokio::test]
+    async fn enrich_skips_other_signals_and_actions() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = write_enrichment_pack(dir.path());
+        let mut inputs = vec![
+            wiktor_core::kernel::feedback_store::ReviewSuggestionInput {
+                action: "query_template".into(),
+                source_log_ids_json: "[1]".into(),
+                subject_json: r#"{"normalized_query":"gRPC 快速上手（concept）"}"#.into(),
+                reason_json: r#"{"signal":"zero_recall"}"#.into(),
+                created_at: 1234,
+            },
+            wiktor_core::kernel::feedback_store::ReviewSuggestionInput {
+                action: "supplemental_compile".into(),
+                source_log_ids_json: "[2]".into(),
+                subject_json: r#"{"page_id":"demo-loop:document:doc_0001","feedback_count":5}"#
+                    .into(),
+                reason_json: r#"{"signal":"low_quality"}"#.into(),
+                created_at: 1234,
+            },
+        ];
+        let n = enrich_zero_recall_inputs(&pack, &mut inputs).await.unwrap();
+        assert_eq!(n, 0);
     }
 }

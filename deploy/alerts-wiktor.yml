@@ -1,0 +1,16 @@
+# Wiktor Step13 D5：最小告警规则——服务失联即告警（抓取目标 up==0 持续 1 分钟）。
+# 后续按需扩：审阅积压、限流拒绝速率（/metrics 的固定指标集）。
+# Wiktor Step13 D5: the minimal alert rule — page the operator when a scrape
+# target has been down for one minute (up == 0). Extend later with review
+# backlog / rate-limit rejection rates (the fixed /metrics metric set).
+groups:
+  - name: wiktor
+    rules:
+      - alert: WiktorServerDown
+        expr: up{job="wiktor-server"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Wiktor server is unreachable"
+          description: "Prometheus failed to scrape http://127.0.0.1:8080/metrics for 1m."

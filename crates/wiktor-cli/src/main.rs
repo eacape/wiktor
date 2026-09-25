@@ -8,6 +8,11 @@ use wiktor_core::kernel::{MockVectorStore, SqliteKernel};
 use wiktor_core::traits::{DataSource, DistanceMetric, DomainConfig, EntityStore, VectorStore};
 use wiktor_core::types::{Cursor, PublishStatus};
 use wiktor_core::{seed, FactValue, Filters, QueryEngine};
+// QueryEmbedder 仅在 server 注入路径使用（Step13 D1；assemble_vector_stack）。
+// QueryEmbedder is used only by the server injection path (Step13 D1;
+// assemble_vector_stack).
+#[cfg(feature = "server")]
+use wiktor_core::QueryEmbedder;
 
 mod commands;
 mod compile;
@@ -384,18 +389,121 @@ async fn main() -> Result<()> {
             domain,
             source,
         } => {
+            // Step13 D1：CLI 是装配者——按 env 注入向量后端/嵌入器/QUG 图；
+            // 缺省回退 Mock + 确定性嵌入（离线可跑）。
+            // Step13 D1: the CLI is the assembler — the vector backend,
+            // embedder and QUG graph are injected per env, falling back to the
+            // Mock store + deterministic embedder by default (offline-runnable).
+            let (vector_store, embedder) = assemble_vector_stack().await?;
+            let qug = match domain.as_deref() {
+                Some(path) => {
+                    let config = load_domain_config(path)?;
+                    if config.qug.enabled {
+                        let kernel = Arc::new(
+                            SqliteKernel::open(&db).map_err(|e| anyhow!("open database: {e}"))?,
+                        );
+                        let domain_dir = path
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .to_path_buf();
+                        let intents_bytes = load_intents_bytes(&config, &domain_dir)?;
+                        wiktor_core::kernel::qug_store::load_active_qug(
+                            &kernel,
+                            &config,
+                            &intents_bytes,
+                        )
+                        .map_err(|e| anyhow!("load active QUG: {e}"))?
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
             wiktor_server::serve::run_server(wiktor_server::serve::ServeOptions {
                 db,
                 listen_http,
                 listen_grpc,
                 domain_pack: domain,
                 source_path: source,
+                vector_store,
+                embedder: Some(embedder),
+                qug,
             })
             .await
             .map_err(|e| anyhow!(e))?;
         }
     }
     Ok(())
+}
+
+/// 按 env 装配 serve 的向量后端与查询嵌入器（Step13 D1）。
+/// `WIKTOR_VECTOR_BACKEND=mock|qdrant`（默认 mock）；qdrant 走
+/// `WIKTOR_QDRANT_URL`/`WIKTOR_QDRANT_API_KEY`（与 `vector ping`/`vector build`
+/// 同源）。嵌入器：设 `WIKTOR_EMBEDDING_BASE_URL` 时用 HttpEmbedder（真实模型
+/// 维度经探测串实测），否则确定性嵌入 768 维。返回 `(Option<store>, embedder)`。
+/// Assembles serve's vector backend and query embedder per env (Step13 D1).
+/// `WIKTOR_VECTOR_BACKEND=mock|qdrant` (default mock); qdrant uses
+/// `WIKTOR_QDRANT_URL`/`WIKTOR_QDRANT_API_KEY` (the same sources as
+/// `vector ping`/`vector build`). The embedder uses HttpEmbedder when
+/// `WIKTOR_EMBEDDING_BASE_URL` is set (the real model's dimension is measured
+/// via the probe), otherwise the deterministic 768 embedder. Returns
+/// `(Option<store>, embedder)`.
+#[cfg(feature = "server")]
+async fn assemble_vector_stack() -> Result<(Option<Arc<dyn VectorStore>>, Arc<dyn QueryEmbedder>)> {
+    let embedder: Arc<dyn QueryEmbedder> = match std::env::var("WIKTOR_EMBEDDING_BASE_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            #[cfg(feature = "embedding-http")]
+            {
+                Arc::new(wiktor_core::embedding::HttpEmbedder::from_env()?)
+            }
+            #[cfg(not(feature = "embedding-http"))]
+            {
+                anyhow::bail!(
+                    "WIKTOR_EMBEDDING_BASE_URL is set but the embedding-http feature is off (rebuild with default features)"
+                )
+            }
+        }
+        _ => {
+            Arc::new(wiktor_core::embedding::deterministic::DeterministicEmbedder::new(embed::DIM))
+        }
+    };
+    // 维度探测（与 vector build 同模式）：集合创建需要确切维度。
+    // Dimension probe (the same pattern as vector build): collection creation
+    // needs the exact dimension.
+    let dim = embedder
+        .embed("wiktor-collection-dimension-probe")
+        .await
+        .map_err(|e| anyhow!("embed dimension probe: {e}"))?
+        .len();
+    let backend = std::env::var("WIKTOR_VECTOR_BACKEND")
+        .unwrap_or_else(|_| "mock".to_string())
+        .to_lowercase();
+    let store: Option<Arc<dyn VectorStore>> = match backend.as_str() {
+        "mock" => None,
+        "qdrant" => {
+            #[cfg(feature = "vector-qdrant")]
+            {
+                let url = std::env::var("WIKTOR_QDRANT_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:6334".to_string());
+                let api_key = std::env::var("WIKTOR_QDRANT_API_KEY").ok();
+                Some(Arc::new(
+                    wiktor_vector_qdrant::QdrantVectorStore::from_config(
+                        &url,
+                        api_key.as_deref(),
+                        dim,
+                    )?,
+                ))
+            }
+            #[cfg(not(feature = "vector-qdrant"))]
+            {
+                anyhow::bail!(
+                    "WIKTOR_VECTOR_BACKEND=qdrant requires the vector-qdrant feature (rebuild with default features)"
+                )
+            }
+        }
+        other => anyhow::bail!("unknown WIKTOR_VECTOR_BACKEND: {other} (expected mock|qdrant)"),
+    };
+    Ok((store, embedder))
 }
 
 /// 统一收尾：刷新 stdout 后按命令返回的退出码结束进程（0 = 正常返回）。

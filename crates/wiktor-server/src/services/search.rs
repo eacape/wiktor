@@ -21,14 +21,14 @@ use crate::grpc::v1::{RewrittenQuery, SearchHit, SearchRequest, SearchResponse};
 /// Search gRPC handler：持装配好的引擎（server 启动时构造，跨请求共享）。
 /// The Search gRPC handler: holds the assembled engine (built at server
 /// startup, shared across requests).
-pub struct SearchService<V: VectorStore> {
+pub struct SearchService<V: VectorStore + ?Sized> {
     engine: Arc<QueryEngine<V>>,
     /// 请求预算：query text 上限（§4）。
     /// Request budgets: the query-text cap (§4).
     max_query_chars: usize,
 }
 
-impl<V: VectorStore + 'static> SearchService<V> {
+impl<V: VectorStore + ?Sized + 'static> SearchService<V> {
     pub fn new(engine: Arc<QueryEngine<V>>, max_query_chars: usize) -> Self {
         Self {
             engine,
@@ -38,7 +38,7 @@ impl<V: VectorStore + 'static> SearchService<V> {
 }
 
 #[tonic::async_trait]
-impl<V: VectorStore + 'static> Search for SearchService<V> {
+impl<V: VectorStore + ?Sized + 'static> Search for SearchService<V> {
     async fn search(
         &self,
         request: tonic::Request<SearchRequest>,

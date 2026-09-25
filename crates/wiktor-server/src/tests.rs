@@ -743,8 +743,13 @@ async fn search_endpoint_authenticates_authorizes_and_returns_hits() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // search 权限 key → 200 且命中该页（FTS）。
-    // The search-authorized key → 200 with the page hit (FTS).
+    // search 权限 key → 200 且命中该页（FTS）；Step13 A3：diagnostics_json
+    // 非空（rrf_k 等分路诊断）且 log_id 非 None（query_logs 落库，反馈闭环的
+    // 数据前提）。
+    // The search-authorized key → 200 with the page hit (FTS); Step13 A3:
+    // diagnostics_json is non-empty (rrf_k and friends) and log_id is not None
+    // (the query_logs row persists — the data prerequisite for the feedback
+    // loop).
     let mut req = get_request("/search?q=%E7%8F%8D%E7%8F%A0&domain=milk-tea&top_k=10");
     let headers = req.headers_mut();
     headers.insert("authorization", "Bearer search-key".parse().unwrap());
@@ -756,6 +761,18 @@ async fn search_endpoint_authenticates_authorizes_and_returns_hits() {
             .any(|h| h["title"].as_str() == Some("珍珠奶茶(大杯)")),
         "FTS search must hit the seeded page, got {:?}",
         hits
+    );
+    assert!(
+        body["diagnostics_json"]["rrf_k"].as_u64() == Some(60),
+        "diagnostics must be real, got {:?}",
+        body["diagnostics_json"]
+    );
+    let log_id = body["log_id"].as_i64().expect("log_id must be present");
+    assert!(log_id > 0, "log_id must reference a query_logs row");
+    assert_eq!(
+        kernel.row_counts().unwrap().get("query_logs").copied(),
+        Some(1),
+        "the search must persist exactly one query_logs row"
     );
 
     // feedback-only key（旧格式）→ 403（方法授权）。

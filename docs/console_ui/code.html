@@ -107,6 +107,10 @@
   }
   footer span { margin-right: 16px; }
   .score { color: var(--primary); }
+  .qbar { display: flex; align-items: center; gap: 10px; margin: 6px 0; font: 12px var(--mono); }
+  .qbar .qn { width: 150px; color: var(--muted); }
+  .qbar .qt { flex: 1; height: 8px; background: var(--surface-3); border-radius: 4px; overflow: hidden; }
+  .qbar .qv { width: 120px; text-align: right; }
 </style>
 </head>
 <body>
@@ -148,6 +152,17 @@
         <th data-i18n="th-table">Table</th><th class="num" data-i18n="th-rows">Rows</th>
         <th data-i18n="th-desc">Description</th></tr></thead>
         <tbody id="ov-rows"></tbody></table>
+    </div>
+    <div class="panel">
+      <h2 data-i18n="h-quality">Quality · five-dimension averages</h2>
+      <div id="ov-quality"><span class="empty" data-i18n="loading">loading…</span></div>
+    </div>
+    <div class="panel">
+      <h2 data-i18n="h-domains">Domain packs (from pages)</h2>
+      <table><thead><tr>
+        <th data-i18n="th-domain">Domain</th><th class="num" data-i18n="th-rows">Pages</th>
+      </tr></thead><tbody id="ov-domains"></tbody></table>
+      <div id="domains-empty" class="empty hidden"></div>
     </div>
   </section>
   <!-- Compile tasks -->
@@ -217,6 +232,11 @@ const I18N = {
     "h-due": "Due compile tasks by status", "h-rows": "Storage row counts",
     "h-tasks": "Due compile tasks (≤100)", "h-reviews": "Pending review queue (≤100)",
     "h-diag": "Retrieval diagnostics", "h-hits": "Hits",
+    "h-quality": "Quality · five-dimension averages", "h-domains": "Domain packs (from pages)",
+    "q-cov": "coverage (覆盖度)", "q-cit": "citation (引用完整性)",
+    "q-sch": "schema (结构合规)", "q-den": "density (信息密度)",
+    "q-con": "consistency (一致性)", "q-ova": "overall (总评)",
+    "q-none": "No quality rows yet (compile pages first).",
     "th-table": "Table", "th-rows": "Rows", "th-desc": "Description",
     "th-task": "Task ID", "th-entity": "Entity", "th-status": "Status",
     "th-attempts": "Attempts", "th-rid": "Review ID", "th-domain": "Domain",
@@ -240,6 +260,11 @@ const I18N = {
     "k-review": "待审阅", "h-due": "到期编译任务状态分布", "h-rows": "存储行数",
     "h-tasks": "到期编译任务（≤100）", "h-reviews": "待处理审阅（≤100）",
     "h-diag": "检索分路诊断", "h-hits": "命中结果",
+    "h-quality": "质量 · 五维均值", "h-domains": "领域包（按页面统计）",
+    "q-cov": "coverage (覆盖度)", "q-cit": "citation (引用完整性)",
+    "q-sch": "schema (结构合规)", "q-den": "density (信息密度)",
+    "q-con": "consistency (一致性)", "q-ova": "overall (总评)",
+    "q-none": "暂无质量行（请先编译页面）。",
     "th-table": "表", "th-rows": "行数", "th-desc": "说明",
     "th-task": "任务 ID", "th-entity": "实体", "th-status": "状态",
     "th-attempts": "尝试次数", "th-rid": "审阅 ID", "th-domain": "领域",
@@ -398,10 +423,45 @@ function renderSearch(res) {
   $("#hits-empty").classList.toggle("hidden", hits.length > 0);
 }
 
+function renderQuality(q) {
+  const box = $("#ov-quality");
+  if (!q || q.error || !q.count) {
+    box.innerHTML = '<span class="empty">' + (lang === "zh"
+      ? "暂无质量行（请先编译页面）。"
+      : "No quality rows yet (compile pages first).") + "</span>";
+    return;
+  }
+  const rows = [
+    [t("q-cov"), q.coverage], [t("q-cit"), q.citation], [t("q-sch"), q.schema_compliance],
+    [t("q-den"), q.density], [t("q-con"), q.consistency], [t("q-ova"), q.overall],
+  ];
+  let html = rows.map(([name, v]) => {
+    if (v == null) return '<div class="qbar"><span class="qn">' + name + '</span><span class="muted">–</span></div>';
+    const pct = Math.round(v * 100);
+    return '<div class="qbar"><span class="qn">' + name + '</span>' +
+      '<span class="qt"><span class="qv-fill" style="display:block;height:100%;width:' + pct + '%;background:var(--primary)"></span></span>' +
+      '<span class="qv">' + pct + "%</span></div>";
+  }).join("");
+  const conNote = q.consistency == null && q.consistency_samples === 0
+    ? " · consistency: " + (lang === "zh" ? "无仲裁样本" : "no arbitrated samples")
+    : "";
+  html += '<div class="muted" style="margin-top:8px">' + (lang === "zh" ? "样本页数" : "scored pages") + ": " + q.count + conNote + "</div>";
+  box.innerHTML = html;
+}
+function renderDomains(d) {
+  const tb = $("#ov-domains");
+  const list = (d && d.domains) || [];
+  tb.innerHTML = list.map((x) =>
+    "<tr><td>" + esc(x.domain) + '</td><td class="num">' + x.pages + "</td></tr>").join("");
+  $("#domains-empty").textContent = lang === "zh" ? "暂无页面。" : "No pages yet.";
+  $("#domains-empty").classList.toggle("hidden", list.length > 0);
+}
+
 async function refresh() {
   try {
-    const [overview, tasks, reviews, qug] = await Promise.all([
+    const [overview, tasks, reviews, qug, quality, domains] = await Promise.all([
       api("/api/overview"), api("/api/tasks"), api("/api/reviews"), api("/api/qug"),
+      api("/api/quality").catch(() => null), api("/api/domains").catch(() => null),
     ]);
     last.tasks = tasks.tasks || []; last.reviews = reviews.reviews || [];
     last.row_counts = overview.row_counts || {};
@@ -412,6 +472,7 @@ async function refresh() {
     $("#ov-pages").textContent = qug.published_pages;
     $("#ov-gen").textContent = qug.generations;
     renderStatus(); renderRows(); renderTasks(last.tasks); renderReviews(last.reviews);
+    renderQuality(quality); renderDomains(domains);
     conn("live"); stamp();
   } catch (e) {
     conn("offline");
