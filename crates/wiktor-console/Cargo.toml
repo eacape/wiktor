@@ -1,0 +1,34 @@
+[package]
+name = "wiktor-console"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Wiktor Web + TUI console：把 Wiktor 数据（任务/质量/审阅/检索诊断）接到可视化界面。"
+license.workspace = true
+repository.workspace = true
+keywords = ["console", "dashboard", "search", "monitor"]
+categories = ["command-line-interface", "web-programming"]
+# 依赖边界（STEP11 console，D1/D5）：console 是读界面，in-process 读
+# SqliteKernel；依赖 core（存储）+ axum（HTTP）。静态资源由 handler 直接从
+# 磁盘返回（STEP11-001：crates.io 不可达，未引入 tower-http fs）。不反向依赖
+# server/feedback 的写路径。
+# Dependency boundary (STEP11 console, D1/D5): the console is a read surface,
+# reading SqliteKernel in-process; it depends on core (storage) plus axum
+# (HTTP). Static assets are returned straight from disk by the handler
+# (STEP11-001: no tower-http fs — crates.io was unreachable). It never reaches
+# server/feedback write paths.
+[dependencies]
+wiktor-core = { path = "../wiktor-core" }
+axum = { workspace = true }
+tokio = { workspace = true }
+tower = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+http-body-util = { workspace = true }

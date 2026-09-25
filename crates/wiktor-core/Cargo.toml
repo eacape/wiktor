@@ -54,3 +54,9 @@ embedding-http = ["dep:reqwest", "llm-openai"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = "0.5"
+tokio = { workspace = true }
+
+[[bench]]
+name = "query_bench"
+harness = false

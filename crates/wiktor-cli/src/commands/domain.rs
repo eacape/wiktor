@@ -65,6 +65,23 @@ pub enum DomainCommand {
     /// pending/running/dead 任务快照对照领域包声明的矩阵；不兼容 → 退出码 3，
     /// 绝不写任何行。
     Check(CheckArgs),
+    /// Discover installed domain packs: scan `examples/*/domain.yaml` plus any
+    /// `WIKTOR_DOMAIN_DIR` (repeatable) for domain.yaml files, and report each
+    /// pack's name/version/qug.enabled. Read-only; no registry, no side effects.
+    /// 发现已安装的领域包：扫描 `examples/*/domain.yaml` 与 `WIKTOR_DOMAIN_DIR`
+    ///（可重复）下的 domain.yaml，报告每个包的 name/version/qug.enabled。
+    /// 只读；无注册表、无副作用。
+    List(ListArgs),
+}
+
+/// `wiktor domain list` 参数。
+/// `wiktor domain list` arguments.
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    /// Emit a single JSON array on stdout; logs go to stderr
+    /// stdout 输出单一 JSON 数组；日志走 stderr
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// `wiktor domain check` 参数（§7 参数表）。
@@ -93,7 +110,127 @@ pub struct CheckArgs {
 pub async fn run(command: DomainCommand) -> Result<i32> {
     match command {
         DomainCommand::Check(args) => run_check(args).await,
+        DomainCommand::List(args) => run_list(args),
     }
+}
+
+/// 领域包发现的单条元数据（仅读 YAML 顶层，不要求完整 DomainConfig）。
+/// A single discovered domain pack's metadata (reads only the YAML top level; no
+/// full DomainConfig required).
+#[derive(Debug, serde::Serialize)]
+struct DomainPackMeta {
+    name: String,
+    version: String,
+    path: std::path::PathBuf,
+    qug_enabled: bool,
+}
+
+/// 领域包顶层结构（宽松反序列化；只取显示需要的字段）。
+/// The domain.yaml top-level shape (lenient deserialize; only what we display).
+#[derive(Debug, serde::Deserialize)]
+struct DomainTop {
+    name: String,
+    #[serde(default = "default_version")]
+    version: String,
+    #[serde(default)]
+    qug: Option<QugTop>,
+}
+
+fn default_version() -> String {
+    "0.0.0".to_string()
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct QugTop {
+    #[serde(default)]
+    enabled: bool,
+}
+
+/// 扫描一个目录下含 domain.yaml 的领域包，返回 (yaml 路径, 元数据)。
+/// Scans a directory for packs containing domain.yaml, returning
+/// (yaml path, metadata).
+fn scan_dir(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Option<DomainPackMeta>)> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return found;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let yaml = path.join("domain.yaml");
+        if yaml.is_file() {
+            let meta = std::fs::read_to_string(&yaml)
+                .ok()
+                .and_then(|t| serde_yaml_ng::from_str::<DomainTop>(&t).ok())
+                .map(|top| DomainPackMeta {
+                    name: top.name,
+                    version: top.version,
+                    path: yaml.clone(),
+                    qug_enabled: top.qug.map(|q| q.enabled).unwrap_or(false),
+                });
+            found.push((yaml, meta));
+        }
+    }
+    found
+}
+
+/// 收集发现到的领域包（`examples/` 根 + env `WIKTOR_DOMAIN_DIR` 可重复）。
+/// Collects discovered packs (the `examples/` root + repeatable `WIKTOR_DOMAIN_DIR`).
+fn collect_packs() -> Vec<DomainPackMeta> {
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    // 当前目录下的 examples/（领域包官方存放处）。
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let examples = cwd.join("examples");
+    dirs.push(examples);
+    // env WIKTOR_DOMAIN_DIR（可重复，':'/';' 分隔，兼容跨平台）。
+    for d in std::env::var("WIKTOR_DOMAIN_DIR")
+        .unwrap_or_default()
+        .split(':')
+        .chain(
+            std::env::var("WIKTOR_DOMAIN_DIR")
+                .unwrap_or_default()
+                .split(';'),
+        )
+        .filter(|s| !s.is_empty())
+    {
+        dirs.push(d.into());
+    }
+
+    let mut packs = Vec::new();
+    for d in dirs {
+        for (_, meta) in scan_dir(&d) {
+            if let Some(m) = meta {
+                packs.push(m);
+            }
+        }
+    }
+    packs
+}
+
+/// `wiktor domain list`：发现领域包并输出表/JSON。只读，无副作用。
+/// `wiktor domain list`: discovers packs and prints a table/JSON. Read-only.
+fn run_list(args: ListArgs) -> Result<i32> {
+    let mut packs = collect_packs();
+    packs.sort_by(|a, b| a.name.cmp(&b.name));
+    packs.dedup_by(|a, b| a.path == b.path);
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&packs)?);
+    } else {
+        println!("{:<14} {:<10} {:<8} PATH", "NAME", "VERSION", "QUG");
+        for p in &packs {
+            println!(
+                "{:<14} {:<10} {:<8} {}",
+                p.name,
+                p.version,
+                if p.qug_enabled { "enabled" } else { "off" },
+                p.path.display()
+            );
+        }
+    }
+    Ok(EXIT_OK)
 }
 
 /// 评估核心（与 CLI 输出解耦，便于单测）：身份五元组 → 同一 preflight 入口 →

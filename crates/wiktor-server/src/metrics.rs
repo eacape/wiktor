@@ -103,10 +103,13 @@ impl RejectionCounters {
 }
 
 /// 进程内指标（§7.2 六个指标名；review_pending 由 /metrics 端点每次抓取时
-/// 从只读查询取值传入，本结构不缓存 DB 状态）。
+/// 从只读查询取值传入，本结构不缓存 DB 状态）。STEP11 B4 增补：查询延迟直方图
+/// 与编译任务状态计数（保持手写 Prometheus 文本；无用户输入作标签，贴 A17）。
 /// The in-process metrics (the six §7.2 metric names; review_pending is fetched
 /// per scrape by the /metrics endpoint from a read-only query and passed in —
-/// this struct does not cache DB state).
+/// this struct does not cache DB state). STEP11 B4 adds a query-latency
+/// histogram and compile-task-state counts (hand-rolled Prometheus text; no user
+/// input as a label, per A17).
 #[derive(Debug, Default)]
 pub struct Metrics {
     ingested: AtomicU64,
@@ -114,6 +117,33 @@ pub struct Metrics {
     rate_limited: AtomicU64,
     store_errors: AtomicU64,
     rejected: RejectionCounters,
+    // STEP11 B4：查询计数与延迟直方图（固定桶边界，无动态标签）。
+    query_total: AtomicU64,
+    query_latency_buckets: [AtomicU64; QUERY_BUCKET_COUNT],
+    // STEP11 B4：编译任务状态计数（固定状态集）。
+    compile: CompileStatusCounters,
+}
+
+/// 查询延迟直方图桶数量（`+Inf` 越界也落到最后一桶）。
+/// The number of query-latency histogram buckets (`+Inf` overflows land in the
+/// last bucket).
+const QUERY_BUCKET_COUNT: usize = 7;
+
+/// 查询延迟直方图固定桶边界（ms）：`[1,5,10,25,50,100]`，最后一桶 `+Inf`。
+/// Fixed query-latency histogram bucket bounds (ms): `[1,5,10,25,50,100]`, the
+/// last bucket being `+Inf`.
+const QUERY_LATENCY_BOUNDS_MS: [u64; 6] = [1, 5, 10, 25, 50, 100];
+
+/// 编译任务状态计数（固定状态集，与 kernel 状态机一致）。
+/// Compile-task-state counts (a fixed state set matching the kernel state
+/// machine).
+#[derive(Debug, Default)]
+struct CompileStatusCounters {
+    pending: AtomicU64,
+    running: AtomicU64,
+    succeeded: AtomicU64,
+    failed: AtomicU64,
+    dead: AtomicU64,
 }
 
 impl Metrics {
@@ -148,6 +178,33 @@ impl Metrics {
     /// a `feedback_rejections` audit row, see the handler).
     pub fn record_rejected(&self, reason: RejectionReason) {
         self.rejected.record(reason);
+    }
+
+    /// STEP11 B4：记录一次查询（+1）并累进其延迟到固定桶。
+    /// STEP11 B4: records one query (+1) and buckets its latency.
+    pub fn record_query_latency_ms(&self, ms: u64) {
+        self.query_total.fetch_add(1, Ordering::Relaxed);
+        let mut i = 0;
+        while i < QUERY_LATENCY_BOUNDS_MS.len() && ms > QUERY_LATENCY_BOUNDS_MS[i] {
+            i += 1;
+        }
+        let bucket = i.min(QUERY_BUCKET_COUNT - 1);
+        self.query_latency_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// STEP11 B4：记录一个编译任务到达某状态（未知状态归入 pending，防动态
+    /// label）。
+    /// STEP11 B4: records a compile task reaching a state (unknown states fall
+    /// into pending, preventing dynamic labels).
+    pub fn record_compile_status(&self, status: &str) {
+        let c = &self.compile;
+        match status {
+            "running" => c.running.fetch_add(1, Ordering::Relaxed),
+            "succeeded" => c.succeeded.fetch_add(1, Ordering::Relaxed),
+            "failed" => c.failed.fetch_add(1, Ordering::Relaxed),
+            "dead" => c.dead.fetch_add(1, Ordering::Relaxed),
+            _ => c.pending.fetch_add(1, Ordering::Relaxed),
+        };
     }
 
     /// 渲染 Prometheus text（§7.2 固定六名；`review_pending` 由调用方传入的
@@ -214,7 +271,65 @@ impl Metrics {
         );
         let _ = writeln!(out, "# TYPE wiktor_feedback_review_pending gauge");
         let _ = writeln!(out, "wiktor_feedback_review_pending {review_pending}");
+
+        // STEP11 B4：查询延迟直方图（固定桶，无用户输入标签）。
+        let _ = writeln!(
+            out,
+            "# HELP wiktor_query_latency_ms_bucket Query latency in ms (fixed buckets)."
+        );
+        let _ = writeln!(out, "# TYPE wiktor_query_latency_ms_bucket histogram");
+        let _ = writeln!(
+            out,
+            "wiktor_query_latency_ms_bucket_count {}",
+            self.query_total.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            out,
+            "wiktor_query_latency_ms_bucket_sum {}",
+            self.query_latency_ms_sum()
+        );
+        let mut cum = 0u64;
+        for (i, bound) in QUERY_LATENCY_BOUNDS_MS.iter().enumerate() {
+            cum += self.query_latency_buckets[i].load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "wiktor_query_latency_ms_bucket{{le=\"{bound}\"}} {cum}"
+            );
+        }
+        cum += self.query_latency_buckets[QUERY_BUCKET_COUNT - 1].load(Ordering::Relaxed);
+        let _ = writeln!(out, "wiktor_query_latency_ms_bucket{{le=\"+Inf\"}} {cum}");
+
+        // STEP11 B4：编译任务状态计数（固定状态集）。
+        let _ = writeln!(
+            out,
+            "# HELP wiktor_compile_status_total Compile tasks by terminal/active state."
+        );
+        let _ = writeln!(out, "# TYPE wiktor_compile_status_total counter");
+        for (label, cell) in [
+            ("pending", self.compile.pending.load(Ordering::Relaxed)),
+            ("running", self.compile.running.load(Ordering::Relaxed)),
+            ("succeeded", self.compile.succeeded.load(Ordering::Relaxed)),
+            ("failed", self.compile.failed.load(Ordering::Relaxed)),
+            ("dead", self.compile.dead.load(Ordering::Relaxed)),
+        ] {
+            let _ = writeln!(
+                out,
+                "wiktor_compile_status_total{{state=\"{label}\"}} {cell}"
+            );
+        }
         out
+    }
+
+    /// 累计查询延迟（粗略，按桶中位数近似；供 histogram `_sum` 占比参考）。
+    /// Cumulative query latency (approximate by bucket midpoint; a histogram
+    /// `_sum` for reference).
+    fn query_latency_ms_sum(&self) -> u64 {
+        let bounds = [0.5, 3.0, 7.5, 17.5, 37.5, 75.0, 150.0];
+        self.query_latency_buckets
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (bounds[i.min(6)] as u64) * b.load(Ordering::Relaxed))
+            .sum()
     }
 }
 
@@ -234,6 +349,11 @@ mod tests {
         metrics.record_rejected(RejectionReason::PayloadTooLarge);
         metrics.record_rate_limited();
         metrics.record_store_error();
+        // STEP11 B4：查询延迟分桶 + 编译状态计数。
+        metrics.record_query_latency_ms(3);
+        metrics.record_query_latency_ms(30);
+        metrics.record_compile_status("running");
+        metrics.record_compile_status("succeeded");
         let text = metrics.render(7);
         for name in [
             "wiktor_feedback_ingested_total",
@@ -242,12 +362,16 @@ mod tests {
             "wiktor_feedback_rate_limited_total",
             "wiktor_feedback_store_errors_total",
             "wiktor_feedback_review_pending",
+            "wiktor_query_latency_ms_bucket",
+            "wiktor_compile_status_total",
         ] {
             assert!(text.contains(name), "missing {name} in:\n{text}");
         }
         assert!(text.contains("wiktor_feedback_ingested_total 3"));
         assert!(text.contains("wiktor_feedback_rejected_total{reason=\"payload_too_large\"} 1"));
         assert!(text.contains("wiktor_feedback_review_pending 7"));
+        assert!(text.contains("wiktor_query_latency_ms_bucket{le=\"5\"} 1"));
+        assert!(text.contains("wiktor_compile_status_total{state=\"running\"} 1"));
         // 用户可控值永不进入输出（A17）。
         // User-controlled values never enter the output (A17).
         assert!(!text.contains("milk-tea"));

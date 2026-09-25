@@ -148,6 +148,23 @@ enum Command {
         #[command(subcommand)]
         command: ExportCommand,
     },
+    /// Run the Web console (local HTTP; reads the DB read-only). Requires the
+    /// `console` feature.
+    /// 运行 Web console（本地 HTTP；只读读库）。需要 `console` feature。
+    Console {
+        /// SQLite database path (default ./wiktor.db)
+        /// SQLite 数据库路径（默认 ./wiktor.db）
+        #[arg(long, default_value = "wiktor.db")]
+        db: PathBuf,
+        /// HTTP listen address (default 127.0.0.1:8081)
+        /// HTTP 监听地址（默认 127.0.0.1:8081）
+        #[arg(long, default_value = "127.0.0.1:8081")]
+        listen: String,
+        /// Static asset dir (default the repo's docs/console_ui)
+        /// 静态资源目录（默认仓库的 docs/console_ui）
+        #[arg(long)]
+        static_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -328,6 +345,20 @@ async fn main() -> Result<()> {
                 cmd_export_meilisearch(&db, &domain, index.as_deref()).await?;
             }
         },
+        #[cfg(feature = "console")]
+        Command::Console {
+            db,
+            listen,
+            static_dir,
+        } => {
+            wiktor_console::serve(&db, &listen, static_dir).await?;
+        }
+        #[cfg(not(feature = "console"))]
+        Command::Console { .. } => {
+            anyhow::bail!(
+                "wiktor console requires the console feature (build with --features console)"
+            )
+        }
         #[cfg(feature = "server")]
         Command::Serve {
             db,

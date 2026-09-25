@@ -23,6 +23,12 @@ wiktor-vector-qdrant = { path = "../wiktor-vector-qdrant", optional = true }
 # The Meilisearch outlet plugin (STEP10 B4): optional dep behind the
 # `export-meilisearch` feature.
 wiktor-adapter-meilisearch = { path = "../wiktor-adapter-meilisearch", optional = true }
+# Web console（STEP11 B5）：本地 HTTP 服务，in-process 读 SqliteKernel。可选依赖
+# 于 `console` feature（默认关，console 不是默认启动面）。
+# Web console (STEP11 B5): a local HTTP service reading SqliteKernel in-process.
+# Optional dep behind the `console` feature (off by default — the console is not
+# the default launch surface).
+wiktor-console = { path = "../wiktor-console", optional = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -54,6 +60,8 @@ vector-qdrant = ["dep:wiktor-vector-qdrant"]
 # export-meilisearch: assembles the Meilisearch outlet plugin (STEP10 B4; off by
 # default — the external engine is an optional plugin).
 export-meilisearch = ["dep:wiktor-adapter-meilisearch"]
+# console：装配 Web console 插件（STEP11 B5）。
+console = ["dep:wiktor-console"]
 server = ["dep:wiktor-server"]
 
 [dev-dependencies]
