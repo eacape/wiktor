@@ -85,12 +85,16 @@
 - **部署 gotcha（已修进模板/脚本）**：①`WIKTOR_API_KEYS` 的 methods 只接受小写 snake_case（PascalCase 启动即 fail-closed 报错，错误体列出允许集）；②HTTP `GET /search` 必须带 `domain` 参数（缺失 400）——`smoke-deploy.sh` 已补 `domain=${DOMAIN:-tech-docs}`。
 
 
-### 实现偏差（STEP12-001..004）
+- **UI 重设计实测（本机 IAB）**：seed + mock 编译（58 accepted）+ qug build 后——Overview 卡片（schema 6 / 78 pages / 59 generations / 0 review）、due 状态 pill（pending·6）、行数表（11 表 + 双语说明）、Compile Tasks 真实 6 行、检索 "rust" 5 命中（Rust 异步运行时等，score 0.0154–0.0164）+ 分路诊断（fts 9 / vec 0 / rrf_k 60）；中英切换即时生效且持久化；修复两处前端 bug（补 `.hidden` CSS 规则、hits innerHTML 缺 `.join("")` 渲染出游离逗号）。
+
+### 实现偏差（STEP12-001..005）
 
 - **STEP12-001（B2，API 扩展）**：`GET /api/overview` 新增 `task_status_counts` 字段（due 编译任务按 status 计数，遍历 due 快照聚合）——spec §4 B2 未列该字段；它是前端状态机五胶囊的真实数据源，并兑现 step11-console spec D3"overview 含编译任务状态计数"的原意。
 - **STEP12-002（B3，数据目录）**：生产数据目录为 `/srv/wiktor/data`（对齐既有 `litestream.service` 的 ReadWritePaths），而非 spec D5 写的 `/srv/wiktor-data`；units 沙箱 ReadWritePaths 同步。
 - **STEP12-003（B3，工具链）**：`install-wiktor.sh` 不自动安装 Rust 工具链（缺 cargo 即报错退出 2），安装步骤放 runbook（rustup + 国内镜像）；生产机因此引入**最小工具链**（rustup minimal + rsproxy）——"Linux 不装开发环境"约定更新为"生产机构建所需最小工具链"。
 - **STEP12-004（B1，检索行为）**：TUI 查询 Tab 不装配 FilterRelaxer（CLI `wiktor search` 显式装配 `DefaultFilterRelaxer`）；TUI/Web console 检索均无过滤输入，滤空放宽重试不会触发——两形态与自身输入面对齐。
+
+- **STEP12-005（B2，UI 重设计，用户指令 2026-09-25）**：`code.html` 由 Obsidian 参考原型重写为**真实数据监督界面**——仅渲染 `/api/*` 真实数据（零 mock 内容），推翻 step11-console spec D2"复用 code.html 原型视觉"的不变项（用户明确"之前给你的只是参考 UI，可以根据项目实际来设计"）；界面英文为默认语言、可切换中文（localStorage 持久化），单文件零外部依赖（去 Tailwind/Material CDN，可完全离线）。DESIGN.md 与 screen.png 保留为历史视觉参考。
 
 不变项自查（§5 偏差基准）：TUI/Web 同源只读数据面 ✅、code.html 原型视觉不重做（仅挂标记 + 追加渲染层）✅、systemd 单机编排不引入容器化 ✅。
 

@@ -7,7 +7,7 @@
 | 文件 | 角色 |
 |---|---|
 | `DESIGN.md` | Obsidian 主题设计系统（色板 / 字体 / 间距 tokens），是视觉的**唯一权威来源** |
-| `code.html` | 完整 Web 原型（单文件，内联 CSS/JS），按 `DESIGN.md` 的 tokens 实现仪表盘 / 编译任务 / 质量雷达 / 审阅 / 检索分路 / QUG 面板 |
+| `code.html` | **真实数据监督界面**（单文件，内联 CSS/JS，零外部依赖）：由 `wiktor console` 提供服务时渲染 `/api/*` 真实数据；英文默认、可切换中文 |
 | `screen.png` | 原型的渲染截图，用于评审与回归对照 |
 
 关系：`DESIGN.md` 定 tokens → `code.html` 消费 tokens 呈现原型 → `screen.png` 是结果快照。改视觉先改 `DESIGN.md`，再同步 `code.html`，避免两张皮。
@@ -40,5 +40,5 @@ curl -X POST -H 'Content-Type: application/json' \
 ## 3. 边界
 
 - console 是**只读监督界面**：`POST /api/search` 走与 CLI `wiktor search` 同源的 QueryEngine（查询日志照常落 `query_logs`），除此之外不写任何表；编译/审阅等写操作留在 CLI/server。
-- **`code.html` 已接真实数据（Step12 B2）**：由 `wiktor console` 提供服务时，面板经 vanilla fetch 轮询 `/api/*` 并渲染（15s 间隔 + 检索框实时查）；API 不可达时自动回退原型静态文案并显示 `offline` 徽标——直接双击打开本地文件时始终是原型态。
+- **`code.html` 是纯真实数据界面（Step12 B2 + STEP12-005 重设计）**：四个 Tab（概览/编译任务/审阅队列/检索）全部渲染 `/api/*` 实时数据（15s 轮询），零 mock 内容；API 不可达时显示 offline 徽标并保留最后已知数据；英文为默认语言，右上角一键切换中文（localStorage 持久化）；单文件、无构建步骤、无 CDN 依赖。
 - TUI（`wiktor tui`，ratatui，feature `tui`）于 Step12 B1 交付：与 Web console 同一数据面，四 Tab 键盘导航；见 `docs/design/step12-tui-console-prod(.en).md`。

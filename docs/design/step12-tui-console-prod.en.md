@@ -85,12 +85,16 @@ Must not change: the TUI/Web shared read-only data plane, the code.html prototyp
 - **Deployment gotchas (fixed in the template/script)**: ① `WIKTOR_API_KEYS` methods only accept lowercase snake_case (PascalCase fails closed at startup, with the allowed set in the error); ② HTTP `GET /search` requires the `domain` parameter (missing → 400) — `smoke-deploy.sh` now sends `domain=${DOMAIN:-tech-docs}`.
 
 
-### Implementation deviations (STEP12-001..004)
+- **UI redesign measured (local IAB)**: after seed + mock compile (58 accepted) + qug build — the Overview cards (schema 6 / 78 pages / 59 generations / 0 review), the due-status pill (pending·6), the row-counts table (11 tables with bilingual descriptions), 6 real rows in Compile Tasks, the search "rust" returning 5 hits (Rust async-runtime pages, scores 0.0154–0.0164) with per-path diagnostics (fts 9 / vec 0 / rrf_k 60); the EN/中文 toggle applies instantly and persists; two frontend bugs fixed (the `.hidden` CSS rule was missing; the hits innerHTML lacked `.join("")` and rendered stray commas).
+
+### Implementation deviations (STEP12-001..005)
 
 - **STEP12-001 (B2, API extension)**: `GET /api/overview` gains a `task_status_counts` field (due compile tasks counted by status, aggregated over due snapshots) — not listed in spec §4 B2; it is the real data source for the frontend's five state pills and delivers step11-console spec D3's original "overview includes compile-task status counts" intent.
 - **STEP12-002 (B3, data dir)**: the production data dir is `/srv/wiktor/data` (aligned with the existing `litestream.service` ReadWritePaths), not D5's `/srv/wiktor-data`; the units' sandbox ReadWritePaths matches.
 - **STEP12-003 (B3, toolchain)**: `install-wiktor.sh` does not auto-install a Rust toolchain (a missing cargo errors out with exit 2); the install steps live in the runbook (rustup + a China mirror). The production box therefore gains a **minimal toolchain** (rustup minimal + rsproxy) — the "no dev environment on Linux" convention is updated to "the minimal toolchain the production build needs".
 - **STEP12-004 (B1, retrieval behavior)**: the TUI query tab installs no FilterRelaxer (CLI `wiktor search` explicitly installs `DefaultFilterRelaxer`); neither TUI nor Web console search takes filter input, so the filtered-empty relaxation retry can never trigger — both forms align with their own input surface.
+
+- **STEP12-005 (B2, UI redesign, user directive 2026-09-25)**: `code.html` was rewritten from the Obsidian reference prototype into a **real-data supervisory UI** — it renders only live `/api/*` data (zero mock content), superseding step11-console spec D2's "reuse the code.html prototype visuals" invariant (the user clarified the prototype was reference-only and the UI should follow the project's actual data surface). English is the default language with a switch to 中文 (persisted in localStorage); the file is single-file with zero external dependencies (Tailwind/Material CDNs dropped, fully offline-capable). DESIGN.md and screen.png remain as historical visual references.
 
 Invariant self-check (§5 deviation baseline): the TUI/Web shared read-only data plane ✅, code.html visuals not redone (markers + an appended rendering layer only) ✅, systemd single-node orchestration without containers ✅.
 
