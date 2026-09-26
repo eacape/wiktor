@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "The Wiktor kernel: two-plane SQLite store (diesel + FTS5), QueryEngine, QUG graph, compile pipeline, consistency/compatibility arbiters, and the Mock vector baseline."
+documentation = "https://docs.rs/wiktor-core"
 
 [dependencies]
 diesel = { workspace = true }

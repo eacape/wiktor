@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "The Wiktor feedback-store trait and standard analyzer: zero-recall, low-quality-recall, and rewrite-failure signals with deterministic aggregation."
+documentation = "https://docs.rs/wiktor-feedback"
 
 [dependencies]
 # 仅依赖 core（偏差 STEP6-003：SQLite 实现单源在 core kernel；禁止 core 反向依赖

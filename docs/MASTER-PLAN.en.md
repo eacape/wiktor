@@ -464,7 +464,7 @@ wiktor/                          # single-repository Cargo workspace
 
 - Confirm availability of wiktor.dev / wiktor.io before registering
 - Trade-off of GitHub org name (wiktor-rs) vs. crate name (wiktor) mismatch
-- Competitor comparison table (Vectara / Pinecone / Weaviate / LangChain / WeKnora, etc.; dimensions: compilation observability / pluginability / open source vs. hosted) — complete before writing the README
+- Competitor comparison table (Vectara / Pinecone / Weaviate / LangChain / WeKnora, etc.; dimensions: compilation observability / pluginability / open source vs. hosted) — complete before writing the README ✅ (P5, 2026-09-27: landed in the README "Wiktor in context" section + .en mirror, see step14-p5-oss-face spec)
 
 ## 15. Brand
 

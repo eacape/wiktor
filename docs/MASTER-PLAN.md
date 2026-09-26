@@ -483,7 +483,7 @@ wiktor/                          # Cargo workspace 单仓
 
 - wiktor.dev / wiktor.io 可用性注册前确认
 - GitHub org 名（wiktor-rs）与 crate 名（wiktor）不一致的取舍
-- 竞品对比表（Vectara / Pinecone / Weaviate / LangChain / WeKnora 等，维度：编译可观测性 / 插件化 / 开源 vs 托管）——写入 README 前完成
+- 竞品对比表（Vectara / Pinecone / Weaviate / LangChain / WeKnora 等，维度：编译可观测性 / 插件化 / 开源 vs 托管）——写入 README 前完成 ✅（P5，2026-09-27：已入 README「对标与定位」节 + .en 版，见 step14-p5-oss-face spec）
 
 ## 十五、品牌
 

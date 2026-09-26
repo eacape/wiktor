@@ -3,9 +3,10 @@ name = "wiktor-console"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Wiktor Web + TUI console：把 Wiktor 数据（任务/质量/审阅/检索诊断）接到可视化界面。"
+description = "The Wiktor Web + TUI console: a local read-only supervisory surface over tasks, quality, review, and retrieval diagnostics."
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/wiktor-console"
 keywords = ["console", "dashboard", "search", "monitor"]
 categories = ["command-line-interface", "web-programming"]
 # 依赖边界（STEP11 console，D1/D5）：console 是读界面，in-process 读

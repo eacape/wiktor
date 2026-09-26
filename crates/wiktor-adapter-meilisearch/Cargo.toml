@@ -3,9 +3,10 @@ name = "wiktor-adapter-meilisearch"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Wiktor 可选插件：把 accepted 页镜像到 Meilisearch（外部检索引擎出口）。"
+description = "The Wiktor Meilisearch retrieval-outlet plugin: mirrors accepted pages to a Meilisearch index."
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/wiktor-adapter-meilisearch"
 keywords = ["meilisearch", "search", "export", "adapter"]
 categories = ["database"]
 # 依赖规则（MASTER-PLAN §8）：插件只依赖 core + 自身传输依赖，不依赖

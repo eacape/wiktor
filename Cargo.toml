@@ -16,6 +16,11 @@ edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/eacape/wiktor"
+description = "A compiling knowledge-retrieval database: LLM-compiled Wiki pages plus a fact plane, hybrid retrieval (FTS5 + vector + QUG), a feedback loop, and gRPC/HTTP services on single-node SQLite."
+homepage = "https://github.com/eacape/wiktor"
+documentation = "https://docs.rs/wiktor"
+keywords = ["retrieval", "search", "knowledge-graph", "llm", "compilation"]
+categories = ["database-implementations", "search"]
 
 [workspace.dependencies]
 # 异步运行时

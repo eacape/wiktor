@@ -1,10 +1,12 @@
 //! 服务端指标（spec `step6-feedback-loop.md` §7.2、§10 A17）：原子计数器 +
-//! 最小 Prometheus text 渲染。固定六个指标名、固定 label 集合，**禁止用户
-//! 输入作 label**（不出现 domain、query 文本、key 原文/标签）。
+//! 最小 Prometheus text 渲染。固定指标名与固定 label 集合（Step14 P5 实为 8
+//! 个 family：6 个 feedback + query 延迟直方图 + compile 状态计数），**禁止
+//! 用户输入作 label**（不出现 domain、query 文本、key 原文/标签）。
 //! Server metrics (spec `step6-feedback-loop.md` §7.2, §10 A17): atomic
-//! counters plus a minimal Prometheus text rendering. Six fixed metric names
-//! and a fixed label set; **user input is never used as a label** (no domain,
-//! query text, or raw/derived key material appears).
+//! counters plus a minimal Prometheus text rendering. Fixed metric names and a
+//! fixed label set (Step14 P5: actually 8 families — 6 feedback + the query
+//! latency histogram + the compile-status counter); **user input is never used
+//! as a label** (no domain, query text, or raw/derived key material appears).
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -3,9 +3,10 @@ name = "wiktor-vector-qdrant"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Wiktor 可插拔向量后端：Qdrant 外部服务（插件点 3 实现）。"
+description = "The Wiktor qdrant vector-backend plugin: the external vector service backing hybrid retrieval."
 license.workspace = true
 repository.workspace = true
+documentation = "https://docs.rs/wiktor-vector-qdrant"
 keywords = ["vector", "qdrant", "search", "embedding"]
 categories = ["database"]
 # 依赖规则（MASTER-PLAN §8）：插件只依赖 core，不依赖 server/feedback。

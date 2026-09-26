@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+description = "The Wiktor service face: unified gRPC (six services) and HTTP (axum) with method-level API keys, health, metrics, and feedback ingestion."
+documentation = "https://docs.rs/wiktor-server"
 
 [dependencies]
 # 依赖边界（A1 / spec step6 §4）：core（存储与反馈实现）+ feedback（FeedbackStore
