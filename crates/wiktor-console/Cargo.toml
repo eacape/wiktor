@@ -20,6 +20,7 @@ categories = ["command-line-interface", "web-programming"]
 # server/feedback write paths.
 [dependencies]
 wiktor-core = { path = "../wiktor-core" }
+wiktor-vector-qdrant = { path = "../wiktor-vector-qdrant", optional = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
@@ -43,3 +44,15 @@ http-body-util = { workspace = true }
 # assembly).
 [features]
 tui = ["dep:ratatui", "dep:crossterm"]
+# embedding-http：转发 wiktor-core 真实嵌入客户端（P6；key/端点/模型走环境变量）。
+# embedding-http: forwards wiktor-core's real embedding client (P6; key/endpoint/
+# model come from env vars).
+embedding-http = ["wiktor-core/embedding-http"]
+# vector-qdrant：装配 qdrant 向量后端插件（P6；`WIKTOR_VECTOR_BACKEND=qdrant` 生效）。
+# vector-qdrant: assembles the qdrant vector-backend plugin (P6; active under
+# `WIKTOR_VECTOR_BACKEND=qdrant`).
+vector-qdrant = ["dep:wiktor-vector-qdrant"]
+# 默认关闭真实向量/嵌入（只读监督面，mock 离线即可；CLI 装配 console 时按需转发）。
+# Real vector/embedding are off by default (a read-only supervisory surface, the
+# offline mock suffices; the CLI forwards them when it assembles the console).
+default = []

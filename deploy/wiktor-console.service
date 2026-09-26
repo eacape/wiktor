@@ -13,6 +13,12 @@ Wants=network-online.target
 Type=simple
 User=wiktor
 Group=wiktor
+# 与 wiktor-server.service 对齐（P6）：注入 /etc/wiktor/wiktor.env，使 console
+# 的 `/api/search` 按 env 装配真实 qdrant 向量 + 真实嵌入（否则恒 mock 退化纯 FTS）。
+# Aligned with wiktor-server.service (P6): inject /etc/wiktor/wiktor.env so the
+# console `/api/search` assembles the real qdrant vectors + real embedder per env
+# (otherwise it stays mock and degrades to FTS-only).
+EnvironmentFile=/etc/wiktor/wiktor.env
 ExecStart=/usr/local/bin/wiktor console --db /srv/wiktor/data/wiktor.db --listen 127.0.0.1:8081
 Restart=on-failure
 RestartSec=5s

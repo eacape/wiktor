@@ -3489,6 +3489,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiktor-core",
+ "wiktor-vector-qdrant",
 ]
 
 [[package]]

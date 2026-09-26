@@ -19,9 +19,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Tabs};
 use ratatui::{Frame, Terminal};
-use wiktor_core::kernel::MockVectorStore;
 use wiktor_core::kernel::SqliteKernel;
 use wiktor_core::query_engine::QueryEngine;
+use wiktor_core::traits::VectorStore;
 
 use state::TuiState;
 
@@ -65,7 +65,7 @@ fn restore_terminal(
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     kernel: Arc<SqliteKernel>,
-    engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>>,
+    engines: std::collections::HashMap<String, Arc<QueryEngine<dyn VectorStore>>>,
 ) -> anyhow::Result<()> {
     let mut app = TuiState::new();
     // Step14 P4：默认选中第一个已编译 domain（多域数据面；空库 → None）。

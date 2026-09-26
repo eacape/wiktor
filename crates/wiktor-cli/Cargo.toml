@@ -62,8 +62,16 @@ vector-qdrant = ["dep:wiktor-vector-qdrant"]
 # export-meilisearch: assembles the Meilisearch outlet plugin (STEP10 B4; off by
 # default — the external engine is an optional plugin).
 export-meilisearch = ["dep:wiktor-adapter-meilisearch"]
-# console：装配 Web console 插件（STEP11 B5）。
-console = ["dep:wiktor-console"]
+# console：装配 Web console 插件（STEP11 B5；P6 转发真实向量/嵌入 feature，
+# 使 console 的 `/api/search` 也能按 env 命中真实 qdrant 向量）。
+# console: assembles the Web console plugin (STEP11 B5; P6 forwards the real
+# vector/embedding features so console `/api/search` can hit real qdrant vectors
+# per env too).
+console = [
+    "dep:wiktor-console",
+    "wiktor-console/embedding-http",
+    "wiktor-console/vector-qdrant",
+]
 server = ["dep:wiktor-server"]
 # tui：装配 TUI console（STEP12 B1；转发 wiktor-console 的 tui feature）。
 # tui: assembles the TUI console (STEP12 B1; forwards wiktor-console's tui

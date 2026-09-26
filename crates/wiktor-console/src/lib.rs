@@ -20,8 +20,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use wiktor_core::embedding::deterministic::{DeterministicEmbedder, DIM};
 use wiktor_core::kernel::{MockVectorStore, SqliteKernel};
-use wiktor_core::query_engine::QueryEngine;
-use wiktor_core::traits::{DistanceMetric, VectorStore as _};
+use wiktor_core::query_engine::{QueryEmbedder, QueryEngine};
+use wiktor_core::traits::{DistanceMetric, VectorStore};
 
 /// TUI console（STEP12 B1，feature `tui`）：与 Web console 同源数据面的终端形态。
 /// The TUI console (STEP12 B1, feature `tui`): the terminal form sharing the
@@ -36,9 +36,11 @@ pub mod tui;
 pub struct ConsoleState {
     pub kernel: Arc<SqliteKernel>,
     /// Step14 P4 多域：key = domain_name，每域一个只读检索引擎（walk 型）。
+    /// P6: 向量后端按 env 装配（mock | qdrant），与 serve 同源。
     /// Step14 P4 multi-domain: key = domain_name, one read-only retrieval engine
-    /// per domain.
-    pub engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>>,
+    /// per domain. P6: the vector backend is env-assembled (mock | qdrant), the
+    /// same source as serve.
+    pub engines: std::collections::HashMap<String, Arc<QueryEngine<dyn VectorStore>>>,
     pub static_dir: std::path::PathBuf,
 }
 
@@ -63,8 +65,17 @@ pub async fn serve(
     // to FTS-only), so `POST /api/search` returns real QueryDiagnostics (A4).
     // Searches persist `query_logs` rows as usual (D3 reuses the existing query
     // path instead of adding a new write path).
-    let vector_store = Arc::new(MockVectorStore::new());
-    let embedder = Arc::new(DeterministicEmbedder::new(DIM));
+    // P6：按 env 装配真实向量后端 + 嵌入器（`WIKTOR_VECTOR_BACKEND=qdrant` +
+    // `WIKTOR_EMBEDDING_BASE_URL` 时用真实 qdrant + HttpEmbedder，维度探测同
+    // serve/vector build；缺省回退离线 mock + 确定性嵌入）。与 serve 检索同源，
+    // 使 console `/api/search` 也能命中真实向量。
+    // P6: assemble the real vector backend + embedder per env (qdrant via
+    // `WIKTOR_VECTOR_BACKEND=qdrant` + a real embedder when
+    // `WIKTOR_EMBEDDING_BASE_URL` is set, dimension-probed like serve/vector
+    // build; default falls back to the offline mock + deterministic embedder).
+    // This keeps console retrieval same-source as serve, so `/api/search` can
+    // hit real vectors too.
+    let (vector_store, embedder) = assemble_vector_stack().await?;
     // Step14 P4 多域：从 kernel 发现已编译 domain，每域建一个只读检索引擎。
     // 无域（空库）→ 空 map，search 返回空命中 + 提示。移除 milk-tea 硬编码。
     // Step14 P4 multi-domain: discover compiled domains from the kernel and
@@ -74,11 +85,22 @@ pub async fn serve(
         .list_domains()
         .map(|ds| ds.into_iter().map(|d| d.domain).collect())
         .unwrap_or_default();
-    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>> =
+    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<dyn VectorStore>>> =
         std::collections::HashMap::new();
     for domain_name in discovered {
+        // 集合维度：mock 后端恒 768，真实嵌入器经探测串实测维度（与 vector
+        // build 同模式；qdrant 集合按域名隔离，天然多域安全）。
+        // Collection dimension: the mock backend is always 768, while the real
+        // embedder's dimension is probed from the model (same pattern as vector
+        // build; qdrant collections are isolated by domain name, naturally
+        // multi-domain safe).
+        let dim = embedder
+            .embed("wiktor-console-collection-dimension-probe")
+            .await
+            .map_err(|e| anyhow::anyhow!("embed dimension probe: {e}"))?
+            .len();
         vector_store
-            .ensure_collection(&domain_name, DIM, DistanceMetric::Cosine)
+            .ensure_collection(&domain_name, dim, DistanceMetric::Cosine)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let engine = Arc::new(
@@ -112,6 +134,73 @@ pub async fn serve(
     tracing::info!("wiktor console on http://{listen} (serves docs/console_ui/code.html)");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// 按 env 装配 console 的向量后端与查询嵌入器（P6，与 serve `assemble_vector_stack`
+/// 同源）。`WIKTOR_VECTOR_BACKEND=mock|qdrant`（默认 mock）；qdrant 走
+/// `WIKTOR_QDRANT_URL`/`WIKTOR_QDRANT_API_KEY`，需 `vector-qdrant` feature。
+/// 嵌入器：设 `WIKTOR_EMBEDDING_BASE_URL` 且 `embedding-http` feature 时用
+/// HttpEmbedder（真实模型维度经探测串实测），否则确定性嵌入 768 维。返回
+/// `(Arc<dyn VectorStore>, Arc<dyn QueryEmbedder>)`；mock 后端恒定返回
+/// `MockVectorStore`。
+/// Assembles the console's vector backend and query embedder per env (P6; the
+/// same source as serve's `assemble_vector_stack`).
+/// `WIKTOR_VECTOR_BACKEND=mock|qdrant` (default mock); qdrant uses
+/// `WIKTOR_QDRANT_URL`/`WIKTOR_QDRANT_API_KEY` and needs the `vector-qdrant`
+/// feature. The embedder uses HttpEmbedder when `WIKTOR_EMBEDDING_BASE_URL` is
+/// set and the `embedding-http` feature is on (the real model's dimension is
+/// probed), otherwise the deterministic 768 embedder. Returns
+/// `(Arc<dyn VectorStore>, Arc<dyn QueryEmbedder>)`; the mock backend always
+/// returns a `MockVectorStore`.
+pub(crate) async fn assemble_vector_stack(
+) -> anyhow::Result<(Arc<dyn VectorStore>, Arc<dyn QueryEmbedder>)> {
+    let embedder: Arc<dyn QueryEmbedder> = match std::env::var("WIKTOR_EMBEDDING_BASE_URL") {
+        Ok(url) if !url.trim().is_empty() => {
+            #[cfg(feature = "embedding-http")]
+            {
+                Arc::new(wiktor_core::embedding::HttpEmbedder::from_env()?)
+            }
+            #[cfg(not(feature = "embedding-http"))]
+            {
+                anyhow::bail!(
+                    "WIKTOR_EMBEDDING_BASE_URL is set but the embedding-http feature is off (rebuild with default features)"
+                )
+            }
+        }
+        _ => Arc::new(DeterministicEmbedder::new(DIM)),
+    };
+    let backend = std::env::var("WIKTOR_VECTOR_BACKEND")
+        .unwrap_or_else(|_| "mock".to_string())
+        .to_lowercase();
+    let store: Arc<dyn VectorStore> = match backend.as_str() {
+        "mock" => Arc::new(MockVectorStore::new()),
+        "qdrant" => {
+            #[cfg(feature = "vector-qdrant")]
+            {
+                let dim = embedder
+                    .embed("wiktor-console-dimension-probe")
+                    .await
+                    .map_err(|e| anyhow::anyhow!("embed dimension probe: {e}"))?
+                    .len();
+                let url = std::env::var("WIKTOR_QDRANT_URL")
+                    .unwrap_or_else(|_| "http://127.0.0.1:6334".to_string());
+                let api_key = std::env::var("WIKTOR_QDRANT_API_KEY").ok();
+                Arc::new(wiktor_vector_qdrant::QdrantVectorStore::from_config(
+                    &url,
+                    api_key.as_deref(),
+                    dim,
+                )?)
+            }
+            #[cfg(not(feature = "vector-qdrant"))]
+            {
+                anyhow::bail!(
+                    "WIKTOR_VECTOR_BACKEND=qdrant requires the vector-qdrant feature (rebuild with default features)"
+                )
+            }
+        }
+        other => anyhow::bail!("unknown WIKTOR_VECTOR_BACKEND: {other} (expected mock|qdrant)"),
+    };
+    Ok((store, embedder))
 }
 
 /// 构造 console 的 axum router：JSON API 全走 kernel 读；`/` 返回

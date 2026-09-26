@@ -8,10 +8,9 @@
 
 use std::sync::Arc;
 
-use wiktor_core::embedding::deterministic::{DeterministicEmbedder, DIM};
-use wiktor_core::kernel::{MockVectorStore, ReviewStatus, SqliteKernel};
+use wiktor_core::kernel::{ReviewStatus, SqliteKernel};
 use wiktor_core::query_engine::QueryEngine;
-use wiktor_core::traits::{DistanceMetric, VectorStore as _};
+use wiktor_core::traits::{DistanceMetric, VectorStore};
 use wiktor_core::types::Query;
 
 /// TUI 四个 Tab（spec step12 §4 B1：1 仪表盘 / 2 任务 / 3 审阅 / 4 查询）。
@@ -203,11 +202,15 @@ pub async fn assemble(
     db: &std::path::Path,
 ) -> anyhow::Result<(
     Arc<SqliteKernel>,
-    std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>>,
+    std::collections::HashMap<String, Arc<QueryEngine<dyn VectorStore>>>,
 )> {
     let kernel = Arc::new(SqliteKernel::open(db)?);
-    let vector_store = Arc::new(MockVectorStore::new());
-    let embedder = Arc::new(DeterministicEmbedder::new(DIM));
+    // P6：按 env 装配真实向量后端 + 嵌入器（与 Web console / serve 同源）；
+    // 缺省回退离线 mock + 确定性嵌入。
+    // P6: assemble the real vector backend + embedder per env (same source as
+    // the Web console / serve); defaults to the offline mock + deterministic
+    // embedder.
+    let (vector_store, embedder) = crate::assemble_vector_stack().await?;
     // Step14 P4：从 kernel 发现已编译 domain，每域建一个只读检索引擎；移除
     // milk-tea 硬编码。空库 → 空 map。
     // Step14 P4: discover compiled domains from the kernel and build one
@@ -217,11 +220,16 @@ pub async fn assemble(
         .list_domains()
         .map(|ds| ds.into_iter().map(|d| d.domain).collect())
         .unwrap_or_default();
-    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>> =
+    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<dyn VectorStore>>> =
         std::collections::HashMap::new();
     for domain_name in discovered {
+        let dim = embedder
+            .embed("wiktor-console-dimension-probe")
+            .await
+            .map_err(|e| anyhow::anyhow!("embed dimension probe: {e}"))?
+            .len();
         vector_store
-            .ensure_collection(&domain_name, DIM, DistanceMetric::Cosine)
+            .ensure_collection(&domain_name, dim, DistanceMetric::Cosine)
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let engine = Arc::new(
@@ -302,7 +310,7 @@ pub fn load_reviews(kernel: &Arc<SqliteKernel>) -> Vec<ReviewRow> {
 /// Runs a search (the same QueryEngine as the Web console; failures fold into
 /// the `error` field instead of crashing).
 pub async fn run_search(
-    engine: &Arc<QueryEngine<MockVectorStore>>,
+    engine: &Arc<QueryEngine<dyn VectorStore>>,
     text: &str,
     top_k: usize,
     domain: Option<&str>,
