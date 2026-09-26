@@ -75,5 +75,5 @@ pub use feedback_store::{
 // Step 6 批2：查询日志写入口（QueryEngine 用）——载荷类型与 domain 缺省常量。
 // Step 6 batch 2: the query-log write entry (used by the QueryEngine) — the
 // payload type and the default-domain constant.
-pub use sqlite::{DomainStat, QualitySummary};
+pub use sqlite::{DomainStat, PageQuality, QualitySummary};
 pub use sqlite::{QueryLogInsert, DEFAULT_QUERY_LOG_DOMAIN};

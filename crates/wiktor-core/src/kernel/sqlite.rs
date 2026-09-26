@@ -85,6 +85,49 @@ pub struct QualitySummary {
     pub overall: Option<f64>,
 }
 
+/// 单页五维质量（P2-II 区分度探针：逐页明细，识别非满分页与区分度）。
+/// Per-page five-dimension quality (P2-II discrimination probe: per-page detail,
+/// surfacing non-full-score pages and the scorer's discrimination).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PageQuality {
+    pub page_id: String,
+    pub entity_id: String,
+    pub title: String,
+    pub status: String,
+    pub coverage: f64,
+    pub citation: f64,
+    pub schema_compliance: f64,
+    pub density: f64,
+    pub consistency: Option<f64>,
+    pub overall: f64,
+}
+
+/// quality_rows 的 SQL 行映射。
+/// The SQL row mapping for quality_rows.
+#[derive(QueryableByName)]
+struct PageQualityRow {
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    page_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    entity_id: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    title: String,
+    #[diesel(sql_type = diesel::sql_types::Text)]
+    status: String,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    coverage: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    citation: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    schema_compliance: f64,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    density: f64,
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Double>)]
+    consistency: Option<f64>,
+    #[diesel(sql_type = diesel::sql_types::Double)]
+    overall: f64,
+}
+
 /// quality_summary 的 SQL 行映射（AVG 对空表返回 NULL → Option）。
 /// The SQL row mapping for quality_summary (AVG yields NULL on an empty table
 /// → Option).
@@ -344,6 +387,40 @@ impl SqliteKernel {
             .map(|r| DomainStat {
                 domain: r.domain,
                 pages: r.pages,
+            })
+            .collect())
+    }
+
+    /// 逐页五维质量明细（P2-II 区分度探针）：`page_quality` 关联 `pages` 取
+    /// page_id/entity_id/title/status，按 overall 升序（低分优先），纯只读。
+    /// Per-page five-dimension quality detail (P2-II discrimination probe):
+    /// `page_quality` joined with `pages` for page_id/entity_id/title/status,
+    /// ordered by overall ascending (worst first); read-only.
+    pub fn quality_rows(&self) -> Result<Vec<PageQuality>> {
+        let mut conn = self.conn.lock().unwrap();
+        let rows: Vec<PageQualityRow> = diesel::sql_query(
+            "SELECT p.page_id AS page_id, p.entity_id AS entity_id, \
+                    p.title AS title, p.status AS status, \
+                    q.coverage AS coverage, q.citation AS citation, \
+                    q.schema_compliance AS schema_compliance, q.density AS density, \
+                    q.consistency AS consistency, q.overall AS overall \
+             FROM page_quality q JOIN pages p ON p.page_id = q.page_id \
+             ORDER BY q.overall ASC, p.page_id ASC",
+        )
+        .load(&mut *conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| PageQuality {
+                page_id: r.page_id,
+                entity_id: r.entity_id,
+                title: r.title,
+                status: r.status,
+                coverage: r.coverage,
+                citation: r.citation,
+                schema_compliance: r.schema_compliance,
+                density: r.density,
+                consistency: r.consistency,
+                overall: r.overall,
             })
             .collect())
     }

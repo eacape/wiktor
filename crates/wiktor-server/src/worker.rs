@@ -17,6 +17,9 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use wiktor_core::compile::config::{Clock, CompilePolicy, SystemClock};
+use wiktor_core::compile::consistency::{
+    ConsistencyArbiter, SourceRefConsistencyArbiter, SqliteFtsCandidateProvider,
+};
 use wiktor_core::compile::contract::DefaultSourceRefValidator;
 use wiktor_core::compile::executor::{LeaseOutcome, PipelineExecutor};
 use wiktor_core::compile::mock::MockCompiler;
@@ -102,15 +105,80 @@ impl CompileWorker {
             domain_pack_version,
             options_json,
         )?;
-        let executor = Arc::new(PipelineExecutor::new(
+        let consistency_enabled = policy.consistency.enabled;
+        let mut executor = PipelineExecutor::new(
             kernel.clone(),
             Self::build_server_compiler(policy.clone())?,
             Arc::new(RuleBasedScorer::new()),
             Arc::new(DefaultSourceRefValidator::new()),
             Arc::new(SystemClock),
             policy,
-        ));
-        Ok(Self::new(kernel, executor, schema))
+        );
+        // Step14 P3-A：consistency 装配与 CLI 同源（env 驱动仲裁器 + SQLite FTS
+        // 有界候选提供器）；关闭时走 None 路径（不仲裁）。
+        // Step14 P3-A: consistency wiring is assembler-source-identical to the
+        // CLI (env-driven arbiter + bounded SQLite FTS candidate provider); with
+        // consistency disabled the None path is kept (no arbitration).
+        if consistency_enabled {
+            executor = executor
+                .with_consistency_arbiter(Self::build_server_consistency_arbiter())
+                .with_candidate_provider(Arc::new(SqliteFtsCandidateProvider::new(kernel.clone())));
+        }
+        Ok(Self::new(kernel, Arc::new(executor), schema))
+    }
+
+    /// Step14 P3-A：按 env 装配常驻 worker 的一致性仲裁器（与 CLI 同源逻辑）。
+    /// `WIKTOR_CONSISTENCY_LLM=1` 且设了非空 `WIKTOR_LLM_BASE_URL` 时用
+    /// `LlmConsistencyArbiter`（模型取 `WIKTOR_LLM_MODEL`，缺省
+    /// [`DEFAULT_LLM_MODEL`]）；否则回退确定性 `SourceRefConsistencyArbiter`
+    /// （离线基线）。一致性仲裁是新增面，显式 opt-in 而非设 URL 即启用。
+    /// Step14 P3-A: assembles the resident worker's consistency arbiter per env
+    /// (the same logic as the CLI). With `WIKTOR_CONSISTENCY_LLM=1` AND a non-empty
+    /// `WIKTOR_LLM_BASE_URL` it uses `LlmConsistencyArbiter` (model from
+    /// `WIKTOR_LLM_MODEL`, defaulting to [`DEFAULT_LLM_MODEL`]); otherwise it
+    /// falls back to the deterministic `SourceRefConsistencyArbiter` (the offline
+    /// baseline). Consistency arbitration is a new surface and opts in
+    /// explicitly rather than enabling on URL presence.
+    fn build_server_consistency_arbiter() -> Arc<dyn ConsistencyArbiter> {
+        let opt_in = std::env::var("WIKTOR_CONSISTENCY_LLM")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let base_url = std::env::var("WIKTOR_LLM_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        if opt_in {
+            if let Some(url) = base_url {
+                #[cfg(feature = "llm-openai")]
+                {
+                    use wiktor_core::compile::consistency::LlmConsistencyArbiter;
+                    use wiktor_core::compile::llm::{OpenAiLlmClient, API_KEY_ENV};
+                    let model = std::env::var("WIKTOR_LLM_MODEL")
+                        .ok()
+                        .filter(|v| !v.trim().is_empty())
+                        .unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
+                    let api_key = std::env::var(API_KEY_ENV)
+                        .ok()
+                        .filter(|k| !k.trim().is_empty());
+                    if let Ok(client) =
+                        OpenAiLlmClient::new(model.clone(), Some(url), api_key, false)
+                    {
+                        return Arc::new(LlmConsistencyArbiter::new(Arc::new(client), model, 512));
+                    }
+                    eprintln!(
+                        "wiktor: consistency LLM arbiter construction failed; \
+                         falling back to deterministic"
+                    );
+                }
+                #[cfg(not(feature = "llm-openai"))]
+                {
+                    eprintln!(
+                        "wiktor: consistency LLM arbiter requires the `llm-openai` feature; \
+                         falling back to deterministic"
+                    );
+                }
+            }
+        }
+        Arc::new(SourceRefConsistencyArbiter::new())
     }
 
     /// 按 env 装配常驻 worker 的编译器（Step0b）：设了非空

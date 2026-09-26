@@ -674,8 +674,9 @@ mod tests {
         report: ConsistencyReport,
     }
 
+    #[async_trait::async_trait]
     impl ConsistencyArbiter for PresetArbiter {
-        fn arbitrate(
+        async fn arbitrate(
             &self,
             _candidate: &CompiledPage,
             _related: &[CompiledPage],
@@ -727,8 +728,8 @@ mod tests {
     // Some(1) → the five-dim average and accepted; Some(0) → below
     // min_consistency=1.0 raises CONSISTENCY_BELOW_THRESHOLD and can never be
     // accepted; 0/1 are expressed exactly.
-    #[test]
-    fn fake_arbiter_reports_flow_through_scorer() {
+    #[tokio::test]
+    async fn fake_arbiter_reports_flow_through_scorer() {
         let src = source();
         let ev = evidence("## 概述\n\n- 啵啵[[ref:r1]]\n- 珍珠[[ref:r2]]\n");
         let refs = DefaultSourceRefValidator.validate(&src, &ev, true);
@@ -752,7 +753,10 @@ mod tests {
         let arb_none = Arc::new(PresetArbiter {
             report: report_with(None),
         }) as Arc<dyn ConsistencyArbiter>;
-        let r_none = arb_none.arbitrate(&p, &[], &policy.consistency).unwrap();
+        let r_none = arb_none
+            .arbitrate(&p, &[], &policy.consistency)
+            .await
+            .unwrap();
         let via_v2 =
             scorer.score_with_consistency(&src, Some(&p), &refs, true, &r_none, &ctx, &policy);
         let legacy = scorer.score(&src, Some(&p), &refs, true, &ctx, &policy);
@@ -766,7 +770,10 @@ mod tests {
         let arb_one = Arc::new(PresetArbiter {
             report: report_with(Some(1.0)),
         }) as Arc<dyn ConsistencyArbiter>;
-        let r_one = arb_one.arbitrate(&p, &[], &policy.consistency).unwrap();
+        let r_one = arb_one
+            .arbitrate(&p, &[], &policy.consistency)
+            .await
+            .unwrap();
         let via_one =
             scorer.score_with_consistency(&src, Some(&p), &refs, true, &r_one, &ctx, &policy);
         assert_eq!(via_one.quality.consistency, Some(1.0));
@@ -782,7 +789,10 @@ mod tests {
         let arb_zero = Arc::new(PresetArbiter {
             report: report_with(Some(0.0)),
         }) as Arc<dyn ConsistencyArbiter>;
-        let r_zero = arb_zero.arbitrate(&p, &[], &policy.consistency).unwrap();
+        let r_zero = arb_zero
+            .arbitrate(&p, &[], &policy.consistency)
+            .await
+            .unwrap();
         let via_zero =
             scorer.score_with_consistency(&src, Some(&p), &refs, true, &r_zero, &ctx, &policy);
         assert_eq!(via_zero.quality.consistency, Some(0.0));

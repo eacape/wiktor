@@ -44,6 +44,21 @@ enum Command {
         #[arg(long, default_value = "wiktor.db")]
         db: PathBuf,
     },
+    /// Per-page five-dimension quality probe (P2-II): dumps every page's score,
+    /// the distribution, and how many pages are NOT all-1.0 (the scorer's
+    /// discrimination). Read-only.
+    /// 逐页五维质量探针（P2-II）：输出每页评分、分布、非满分页数（评分器区分
+    /// 度）。只读。
+    Quality {
+        /// SQLite database path (default ./wiktor.db)
+        /// SQLite 数据库路径（默认 ./wiktor.db）
+        #[arg(long, default_value = "wiktor.db")]
+        db: PathBuf,
+        /// Emit a single JSON object on stdout.
+        /// stdout 输出单个 JSON 对象。
+        #[arg(long)]
+        json: bool,
+    },
     /// Seed knowledge pages + fact-plane data from a domain pack.
     /// 从领域包导入知识页面与事实平面数据。
     Seed {
@@ -286,6 +301,7 @@ async fn main() -> Result<()> {
                 println!("{table}: {count}");
             }
         }
+        Command::Quality { db, json } => cmd_quality(&db, json)?,
         Command::Seed { db, domain, pages } => cmd_seed(&db, &domain, pages.as_deref()).await?,
         Command::Search {
             text,
@@ -824,6 +840,93 @@ async fn cmd_export_meilisearch(_db: &Path, _domain: &Path, _index: Option<&str>
 /// query-side term join).
 fn embed_text(page: &wiktor_core::kernel::AcceptedPageVector) -> String {
     format!("{}\n{}", page.title, page.content)
+}
+
+/// P2-II 区分度探针：逐页五维质量 + 分布 + 非满分页识别（只读）。
+/// 输出人类表或 JSON（`--json`）。`non_uniform` = 非全 1 的页（评分器实际给出
+/// 区分的地方）；全 1 时标注「满分饱和（ceiling）——相关性对零方差未定义」。
+/// P2-II discrimination probe: per-page five-dimension quality + distribution +
+/// non-full-score page recognition (read-only). Emits a human table or JSON
+/// (`--json`). `non_uniform` = pages that are not all-1.0 (where the scorer
+/// actually discriminates); when all are 1.0 it flags the ceiling effect —
+/// correlation is undefined on zero variance.
+fn cmd_quality(db: &Path, json: bool) -> Result<()> {
+    let kernel = SqliteKernel::open(db)?;
+    let rows = kernel.quality_rows()?;
+    let n = rows.len();
+    // 非满分页 = 任一切面 < 1.0。
+    // Non-full-score = any dimension below 1.0.
+    let non_uniform: Vec<&wiktor_core::kernel::PageQuality> = rows
+        .iter()
+        .filter(|r| {
+            r.coverage < 1.0
+                || r.citation < 1.0
+                || r.schema_compliance < 1.0
+                || r.density < 1.0
+                || r.overall < 1.0
+        })
+        .collect();
+    let mean = |f: fn(&wiktor_core::kernel::PageQuality) -> f64| {
+        if n == 0 {
+            None
+        } else {
+            Some(rows.iter().map(f).sum::<f64>() / n as f64)
+        }
+    };
+    if json {
+        let obj = serde_json::json!({
+            "page_count": n,
+            "non_uniform_count": non_uniform.len(),
+            "mean": {
+                "coverage": mean(|r| r.coverage),
+                "citation": mean(|r| r.citation),
+                "schema_compliance": mean(|r| r.schema_compliance),
+                "density": mean(|r| r.density),
+                "overall": mean(|r| r.overall),
+            },
+            "non_uniform_pages": non_uniform.iter().map(|r| serde_json::json!({
+                "page_id": r.page_id,
+                "title": r.title,
+                "status": r.status,
+                "coverage": r.coverage,
+                "citation": r.citation,
+                "density": r.density,
+                "overall": r.overall,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{obj}");
+        return Ok(());
+    }
+    println!(
+        "page_count={n}  non_uniform={} (not-all-1.0 pages)",
+        non_uniform.len()
+    );
+    if non_uniform.is_empty() && n > 0 {
+        println!(
+            "NOTE: all pages score all-1.0 (ceiling effect) — correlation is \
+             undefined on zero variance; discrimination is on low-quality pages only."
+        );
+        println!("注意：全部页满分（ceiling）——零方差上相关系数未定义；评分区分仅对劣质页成立。");
+    }
+    println!(
+        "mean  coverage={:.3}  citation={:.3}  schema={:.3}  density={:.3}  overall={:.3}",
+        mean(|r| r.coverage).unwrap_or(0.0),
+        mean(|r| r.citation).unwrap_or(0.0),
+        mean(|r| r.schema_compliance).unwrap_or(0.0),
+        mean(|r| r.density).unwrap_or(0.0),
+        mean(|r| r.overall).unwrap_or(0.0),
+    );
+    println!(
+        "{:<4} {:<6} {:<5} {:<5} {:<5} {:<5}  title",
+        "overall", "status", "cov", "cit", "den", "sch"
+    );
+    for r in &rows {
+        println!(
+            "{:<4.2} {:<6} {:<5.2} {:<5.2} {:<5.2} {:<5.2}  {}",
+            r.overall, r.status, r.coverage, r.citation, r.density, r.schema_compliance, r.title,
+        );
+    }
+    Ok(())
 }
 
 /// Search through the QueryEngine: QUG rewrite (optional) → filter pushdown →

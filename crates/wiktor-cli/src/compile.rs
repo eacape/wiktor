@@ -16,7 +16,9 @@ use wiktor_core::compile::compatibility::COMPATIBILITY_REJECTED_PREFIX;
 use wiktor_core::compile::config::{
     build_context, CompilePolicy, CompileStats, RunOptions, SystemClock,
 };
-use wiktor_core::compile::consistency::{SourceRefConsistencyArbiter, SqliteFtsCandidateProvider};
+use wiktor_core::compile::consistency::{
+    ConsistencyArbiter, SourceRefConsistencyArbiter, SqliteFtsCandidateProvider,
+};
 use wiktor_core::compile::contract::{system_prompt, DefaultSourceRefValidator};
 use wiktor_core::compile::executor::PipelineExecutor;
 use wiktor_core::compile::mock::MockCompiler;
@@ -381,7 +383,7 @@ pub async fn run(args: CompileArgs) -> Result<i32> {
     );
     if consistency_enabled {
         executor = executor
-            .with_consistency_arbiter(Arc::new(SourceRefConsistencyArbiter::new()))
+            .with_consistency_arbiter(build_cli_consistency_arbiter())
             .with_candidate_provider(Arc::new(SqliteFtsCandidateProvider::new(kernel)));
     }
     let options = RunOptions {
@@ -425,6 +427,63 @@ fn build_llm_compiler(args: &CompileArgs, policy: CompilePolicy) -> Result<Arc<d
         client: Arc::new(client),
         policy,
     }))
+}
+
+/// Step14 P3-A：装配 CLI 的一致性仲裁器（env 驱动）。`WIKTOR_CONSISTENCY_LLM=1`
+/// 且设了非空 `WIKTOR_LLM_BASE_URL` 时用 LLM 仲裁（模型 `WIKTOR_LLM_MODEL`，
+/// 缺省 qwen3.8-max）；否则回退确定性 `SourceRefConsistencyArbiter`（离线绿）。
+/// 与编译器不同，一致性仲裁是**新增面**，采用显式 opt-in（而非设 URL 即启用），
+/// 避免意外引入网络裁决。
+/// Step14 P3-A: assembles the CLI consistency arbiter (env-driven). With
+/// `WIKTOR_CONSISTENCY_LLM=1` AND a non-empty `WIKTOR_LLM_BASE_URL` it uses the
+/// LLM arbiter (model `WIKTOR_LLM_MODEL`, defaulting to qwen3.8-max); otherwise
+/// it falls back to the deterministic `SourceRefConsistencyArbiter` (offline
+/// green). Unlike the compiler, consistency arbitration is a **new surface** and
+/// uses an explicit opt-in (rather than enabling on URL presence), to avoid
+/// accidentally introducing network-based arbitration.
+#[cfg(feature = "llm-openai")]
+fn build_cli_consistency_arbiter() -> Arc<dyn ConsistencyArbiter> {
+    use wiktor_core::compile::llm::{OpenAiLlmClient, API_KEY_ENV};
+
+    let opt_in = std::env::var("WIKTOR_CONSISTENCY_LLM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let base_url = std::env::var("WIKTOR_LLM_BASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    if opt_in {
+        if let Some(url) = base_url {
+            let model = std::env::var("WIKTOR_LLM_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "qwen3.8-max".to_string());
+            let api_key = std::env::var(API_KEY_ENV)
+                .ok()
+                .filter(|k| !k.trim().is_empty());
+            if let Ok(client) = OpenAiLlmClient::new(model.clone(), Some(url), api_key, false) {
+                return Arc::new(wiktor_core::compile::LlmConsistencyArbiter::new(
+                    Arc::new(client),
+                    model,
+                    512,
+                ));
+            }
+            // 客户端构造失败（如坏 URL）→ 记日志后回退确定性，不 panic、不中断编译。
+            // Client construction failure (e.g. a bad URL) → log then fall back to
+            // the deterministic arbiter, never panicking or aborting the compile.
+            eprintln!(
+                "wiktor: consistency LLM arbiter construction failed; falling back to deterministic"
+            );
+        }
+    }
+    Arc::new(SourceRefConsistencyArbiter::new())
+}
+
+/// 无 `llm-openai` feature：仅确定性仲裁器（LLM 仲裁不可用）。
+/// Without the `llm-openai` feature: only the deterministic arbiter (no LLM
+/// arbitration).
+#[cfg(not(feature = "llm-openai"))]
+fn build_cli_consistency_arbiter() -> Arc<dyn ConsistencyArbiter> {
+    Arc::new(SourceRefConsistencyArbiter::new())
 }
 
 /// `--model`（已在上游校验必填；此处仅取值）。

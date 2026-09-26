@@ -123,11 +123,23 @@ pub trait ConsistencyCandidateProvider: Send + Sync {
     ) -> Result<Vec<CompiledPage>>;
 }
 
-/// 仲裁器（§6.1 签名，同步纯函数面）：candidate + related → 报告。
-/// The arbiter (§6.1 signature, a synchronous pure-function surface):
-/// candidate + related → report.
+/// 仲裁器（§6.1 签名，Step14 P3 起为 async）：candidate + related → 报告。
+/// The arbiter (§6.1 signature; async since Step14 P3): candidate + related →
+/// report.
+///
+/// Step14 P3-A 把仲裁面从同步纯函数改为 async，以便 LLM 仲裁器（内部做网络
+/// 调用）实现同一 trait——文档契约「LLM 仲裁只能实现同一 trait，不能绕过证据/
+/// top-k/预算契约」因此保持成立。确定性实现 [`SourceRefConsistencyArbiter`]
+/// 的方法体不变，仅签名加 `async`。
+/// Step14 P3-A turns the arbitration surface from a synchronous pure function
+/// into an async one so an LLM arbiter (which performs network calls internally)
+/// implements the same trait — the documented contract "an LLM arbiter can only
+/// implement the same trait and cannot bypass the evidence/top-k/budget contracts"
+/// therefore stays intact. The deterministic [`SourceRefConsistencyArbiter`]
+/// keeps its body unchanged, only the signature gains `async`.
+#[async_trait]
 pub trait ConsistencyArbiter: Send + Sync {
-    fn arbitrate(
+    async fn arbitrate(
         &self,
         candidate: &CompiledPage,
         related: &[CompiledPage],
@@ -175,8 +187,9 @@ impl SourceRefConsistencyArbiter {
     }
 }
 
+#[async_trait]
 impl ConsistencyArbiter for SourceRefConsistencyArbiter {
-    fn arbitrate(
+    async fn arbitrate(
         &self,
         candidate: &CompiledPage,
         related: &[CompiledPage],
@@ -254,6 +267,224 @@ impl ConsistencyArbiter for SourceRefConsistencyArbiter {
     }
 }
 
+/// 单个可比较 source-ref 证据（共享给确定性与 LLM 仲裁器；值保持原文供语义判断）。
+/// One comparable source-ref evidence (shared by the deterministic and LLM
+/// arbiters; the value stays raw for semantic judgement).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparableRef {
+    pub entity_id: String,
+    pub pointer: String,
+    pub value: serde_json::Value,
+}
+
+/// 收集单页可比较 source-ref（仅允许列表内且 `/fields/...` 形状，D3），值保持
+/// 原文。供 [`LlmConsistencyArbiter`] 组装 LLM 输入——证据过滤在核心侧完成，
+/// LLM 只做矛盾判定，不绕过证据契约。
+/// Collects a page's comparable source-refs (allowlisted AND `/fields/...`
+/// shaped, D3) with raw values. Used by [`LlmConsistencyArbiter`] to build its
+/// LLM input — evidence filtering happens on the core side, the LLM only judges
+/// contradiction, never bypassing the evidence contract.
+pub(crate) fn comparable_refs(
+    page: &CompiledPage,
+    policy: &ConsistencyPolicy,
+) -> Vec<ComparableRef> {
+    let mut out = Vec::new();
+    let Some(evidence) = &page.evidence else {
+        return out;
+    };
+    for section in &evidence.sections {
+        for r in &section.refs {
+            if !is_comparable_pointer(&r.pointer, &policy.compare_pointers) {
+                continue;
+            }
+            out.push(ComparableRef {
+                entity_id: r.entity_id.clone(),
+                pointer: r.pointer.clone(),
+                value: r.value.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// LLM 一致性仲裁器（Step14 P3-A）：复用 [`crate::compile::llm::LlmClient`] 做
+/// 语义矛盾判定。**不绕过证据/top-k/预算契约**——只把核心侧过滤后的可比较
+/// source-ref（`compare_pointers` 声明且 `/fields/...` 形状）送给模型；模型按
+/// `(entity_id, pointer)` 判定 equal/divergent；核心据此计算 score 并对 divergent
+/// 值算 BLAKE3 摘要组装 finding（原文不落诊断）。单次请求输出恰好一次。
+/// LLM consistency arbiter (Step14 P3-A): reuses
+/// [`crate::compile::llm::LlmClient`] for semantic contradiction judgement. It
+/// **does not bypass the evidence/top-k/budget contracts** — only core-side
+/// filtered comparable source-refs (allowlisted AND `/fields/...` shaped) reach
+/// the model; the model judges equal/divergent per `(entity_id, pointer)`, and
+/// the core computes the score and the BLAKE3 digests for divergent values
+/// (raw values never reach diagnostics). Exactly one request per arbitration.
+#[cfg(feature = "llm-openai")]
+pub struct LlmConsistencyArbiter {
+    client: Arc<dyn crate::compile::llm::LlmClient>,
+    model: String,
+    max_output_tokens: u32,
+}
+
+#[cfg(feature = "llm-openai")]
+impl LlmConsistencyArbiter {
+    /// 绑定 LLM 客户端与模型构造仲裁器。
+    /// Builds the arbiter bound to an LLM client and model.
+    pub fn new(
+        client: Arc<dyn crate::compile::llm::LlmClient>,
+        model: String,
+        max_output_tokens: u32,
+    ) -> Self {
+        Self {
+            client,
+            model,
+            max_output_tokens,
+        }
+    }
+}
+
+#[cfg(feature = "llm-openai")]
+#[async_trait]
+impl ConsistencyArbiter for LlmConsistencyArbiter {
+    async fn arbitrate(
+        &self,
+        candidate: &CompiledPage,
+        related: &[CompiledPage],
+        policy: &ConsistencyPolicy,
+    ) -> Result<ConsistencyReport> {
+        // 核心侧过滤证据（同一 D3 规则）：LLM 只见可比较 source-ref。
+        // Evidence filtered on the core side (the same D3 rule): the LLM only
+        // ever sees comparable source-refs.
+        let candidate_refs = comparable_refs(candidate, policy);
+        let related_refs: Vec<ComparableRef> = related
+            .iter()
+            .flat_map(|p| comparable_refs(p, policy))
+            .collect();
+        let input = serde_json::json!({
+            "candidate_refs": candidate_refs,
+            "related_refs": related_refs,
+            "compare_pointers": policy.compare_pointers,
+        });
+        let request = crate::compile::llm::LlmRequest {
+            system: CONSISTENCY_SYSTEM_PROMPT.to_string(),
+            input_json: serde_json::to_string(&input)?,
+            model: self.model.clone(),
+            max_output_tokens: self.max_output_tokens,
+            timeout_seconds: crate::compile::llm::DEFAULT_TIMEOUT_SECONDS,
+        };
+        let response = self
+            .client
+            .complete(request)
+            .await
+            .map_err(Error::CompileFailure)?;
+        let verdicts = parse_consistency_verdicts(&response.json)?;
+        // 核心按判定组装报告：equal/divergent 计数 → score；divergent 组对
+        // candidate 出现的最小规范化值算 BLAKE3 摘要（不落原文）。
+        // The core assembles the report from the verdicts: equal/divergent counts
+        // → score; divergent groups hash the candidate's smallest canonical value
+        // (raw never reaches diagnostics).
+        let mut compared = 0u32;
+        let mut equal = 0u32;
+        let mut findings: Vec<ConsistencyFinding> = Vec::new();
+        for v in verdicts {
+            compared += 1;
+            if v.status == VerdictStatus::Equal {
+                equal += 1;
+                continue;
+            }
+            let candidate_hash = candidate_refs
+                .iter()
+                .filter(|r| r.entity_id == v.entity_id && r.pointer == v.pointer)
+                .map(|r| canonical_json(&r.value))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .unwrap_or_default();
+            let evidence_hash = related_refs
+                .iter()
+                .filter(|r| r.entity_id == v.entity_id && r.pointer == v.pointer)
+                .map(|r| canonical_json(&r.value))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .min()
+                .unwrap_or_default();
+            findings.push(ConsistencyFinding {
+                code: VALUE_DIVERGENCE.to_string(),
+                key: ClaimKey {
+                    entity_id: v.entity_id,
+                    pointer: v.pointer,
+                },
+                candidate_value_hash: blake3::hash(&candidate_hash).to_hex().to_string(),
+                evidence_value_hash: blake3::hash(&evidence_hash).to_hex().to_string(),
+            });
+        }
+        let score = if compared == 0 {
+            None
+        } else {
+            Some(equal as f32 / compared as f32)
+        };
+        Ok(ConsistencyReport {
+            score,
+            compared_claims: compared,
+            findings,
+            candidate_count: related.len() as u32,
+        })
+    }
+}
+
+/// LLM 裁决 JSON 契约（§6.1 形状兼容）：模型对每个比较键给 equal/divergent。
+/// LLM verdict JSON contract (§6.1-shape compatible): the model gives
+/// equal/divergent per comparison key.
+#[cfg(feature = "llm-openai")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VerdictStatus {
+    Equal,
+    Divergent,
+}
+
+#[cfg(feature = "llm-openai")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ConsistencyVerdict {
+    entity_id: String,
+    pointer: String,
+    #[serde(rename = "status")]
+    status: VerdictStatus,
+}
+
+/// 解析模型响应为裁决列表（serde 强校验；不可解析 → `Validation`，不静默跳过）。
+/// Parses the model response into verdicts (strict serde; unparseable →
+/// `Validation`, never silently skipped).
+#[cfg(feature = "llm-openai")]
+fn parse_consistency_verdicts(json: &str) -> Result<Vec<ConsistencyVerdict>> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| Error::Validation(format!("consistency LLM verdicts: {e}")))?;
+    let verdicts = v
+        .get("verdicts")
+        .ok_or_else(|| {
+            Error::Validation("consistency LLM verdicts missing `verdicts`".to_string())
+        })?
+        .as_array()
+        .ok_or_else(|| Error::Validation("consistency LLM `verdicts` not an array".to_string()))?;
+    let list: Vec<ConsistencyVerdict> =
+        serde_json::from_value(serde_json::Value::Array(verdicts.clone()))
+            .map_err(|e| Error::Validation(format!("consistency LLM verdict entry: {e}")))?;
+    Ok(list)
+}
+
+/// LLM 一致性裁决的 system prompt（约束只判可比较 source-ref 的语义矛盾）。
+/// The LLM consistency-judgement system prompt (constraining to semantic
+/// contradiction over comparable source-refs only).
+#[cfg(feature = "llm-openai")]
+pub const CONSISTENCY_SYSTEM_PROMPT: &str = "You are a fact-consistency arbiter. \
+You are given a candidate page's source-refs and related pages' source-refs, \
+each keyed by (entity_id, pointer). Judge, per distinct (entity_id, pointer) \
+that appears in BOTH the candidate and at least one related page, whether the \
+semantic values agree. Respond with a single JSON object of the shape \
+{\"verdicts\":[{\"entity_id\":\"...\",\"pointer\":\"/fields/...\",\"status\":\"equal\"|\"divergent\"}]}. \
+Only include keys that appear in both candidate and related refs. Do not add \
+prose. If nothing is comparable, return {\"verdicts\":[]}.";
+
 /// 组内一次值出现：规范化字节 + 是否来自候选页。
 /// One value occurrence within a group: canonical bytes plus candidate origin.
 struct ClaimOccurrence {
@@ -314,7 +545,7 @@ fn collect_page_refs(
 /// 可比较指针判定（D3）：在显式允许列表内且满足 RFC6901 `/fields/...` 形状。
 /// Comparable-pointer test (D3): inside the explicit allowlist AND shaped as an
 /// RFC6901 `/fields/...` pointer.
-fn is_comparable_pointer(pointer: &str, compare_pointers: &[String]) -> bool {
+pub(crate) fn is_comparable_pointer(pointer: &str, compare_pointers: &[String]) -> bool {
     const FIELDS_PREFIX: &str = "/fields/";
     pointer.len() > FIELDS_PREFIX.len()
         && pointer.starts_with(FIELDS_PREFIX)
@@ -507,8 +738,8 @@ mod tests {
     // A5：相同 (entity_id, pointer) 相同 canonical value → 得分 1、无 finding。
     // A5: identical (entity_id, pointer) with identical canonical value → score 1,
     // no finding.
-    #[test]
-    fn identical_values_score_one() {
+    #[tokio::test]
+    async fn identical_values_score_one() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -521,6 +752,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, Some(1.0));
         assert_eq!(report.compared_claims, 1);
@@ -532,8 +764,8 @@ mod tests {
     // 原文不落报告。
     // A5: distinct values → VALUE_DIVERGENCE with score 0; diagnostics carry
     // 64-char lowercase hex digests only, raw values never reach the report.
-    #[test]
-    fn divergent_values_produce_finding_with_hashes_only() {
+    #[tokio::test]
+    async fn divergent_values_produce_finding_with_hashes_only() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -546,6 +778,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, Some(0.0));
         assert_eq!(report.compared_claims, 1);
@@ -567,8 +800,8 @@ mod tests {
     // A5：标题相似但无可比较证据重叠 → None（不判 0、不 fail-closed）。
     // A5: similar titles without overlapping comparable evidence → None (neither
     // zero nor fail-closed).
-    #[test]
-    fn similar_titles_without_ref_overlap_score_none() {
+    #[tokio::test]
+    async fn similar_titles_without_ref_overlap_score_none() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵奶茶",
@@ -581,6 +814,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR, DESC_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, None);
         assert_eq!(report.compared_claims, 0);
@@ -592,8 +826,8 @@ mod tests {
     // Empty compare_pointers (enabled=true with an empty pointer table) →
     // deterministic None with zero findings (no comparable evidence means no
     // conclusion, §6.1 compared_claims=0 → None).
-    #[test]
-    fn empty_pointer_table_is_deterministic_none() {
+    #[tokio::test]
+    async fn empty_pointer_table_is_deterministic_none() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -606,6 +840,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[]))
+            .await
             .unwrap();
         assert_eq!(report.score, None);
         assert_eq!(report.compared_claims, 0);
@@ -617,8 +852,8 @@ mod tests {
     // A7：不同 domain 的实体键各自成组 → 不比较。
     // A7: entity keys from different domains form separate groups → no
     // comparison.
-    #[test]
-    fn cross_domain_keys_never_compare() {
+    #[tokio::test]
+    async fn cross_domain_keys_never_compare() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -641,6 +876,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, None);
         assert!(report.findings.is_empty());
@@ -648,8 +884,8 @@ mod tests {
 
     // A7：非 /fields/ 形状的 pointer 即使在允许列表内也跳过。
     // A7: pointers outside the /fields/ shape are skipped even when allowlisted.
-    #[test]
-    fn non_fields_pointers_are_skipped() {
+    #[tokio::test]
+    async fn non_fields_pointers_are_skipped() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -672,6 +908,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR, "/meta/name"]))
+            .await
             .unwrap();
         assert_eq!(report.score, None);
         assert!(report.findings.is_empty());
@@ -680,12 +917,13 @@ mod tests {
     // A7：无 evidence（旧 seed 页）整页跳过，不猜测等价关系。
     // A7: pages without evidence (legacy seed) are skipped whole; equivalence is
     // never guessed.
-    #[test]
-    fn pages_without_evidence_are_skipped() {
+    #[tokio::test]
+    async fn pages_without_evidence_are_skipped() {
         let candidate = page("milk-tea:drink:boba", "啵啵", None);
         let related = vec![page("milk-tea:drink:seed", "seed", None)];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, None);
         assert_eq!(report.compared_claims, 0);
@@ -695,8 +933,8 @@ mod tests {
     // 页内重复同值 ref 去重：候选单独携带重复 ref 只算一次出现 → 不算比较。
     // Within-page duplicate same-value refs dedupe: a candidate alone with
     // duplicated refs yields one occurrence → not a comparison.
-    #[test]
-    fn duplicate_refs_within_one_page_are_not_self_compared() {
+    #[tokio::test]
+    async fn duplicate_refs_within_one_page_are_not_self_compared() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -707,6 +945,7 @@ mod tests {
         );
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &[], &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, None);
         assert_eq!(report.compared_claims, 0);
@@ -715,8 +954,8 @@ mod tests {
     // 候选同键两个不同值 → 自相矛盾被检出（比较发生且产生分歧）。
     // Two distinct values for one key on the candidate → self-contradiction
     // detected (a comparison happened and diverged).
-    #[test]
-    fn self_contradicting_candidate_is_detected() {
+    #[tokio::test]
+    async fn self_contradicting_candidate_is_detected() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -727,6 +966,7 @@ mod tests {
         );
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &[], &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, Some(0.0));
         assert_eq!(report.compared_claims, 1);
@@ -737,8 +977,8 @@ mod tests {
     // 候选重复 ref + 相关页同值 → 去重后与相关页各一次出现 → 得分 1。
     // Candidate duplicates plus an agreeing related page → one occurrence each
     // after dedupe → score 1.
-    #[test]
-    fn candidate_duplicates_plus_agreeing_related_score_one() {
+    #[tokio::test]
+    async fn candidate_duplicates_plus_agreeing_related_score_one() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -754,6 +994,7 @@ mod tests {
         )];
         let report = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(report.score, Some(1.0));
     }
@@ -763,8 +1004,8 @@ mod tests {
     // Mixed groups: one equal, one divergent → 0.5; findings stably ordered by
     // (entity_id, pointer); repeated arbitration matches field-by-field
     // (determinism).
-    #[test]
-    fn mixed_groups_and_determinism() {
+    #[tokio::test]
+    async fn mixed_groups_and_determinism() {
         let candidate = page(
             "milk-tea:drink:boba",
             "啵啵",
@@ -797,9 +1038,11 @@ mod tests {
         ];
         let first = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         let second = SourceRefConsistencyArbiter
             .arbitrate(&candidate, &related, &policy(&[NAME_PTR]))
+            .await
             .unwrap();
         assert_eq!(first.score, Some(0.5));
         assert_eq!(first.compared_claims, 2);
@@ -822,8 +1065,9 @@ mod tests {
         report: ConsistencyReport,
     }
 
+    #[async_trait]
     impl ConsistencyArbiter for FakeArbiter {
-        fn arbitrate(
+        async fn arbitrate(
             &self,
             _candidate: &CompiledPage,
             _related: &[CompiledPage],
@@ -853,8 +1097,8 @@ mod tests {
     // A3：fake arbiter 经 trait 对象返回 None/1/0，核心组合面不依赖具体实现。
     // A3: a fake arbiter behind a trait object returns None/1/0; the core
     // composition surface depends on no concrete implementation.
-    #[test]
-    fn fake_arbiter_is_substitutable() {
+    #[tokio::test]
+    async fn fake_arbiter_is_substitutable() {
         let none = Arc::new(FakeArbiter {
             report: ConsistencyReport::default(),
         }) as Arc<dyn ConsistencyArbiter>;
@@ -876,13 +1120,16 @@ mod tests {
         }) as Arc<dyn ConsistencyArbiter>;
         let candidate = page("milk-tea:drink:boba", "啵啵", None);
         let pol = policy(&[NAME_PTR]);
-        assert_eq!(none.arbitrate(&candidate, &[], &pol).unwrap().score, None);
         assert_eq!(
-            one.arbitrate(&candidate, &[], &pol).unwrap().score,
+            none.arbitrate(&candidate, &[], &pol).await.unwrap().score,
+            None
+        );
+        assert_eq!(
+            one.arbitrate(&candidate, &[], &pol).await.unwrap().score,
             Some(1.0)
         );
         assert_eq!(
-            zero.arbitrate(&candidate, &[], &pol).unwrap().score,
+            zero.arbitrate(&candidate, &[], &pol).await.unwrap().score,
             Some(0.0)
         );
     }
@@ -1072,5 +1319,174 @@ mod tests {
         assert!(!ids.contains("milk-tea:drink:cand"));
         assert_eq!(related.len(), 10);
         assert!(related.iter().all(|p| p.evidence.is_none()));
+    }
+
+    // —— Step14 P3-A：LLM 仲裁器（feature llm-openai）——
+    // —— Step14 P3-A: the LLM arbiter (feature llm-openai) ——
+
+    #[cfg(feature = "llm-openai")]
+    mod llm_arbiter {
+        use super::*;
+        use crate::compile::llm::{LlmClient, LlmRequest, LlmResponse};
+        use crate::compile::CompileFailure;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MockLlm {
+            response: std::result::Result<String, CompileFailure>,
+            calls: AtomicUsize,
+            last_input: std::sync::Mutex<Option<String>>,
+        }
+
+        impl MockLlm {
+            fn ok(json: &str) -> Self {
+                Self {
+                    response: Ok(json.to_string()),
+                    calls: AtomicUsize::new(0),
+                    last_input: std::sync::Mutex::new(None),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl LlmClient for MockLlm {
+            async fn complete(
+                &self,
+                request: LlmRequest,
+            ) -> std::result::Result<LlmResponse, CompileFailure> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                *self.last_input.lock().unwrap() = Some(request.input_json);
+                match &self.response {
+                    Ok(json) => Ok(LlmResponse {
+                        json: json.clone(),
+                        usage: None,
+                    }),
+                    Err(f) => Err(f.clone()),
+                }
+            }
+        }
+
+        // 构造预置的裁决 JSON。
+        // Builds a canned verdicts JSON.
+        fn verdict_json(statuses: &[(&str, &str, &str)]) -> String {
+            let arr: Vec<serde_json::Value> = statuses
+                .iter()
+                .map(|(e, p, s)| serde_json::json!({ "entity_id": e, "pointer": p, "status": s }))
+                .collect();
+            serde_json::to_string(&serde_json::json!({ "verdicts": arr })).unwrap()
+        }
+
+        fn llm_arbiter(mock: Arc<MockLlm>, tokens: u32) -> LlmConsistencyArbiter {
+            LlmConsistencyArbiter::new(mock, "qwen3.8-max".to_string(), tokens)
+        }
+
+        // P3-A2：LLM 判定 equal → 得分 1、无 finding；判定 divergent → 得分 0、
+        // finding 只含 BLAKE3 摘要（原文不落诊断）。
+        // P3-A2: an LLM verdict of equal → score 1 with no findings; divergent →
+        // score 0 with a finding carrying BLAKE3 digests only (raw never logged).
+        #[tokio::test]
+        async fn llm_verdicts_map_to_report() {
+            let mock = Arc::new(MockLlm::ok(&verdict_json(&[
+                ("milk-tea:ingredient:pearl", "/fields/name", "equal"),
+                (
+                    "milk-tea:ingredient:pearl",
+                    "/fields/description",
+                    "divergent",
+                ),
+            ])));
+            let arbiter = llm_arbiter(mock.clone(), 512);
+            let candidate = page(
+                "milk-tea:drink:boba",
+                "啵啵",
+                Some(evidence(vec![
+                    source_ref("r1", PEARL, NAME_PTR, "珍珠"),
+                    source_ref("r2", PEARL, DESC_PTR, "波霸"),
+                ])),
+            );
+            let related = vec![page(
+                "milk-tea:drink:milk-tea",
+                "奶茶",
+                Some(evidence(vec![
+                    source_ref("r9", PEARL, NAME_PTR, "珍珠"),
+                    source_ref("r8", PEARL, DESC_PTR, "黑珍珠"),
+                ])),
+            )];
+            let report = arbiter
+                .arbitrate(&candidate, &related, &policy(&[NAME_PTR, DESC_PTR]))
+                .await
+                .unwrap();
+            assert_eq!(report.score, Some(0.5));
+            assert_eq!(report.compared_claims, 2);
+            assert_eq!(report.findings.len(), 1);
+            let f = &report.findings[0];
+            assert_eq!(f.code, VALUE_DIVERGENCE);
+            assert_eq!(f.key.entity_id, PEARL);
+            assert_eq!(f.key.pointer, DESC_PTR);
+            assert_eq!(f.candidate_value_hash.len(), 64);
+            assert_eq!(f.evidence_value_hash.len(), 64);
+            assert!(!format!("{report:?}").contains("波霸"));
+            assert_eq!(mock.calls.load(Ordering::Relaxed), 1);
+        }
+
+        // P3-A2：无可比较键（LLM 返回空 verdicts）→ score None、零 finding。
+        // P3-A2: no comparable keys (LLM returns empty verdicts) → score None,
+        // zero findings.
+        #[tokio::test]
+        async fn llm_empty_verdicts_score_none() {
+            let mock = Arc::new(MockLlm::ok(&verdict_json(&[])));
+            let arbiter = llm_arbiter(mock.clone(), 512);
+            let candidate = page("milk-tea:drink:boba", "啵啵", None);
+            let report = arbiter
+                .arbitrate(&candidate, &[], &policy(&[NAME_PTR]))
+                .await
+                .unwrap();
+            assert_eq!(report.score, None);
+            assert_eq!(report.compared_claims, 0);
+            assert!(report.findings.is_empty());
+        }
+
+        // P3-A2：不可解析的模型响应 → Validation（fail-closed，不静默跳过）。
+        // P3-A2: an unparseable model response → Validation (fail-closed, never
+        // silently skipped).
+        #[tokio::test]
+        async fn llm_unparseable_response_is_validation() {
+            let mock = Arc::new(MockLlm::ok("not json"));
+            let arbiter = llm_arbiter(mock.clone(), 512);
+            let candidate = page("milk-tea:drink:boba", "啵啵", None);
+            let err = arbiter
+                .arbitrate(&candidate, &[], &policy(&[NAME_PTR]))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Validation(_)), "got {err:?}");
+        }
+
+        // P3-A2：证据过滤在核心侧——不在 compare_pointers 或非 /fields/ 形状的
+        // ref 不进 LLM 输入（不绕过证据契约）。
+        // P3-A2: evidence filtering stays on the core side — refs outside
+        // compare_pointers or non-/fields/ shaped never reach the LLM input
+        // (the evidence contract is not bypassed).
+        #[tokio::test]
+        async fn llm_input_only_carries_comparable_refs() {
+            let mock = Arc::new(MockLlm::ok(&verdict_json(&[])));
+            let arbiter = llm_arbiter(mock.clone(), 512);
+            let candidate = page(
+                "milk-tea:drink:boba",
+                "啵啵",
+                Some(evidence(vec![
+                    source_ref("r1", PEARL, NAME_PTR, "珍珠"),
+                    source_ref("r2", PEARL, "/meta/x", "不该送"),
+                    source_ref("r3", PEARL, "/fields/sugar", "不在允许表"),
+                ])),
+            );
+            let report = arbiter
+                .arbitrate(&candidate, &[], &policy(&[NAME_PTR]))
+                .await
+                .unwrap();
+            assert_eq!(report.score, None);
+            let input = mock.last_input.lock().unwrap().clone().unwrap();
+            assert!(input.contains("/fields/name"));
+            assert!(!input.contains("/meta/x"));
+            assert!(!input.contains("不在允许表"));
+            assert!(!input.contains("不该送"));
+        }
     }
 }

@@ -47,6 +47,8 @@ pub use consistency::{
     ConsistencyFinding, ConsistencyReport, SourceRefConsistencyArbiter, SqliteFtsCandidateProvider,
     CONSISTENCY_BELOW_THRESHOLD, MAX_CONSISTENCY_TOP_K, VALUE_DIVERGENCE,
 };
+#[cfg(feature = "llm-openai")]
+pub use consistency::{ComparableRef, LlmConsistencyArbiter, CONSISTENCY_SYSTEM_PROMPT};
 pub use contract::{
     decode_response, render_canonical_markdown, system_prompt, Assertion, CompileEvidence,
     CompileFailure, DefaultSourceRefValidator, EnvelopeErrorCode, EvidenceSection, OutputWiki,

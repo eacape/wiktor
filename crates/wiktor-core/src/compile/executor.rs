@@ -1212,7 +1212,9 @@ impl PipelineExecutor {
         let related = provider
             .top_k_related(page, self.policy.consistency.top_k)
             .await?;
-        let report = arbiter.arbitrate(page, &related, &self.policy.consistency)?;
+        let report = arbiter
+            .arbitrate(page, &related, &self.policy.consistency)
+            .await?;
         Ok(Some(report))
     }
 
@@ -2204,8 +2206,9 @@ mod tests {
         report: ConsistencyReport,
     }
 
+    #[async_trait::async_trait]
     impl ConsistencyArbiter for PresetArbiter {
-        fn arbitrate(
+        async fn arbitrate(
             &self,
             _candidate: &CompiledPage,
             _related: &[CompiledPage],
