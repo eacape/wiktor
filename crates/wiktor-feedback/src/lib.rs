@@ -63,7 +63,10 @@ pub mod analyzer;
 pub mod report;
 pub mod store;
 
-pub use analyzer::{FeedbackAnalyzer, FeedbackWindow, StandardFeedbackAnalyzer};
+pub use analyzer::{
+    FeedbackAnalyzer, FeedbackKeyMatcher, FeedbackWindow, StandardFeedbackAnalyzer,
+    StandardKeyMatcher,
+};
 pub use report::{
     BlindSpotQuery, FeedbackCounts, FeedbackReport, FeedbackThresholds, LowQualityPage,
     ReviewSuggestion,

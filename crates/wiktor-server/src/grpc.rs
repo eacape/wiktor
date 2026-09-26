@@ -127,7 +127,9 @@ mod tests {
             60,
         )
         .unwrap();
-        let svc = crate::services::search::SearchService::new(Arc::new(engine), 16 * 1024);
+        let mut engines = std::collections::HashMap::new();
+        engines.insert("milk-tea".to_string(), Arc::new(engine));
+        let svc = crate::services::search::SearchService::new(engines, 16 * 1024);
         let resp = svc
             .search(tonic::Request::new(v1::SearchRequest {
                 domain: "milk-tea".into(),
@@ -143,6 +145,81 @@ mod tests {
             resp.log_id > 0,
             "a successful search writes a query-log row (log_id={})",
             resp.log_id
+        );
+    }
+
+    // B3：Step14 P4 —— 单进程多领域：一个引擎表同时服务两个 domain，请求按
+    // `domain` 分发到各自引擎；未装配的域返回 NOT_FOUND（区别于认证 403）。
+    // B3: Step14 P4 — single-process multi-domain: one engine map serves two
+    // domains, dispatching each request to its own engine; an unwired domain →
+    // NOT_FOUND (distinct from the auth 403).
+    #[tokio::test]
+    async fn search_dispatches_by_domain_in_multi_domain_map() {
+        use crate::grpc::v1::search_server::Search;
+        use wiktor_core::embedding::deterministic::DeterministicEmbedder;
+        use wiktor_core::query_engine::QueryEngine;
+        use wiktor_core::traits::{DistanceMetric, VectorStore};
+
+        let store = Arc::new(MockVectorStore::new());
+        let mut engines = std::collections::HashMap::new();
+        for domain in ["milk-tea", "coffee"] {
+            store
+                .ensure_collection(domain, 768, DistanceMetric::Cosine)
+                .await
+                .unwrap();
+            let kernel = Arc::new(SqliteKernel::open_in_memory().unwrap());
+            let engine = QueryEngine::new(
+                kernel,
+                store.clone(),
+                None,
+                Arc::new(DeterministicEmbedder::new(768)),
+                domain,
+                5,
+                60,
+            )
+            .unwrap();
+            engines.insert(domain.to_string(), Arc::new(engine));
+        }
+        let svc = crate::services::search::SearchService::new(engines, 16 * 1024);
+
+        // 已装配域：各自成功返回（空 store → 无命中，但仍写 query-log，log_id>0）。
+        // Wired domains: each succeeds over the empty store (no hits but a
+        // query-log row is written → log_id>0).
+        for domain in ["milk-tea", "coffee"] {
+            let resp = svc
+                .search(tonic::Request::new(v1::SearchRequest {
+                    domain: domain.into(),
+                    text: "招牌".into(),
+                    filters_json: String::new(),
+                    top_k: 5,
+                }))
+                .await
+                .unwrap()
+                .into_inner();
+            assert!(resp.hits.is_empty());
+            assert!(resp.log_id > 0, "domain {domain} search wrote a log row");
+        }
+
+        // 未装配域：NOT_FOUND，明确区别于认证失败（403/Unauthenticated）。
+        // Unwired domain: NOT_FOUND (distinct from the auth 403/Unauthenticated).
+        let err = svc
+            .search(tonic::Request::new(v1::SearchRequest {
+                domain: "bubble-tea".into(),
+                text: "招牌".into(),
+                filters_json: String::new(),
+                top_k: 5,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::NotFound,
+            "unwired domain → NotFound"
+        );
+        assert!(
+            err.message().contains("domain not served"),
+            "diagnostic message: {}",
+            err.message()
         );
     }
 

@@ -22,18 +22,31 @@ use crate::grpc::v1::{RewrittenQuery, SearchHit, SearchRequest, SearchResponse};
 /// The Search gRPC handler: holds the assembled engine (built at server
 /// startup, shared across requests).
 pub struct SearchService<V: VectorStore + ?Sized> {
-    engine: Arc<QueryEngine<V>>,
+    /// 多域引擎表（Step14 P4）：key = domain_name，按请求域分发。单域 = 单条目。
+    /// Multi-domain engine table (Step14 P4): key = domain_name, dispatched by
+    /// the request domain. Single-domain = a one-entry map.
+    engines: std::collections::HashMap<String, Arc<QueryEngine<V>>>,
     /// 请求预算：query text 上限（§4）。
     /// Request budgets: the query-text cap (§4).
     max_query_chars: usize,
 }
 
 impl<V: VectorStore + ?Sized + 'static> SearchService<V> {
-    pub fn new(engine: Arc<QueryEngine<V>>, max_query_chars: usize) -> Self {
+    pub fn new(
+        engines: std::collections::HashMap<String, Arc<QueryEngine<V>>>,
+        max_query_chars: usize,
+    ) -> Self {
         Self {
-            engine,
+            engines,
             max_query_chars,
         }
+    }
+
+    /// 按请求领域取引擎（Step14 P4 分发点）；未装配 → None。
+    /// Returns the engine for a request domain (Step14 P4's dispatch point);
+    /// unwired → None.
+    fn engine_for(&self, domain: &str) -> Option<Arc<QueryEngine<V>>> {
+        self.engines.get(domain).cloned()
     }
 }
 
@@ -67,8 +80,17 @@ impl<V: VectorStore + ?Sized + 'static> Search for SearchService<V> {
             top_k: req.top_k as usize,
             domain: Some(req.domain.clone()),
         };
-        let result = self
-            .engine
+        // Step14 P4：按请求领域从多域引擎表分发；未装配该域 → NOT_FOUND
+        //（区别于认证 403：key 授权通过但该域未 serve）。
+        // Step14 P4: dispatch by the request domain from the multi-domain engine
+        // map; an unwired domain → NOT_FOUND (distinct from the auth 403:
+        // key-authorized but the domain is not served).
+        let Some(engine) = self.engine_for(req.domain.as_str()) else {
+            return Err(tonic::Status::not_found(
+                "domain not served by this instance",
+            ));
+        };
+        let result = engine
             .search(&query)
             .await
             .map_err(|e| crate::error::grpc_status(&e, "search failed"))?;

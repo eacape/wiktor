@@ -399,7 +399,12 @@ impl HealthCheck for KernelHealthCheck {
 pub struct ServerState {
     pub kernel: Arc<SqliteKernel>,
     pub keys: ApiKeys,
-    pub engine: Arc<QueryEngine<dyn VectorStore>>,
+    /// 多域引擎表（Step14 P4）：key = domain_name，每域一个混合检索引擎。
+    /// 兼容单域：单域装配时 map 仅含该域。`engine_for(domain)` 按请求域分发。
+    /// Multi-domain engine table (Step14 P4): key = domain_name, one hybrid
+    /// retrieval engine per domain. Single-domain wiring yields a one-entry map.
+    /// `engine_for(domain)` dispatches by the request domain.
+    pub engines: HashMap<String, Arc<QueryEngine<dyn VectorStore>>>,
     pub limiter: FixedWindowLimiter,
     pub metrics: Arc<crate::metrics::Metrics>,
     pub clock: Arc<dyn Clock>,
@@ -408,18 +413,20 @@ pub struct ServerState {
 
 impl ServerState {
     /// 生产构造（D8 默认：60s 窗口 120 次；系统时钟；内核健康探针）。
+    /// Step14 P4：传入多域引擎表（单域 = 单条目）。
     /// Production constructor (D8 defaults: 120 requests per 60s window; system
-    /// clock; kernel health probe).
+    /// clock; kernel health probe). Step14 P4: takes the multi-domain engine
+    /// map (single-domain = a one-entry map).
     pub fn new(
         kernel: Arc<SqliteKernel>,
         keys: ApiKeys,
-        engine: Arc<QueryEngine<dyn VectorStore>>,
+        engines: HashMap<String, Arc<QueryEngine<dyn VectorStore>>>,
     ) -> Self {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let health = Arc::new(KernelHealthCheck {
             kernel: kernel.clone(),
         });
-        Self::with_engine(kernel, keys, clock, health, engine)
+        Self::with_engines(kernel, keys, clock, health, engines)
     }
 
     /// 全量构造（测试注入 MockClock / 失败健康探针，A8/A17）。engine 用缺省
@@ -435,6 +442,7 @@ impl ServerState {
         keys: ApiKeys,
         clock: Arc<dyn Clock>,
         health: Arc<dyn HealthCheck>,
+        domain: &str,
     ) -> Self {
         let store: Arc<dyn VectorStore> = Arc::new(MockVectorStore::new());
         let mut engine = QueryEngine::new(
@@ -442,34 +450,47 @@ impl ServerState {
             store,
             None,
             Arc::new(DeterministicEmbedder::new(768)),
-            "default",
+            domain,
             5,
             60,
         )
         .expect("default test engine assembles");
         engine.fts_only = true;
-        Self::with_engine(kernel, keys, clock, health, Arc::new(engine))
+        let mut engines = HashMap::new();
+        engines.insert(domain.to_string(), Arc::new(engine));
+        Self::with_engines(kernel, keys, clock, health, engines)
     }
 
     /// 全量构造（engine 由调用方注入，Step13 D2 生产路径）。
+    /// Step14 P4：接收多域引擎表；`with_engine` 单域路径已被其替代。
     /// Full constructor (the engine is injected by the caller — the Step13 D2
-    /// production path).
-    pub fn with_engine(
+    /// production path). Step14 P4: takes the multi-domain engine map; the
+    /// single-engine `with_engine` path is superseded by it.
+    pub fn with_engines(
         kernel: Arc<SqliteKernel>,
         keys: ApiKeys,
         clock: Arc<dyn Clock>,
         health: Arc<dyn HealthCheck>,
-        engine: Arc<QueryEngine<dyn VectorStore>>,
+        engines: HashMap<String, Arc<QueryEngine<dyn VectorStore>>>,
     ) -> Self {
         ServerState {
             kernel,
             keys,
-            engine,
+            engines,
             limiter: FixedWindowLimiter::new(clock.clone(), 60, 120),
             metrics: Arc::new(crate::metrics::Metrics::default()),
             clock,
             health,
         }
+    }
+
+    /// 按请求领域取引擎（Step14 P4 分发放置处）：命中 → 该域引擎；未装配 →
+    /// None（调用方据此返回 NOT_FOUND，区别于认证 403）。
+    /// Returns the engine for a request domain (Step14 P4's dispatch point): a
+    /// hit → that domain's engine; unwired → None (the caller maps this to
+    /// NOT_FOUND, distinct from the auth 403).
+    pub fn engine_for(&self, domain: &str) -> Option<Arc<QueryEngine<dyn VectorStore>>> {
+        self.engines.get(domain).cloned()
     }
 }
 

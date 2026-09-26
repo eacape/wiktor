@@ -155,9 +155,11 @@ enum Command {
         /// gRPC listen address.
         #[arg(long, default_value = "127.0.0.1:50051")]
         listen_grpc: String,
-        /// Domain pack path used by the compile worker.
+        /// Domain pack path(s) used by the compile worker / retrieval engine;
+        /// repeatable for multi-domain serve (Step14 P4).
+        /// 编译 worker/检索引擎的领域包路径；可重复以支持多领域 serve（P4）。
         #[arg(long)]
-        domain: Option<PathBuf>,
+        domain: Vec<PathBuf>,
         /// Optional jsonl source override.
         #[arg(long)]
         source: Option<String>,
@@ -419,39 +421,46 @@ async fn main() -> Result<()> {
             // embedder and QUG graph are injected per env, falling back to the
             // Mock store + deterministic embedder by default (offline-runnable).
             let (vector_store, embedder) = assemble_vector_stack().await?;
-            let qug = match domain.as_deref() {
-                Some(path) => {
-                    let config = load_domain_config(path)?;
-                    if config.qug.enabled {
-                        let kernel = Arc::new(
-                            SqliteKernel::open(&db).map_err(|e| anyhow!("open database: {e}"))?,
-                        );
-                        let domain_dir = path
-                            .parent()
-                            .unwrap_or_else(|| Path::new("."))
-                            .to_path_buf();
-                        let intents_bytes = load_intents_bytes(&config, &domain_dir)?;
-                        wiktor_core::kernel::qug_store::load_active_qug(
-                            &kernel,
-                            &config,
-                            &intents_bytes,
-                        )
-                        .map_err(|e| anyhow!("load active QUG: {e}"))?
-                    } else {
-                        None
+            // Step14 P4：多域——每个 --domain 加载各自的 QUG 图到 map（key =
+            // domain_name）；无 --domain 时为空（无检索面，纯状态服务）。
+            // Step14 P4: multi-domain — each --domain loads its own QUG graph
+            // into a map (key = domain_name); with no --domain the map is empty
+            // (no retrieval surface; a pure status service).
+            let mut qugs: std::collections::HashMap<
+                String,
+                Arc<wiktor_core::query_engine::qug::QugGraph>,
+            > = std::collections::HashMap::new();
+            for path in &domain {
+                let config = load_domain_config(path)?;
+                if config.qug.enabled {
+                    let kernel = Arc::new(
+                        SqliteKernel::open(&db).map_err(|e| anyhow!("open database: {e}"))?,
+                    );
+                    let domain_dir = path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .to_path_buf();
+                    let intents_bytes = load_intents_bytes(&config, &domain_dir)?;
+                    let graph = wiktor_core::kernel::qug_store::load_active_qug(
+                        &kernel,
+                        &config,
+                        &intents_bytes,
+                    )
+                    .map_err(|e| anyhow!("load active QUG: {e}"))?;
+                    if let Some(graph) = graph {
+                        qugs.insert(config.name.clone(), graph);
                     }
                 }
-                None => None,
-            };
+            }
             wiktor_server::serve::run_server(wiktor_server::serve::ServeOptions {
                 db,
                 listen_http,
                 listen_grpc,
-                domain_pack: domain,
+                domain_packs: domain,
                 source_path: source,
                 vector_store,
                 embedder: Some(embedder),
-                qug,
+                qugs,
             })
             .await
             .map_err(|e| anyhow!(e))?;

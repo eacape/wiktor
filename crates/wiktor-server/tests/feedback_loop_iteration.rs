@@ -27,7 +27,7 @@ use wiktor_core::kernel::SqliteKernel;
 use wiktor_core::seed;
 use wiktor_core::traits::PublishStatus;
 use wiktor_core::types::Filters;
-use wiktor_feedback::analyzer::{analyze_window_with, FeedbackWindow};
+use wiktor_feedback::analyzer::{analyze_window_with, FeedbackWindow, StandardKeyMatcher};
 use wiktor_feedback::report::FeedbackReport;
 
 /// 准备一个小 domain：`drink` 实体 + JSONL 源（drink_a 已 seed，drink_b 待补编译）。
@@ -159,6 +159,7 @@ async fn feedback_loop_iteration_closes_the_gap() {
             events,
         },
         1,
+        &StandardKeyMatcher,
     )
     .unwrap();
     assert!(

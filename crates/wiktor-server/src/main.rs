@@ -70,9 +70,14 @@ async fn run() -> Result<(), String> {
         db: args.db,
         listen_http: args.listen,
         listen_grpc: std::env::var("WIKTOR_GRPC_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".into()),
-        domain_pack: std::env::var("WIKTOR_DOMAIN_PACK")
-            .ok()
-            .map(std::path::PathBuf::from),
+        domain_packs: std::env::var("WIKTOR_DOMAIN_PACK")
+            .map(|v| {
+                v.split(':')
+                    .filter(|s| !s.trim().is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
         source_path: std::env::var("WIKTOR_SOURCE_PATH").ok(),
         // 旧 bin 无注入能力（Step13 D1：注入面在 CLI 装配者）——恒走缺省
         // Mock + 确定性嵌入。
@@ -81,7 +86,7 @@ async fn run() -> Result<(), String> {
         // default Mock + deterministic embedder.
         vector_store: None,
         embedder: None,
-        qug: None,
+        qugs: std::collections::HashMap::new(),
     })
     .await
 }

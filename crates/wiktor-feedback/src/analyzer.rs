@@ -62,6 +62,40 @@ use wiktor_core::kernel::feedback_store::{FeedbackEvent, FeedbackKind, QueryLogS
 use wiktor_core::query_engine::qug::normalize;
 use wiktor_core::types::error::{Error, Result};
 
+/// 反馈去重键匹配器（Step14 P3-C spec）：把查询日志归一到用于信号一/二去重
+/// 聚合的稳定键。核心是纯函数抽象——默认实现复用 `qug::normalize`（Step 3
+/// §3.1 契约，离线/确定）；未来可替换为语义/向量键而不改 analyzer 三段信号
+/// 规则。任何实现必须保持幂等（同 query_text 恒出同键）与确定性（不改报告
+/// 排序契约）。
+/// Feedback dedup-key matcher (Step14 P3-C spec): normalizes a query log to the
+/// stable key used for signal-1/2 dedup aggregation. It is a pure-function
+/// abstraction whose default impl reuses `qug::normalize` (the Step 3 §3.1
+/// contract; offline/deterministic); a future semantic/vector key can replace
+/// it without rewriting the analyzer's three signal rules. Any impl must stay
+/// idempotent (same query_text → same key) and deterministic (no change to the
+/// report sorting contract).
+#[async_trait::async_trait]
+pub trait FeedbackKeyMatcher: Send + Sync {
+    /// 归一化一条查询文本为稳定去重键；失败 → `analyze` 该行 fail-closed。
+    /// Normalizes one query text into a stable dedup key; on failure the row
+    /// fails closed inside `analyze`.
+    fn normalize(&self, query_text: &str) -> Result<String>;
+}
+
+/// 默认匹配器：包装 `qug::normalize`，与现状逐字节一致（trim + 折叠空白 +
+/// 小写 + 非空 + ≤MAX_PHRASE_SCALARS）。
+/// The default matcher: wraps `qug::normalize`, byte-for-byte identical to the
+/// current behavior (trim + collapse whitespace + lowercase + non-empty +
+/// ≤MAX_PHRASE_SCALARS).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StandardKeyMatcher;
+
+impl FeedbackKeyMatcher for StandardKeyMatcher {
+    fn normalize(&self, query_text: &str) -> Result<String> {
+        normalize(query_text)
+    }
+}
+
 /// 低质量判据最小事件数（D11：至少 5 个 click/adopt/rate 事件）。
 /// Minimum event count for the low-quality rule (D11: at least 5 click/adopt/
 /// rate events).
@@ -130,15 +164,19 @@ pub trait FeedbackAnalyzer: Send + Sync {
 /// the batch-6 CLI `--min-events`); the default equals the fixed constant
 /// [`MIN_EVENTS`], and the adoption-rate threshold stays fixed at
 /// [`ADOPTION_THRESHOLD`] (D11: MVP-fixed, not open for rewriting here).
-#[derive(Debug, Clone, Copy)]
 pub struct StandardFeedbackAnalyzer {
     min_events: usize,
+    /// Step14 P3-C：去重键匹配器（默认 [`StandardKeyMatcher`]，可插拔）。
+    /// Step14 P3-C: the dedup-key matcher (defaults to [`StandardKeyMatcher`],
+    /// pluggable).
+    matcher: Box<dyn FeedbackKeyMatcher>,
 }
 
 impl Default for StandardFeedbackAnalyzer {
     fn default() -> Self {
         Self {
             min_events: MIN_EVENTS,
+            matcher: Box::new(StandardKeyMatcher),
         }
     }
 }
@@ -150,14 +188,27 @@ impl StandardFeedbackAnalyzer {
     /// caller owns range validation, here only `>= 1` is backstopped and an
     /// illegal value fails closed inside [`analyze_window_with`]).
     pub fn with_min_events(min_events: usize) -> Self {
-        Self { min_events }
+        Self {
+            min_events,
+            matcher: Box::new(StandardKeyMatcher),
+        }
+    }
+
+    /// 以自定义去重键匹配器构造（Step14 P3-C：可插拔注入点）。
+    /// Builds with a custom dedup-key matcher (Step14 P3-C: the pluggable
+    /// injection point).
+    pub fn with_key_matcher(min_events: usize, matcher: Box<dyn FeedbackKeyMatcher>) -> Self {
+        Self {
+            min_events,
+            matcher,
+        }
     }
 }
 
 #[async_trait::async_trait]
 impl FeedbackAnalyzer for StandardFeedbackAnalyzer {
     async fn analyze(&self, input: FeedbackWindow) -> Result<FeedbackReport> {
-        analyze_window_with(input, self.min_events)
+        analyze_window_with(input, self.min_events, &*self.matcher)
     }
 }
 
@@ -209,17 +260,25 @@ struct PageAgg {
 /// the D11 fixed default [`MIN_EVENTS`]; for a custom value use
 /// [`analyze_window_with`].
 pub fn analyze_window(window: FeedbackWindow) -> Result<FeedbackReport> {
-    analyze_window_with(window, MIN_EVENTS)
+    analyze_window_with(window, MIN_EVENTS, &StandardKeyMatcher)
 }
 
 /// [`analyze_window`] 的参数化形态（批6 CLI `--min-events`）：低质量判据与报告
 /// 阈值使用传入的 `min_events`；`min_events = 0` 会让「最小样本」失去意义 →
 /// Validation（fail-closed，绝不静默放宽 D11）。
+/// 参数化去重键匹配器（Step14 P3-C）：信号一/二用它生成去重键；默认传
+/// [`StandardKeyMatcher`]。
 /// The parameterized form of [`analyze_window`] (batch-6 CLI `--min-events`):
 /// the low-quality criterion and the report threshold use the given
 /// `min_events`; `min_events = 0` voids the "minimum sample" rule → Validation
 /// (fail-closed, never silently relaxing D11).
-pub fn analyze_window_with(window: FeedbackWindow, min_events: usize) -> Result<FeedbackReport> {
+/// The dedup-key matcher is parameterized too (Step14 P3-C): signals 1/2 use it
+/// to build the dedup key; pass [`StandardKeyMatcher`] by default.
+pub fn analyze_window_with(
+    window: FeedbackWindow,
+    min_events: usize,
+    matcher: &dyn FeedbackKeyMatcher,
+) -> Result<FeedbackReport> {
     if min_events == 0 {
         return Err(Error::Validation(
             "feedback analysis min_events must be >= 1".into(),
@@ -253,7 +312,7 @@ pub fn analyze_window_with(window: FeedbackWindow, min_events: usize) -> Result<
             // blind spot and is excluded; every other zero-hit log qualifies.
             let relaxed_and_still_empty = log.candidate_empty_initial && !log.relaxation_succeeded;
             if !relaxed_and_still_empty {
-                let key = normalized_log_query(log)?;
+                let key = normalized_log_query(matcher, log)?;
                 zero_by_query
                     .entry(key)
                     .or_default()
@@ -261,7 +320,7 @@ pub fn analyze_window_with(window: FeedbackWindow, min_events: usize) -> Result<
             }
         }
         if log.rewrite_failure {
-            let key = normalized_log_query(log)?;
+            let key = normalized_log_query(matcher, log)?;
             rewrite_by_query
                 .entry(key)
                 .or_default()
@@ -398,8 +457,11 @@ pub fn analyze_window_with(window: FeedbackWindow, min_events: usize) -> Result<
 /// Normalizes a log's query text (reusing the query_engine normalize contract);
 /// a row violating the contract fails closed: a whole-analysis Validation with
 /// the log_id for auditability, never a silent skip.
-fn normalized_log_query(log: &QueryLogSnapshot) -> Result<String> {
-    normalize(&log.query_text).map_err(|e| {
+fn normalized_log_query(
+    matcher: &dyn FeedbackKeyMatcher,
+    log: &QueryLogSnapshot,
+) -> Result<String> {
+    matcher.normalize(&log.query_text).map_err(|e| {
         Error::Validation(format!(
             "query log {} query_text violates the normalization contract: {e}",
             log.log_id
@@ -489,5 +551,67 @@ fn page_suggestion(domain: &str, page: &LowQualityPage) -> ReviewSuggestion {
             "adoption_rate": page.adoption_rate,
         })
         .to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log(id: i64, text: &str) -> QueryLogSnapshot {
+        QueryLogSnapshot {
+            log_id: id,
+            query_text: text.to_string(),
+            query_json: "{}".to_string(),
+            rewritten_json: None,
+            rewrite_failure: false,
+            hit_count: 0,
+            latency_ms: 20,
+            timestamp: 1_700_000_000,
+            domain: "d".to_string(),
+            candidate_empty_initial: false,
+            relaxation_attempted: false,
+            relaxation_succeeded: false,
+        }
+    }
+
+    fn report_with(matcher: &dyn FeedbackKeyMatcher) -> FeedbackReport {
+        analyze_window_with(
+            FeedbackWindow {
+                domain: "d".to_string(),
+                from: 1_600_000_000,
+                to: 1_800_000_000,
+                logs: vec![log(1, "抹茶拿铁"), log(2, "matcha latte")],
+                events: vec![],
+            },
+            1,
+            matcher,
+        )
+        .unwrap()
+    }
+
+    /// Step14 P3-C：可插拔验证——自定义 matcher 贡献自己的一致的（因此是
+    /// 确定性的）去重键后，两条本应分离的零召回日志聚合到同一报告项；
+    /// 默认 matcher 保持既有契约把它们分成两项。
+    /// Step14 P3-C: pluggability check — once a custom matcher supplies its own
+    /// consistent (hence deterministic) dedup key, two zero-recall logs that
+    /// would otherwise separate collapse into one report item; the default
+    /// matcher keeps the existing contract and splits them.
+    #[test]
+    fn custom_key_matcher_collapses_zero_recall_dedup() {
+        struct Collapse;
+        impl FeedbackKeyMatcher for Collapse {
+            fn normalize(&self, _query_text: &str) -> Result<String> {
+                Ok("constant".to_string())
+            }
+        }
+
+        assert_eq!(report_with(&Collapse).zero_recall.len(), 1);
+        let item = &report_with(&Collapse).zero_recall[0];
+        assert_eq!(item.occurrences, 2);
+        assert_eq!(item.log_ids, vec![1, 2]);
+        assert_eq!(item.normalized_query, "constant");
+
+        assert_eq!(report_with(&StandardKeyMatcher).zero_recall.len(), 2);
     }
 }

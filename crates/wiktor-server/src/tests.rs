@@ -53,6 +53,7 @@ fn env() -> Env {
         Arc::new(KernelHealthCheck {
             kernel: kernel.clone(),
         }),
+        DOMAIN,
     ));
     let router = build_router(state);
     Env {
@@ -635,6 +636,7 @@ async fn a8_restart_clears_rate_limit() {
         Arc::new(KernelHealthCheck {
             kernel: env.kernel.clone(),
         }),
+        DOMAIN,
     ));
     let router = build_router(restarted);
     let (status, _payload) = send_json(&router, post_request(body, Some(SECRET))).await;
@@ -669,6 +671,7 @@ async fn a17_health_ok_and_503_when_unavailable() {
         keys(),
         env.clock.clone(),
         Arc::new(FailingHealth),
+        DOMAIN,
     ));
     let (status, payload) = send_json(&build_router(broken), get_request("/health")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -806,6 +809,7 @@ async fn state_with_search_key() -> (Arc<ServerState>, Arc<wiktor_core::SqliteKe
         keys,
         clock,
         Arc::new(health),
+        "milk-tea",
     ));
     (state, kernel)
 }

@@ -36,9 +36,9 @@ const REFRESH_SECS: u64 = 2;
 /// terminal enters raw mode + the alternate screen and is restored on exit;
 /// every error path restores the terminal before returning.
 pub async fn run(db: &Path) -> anyhow::Result<()> {
-    let (kernel, engine) = state::assemble(db).await?;
+    let (kernel, engines) = state::assemble(db).await?;
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, kernel, engine).await;
+    let result = event_loop(&mut terminal, kernel, engines).await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -65,9 +65,13 @@ fn restore_terminal(
 async fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     kernel: Arc<SqliteKernel>,
-    engine: Arc<QueryEngine<MockVectorStore>>,
+    engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>>,
 ) -> anyhow::Result<()> {
     let mut app = TuiState::new();
+    // Step14 P4：默认选中第一个已编译 domain（多域数据面；空库 → None）。
+    // Step14 P4: select the first compiled domain by default (multi-domain data
+    // plane; an empty DB → None).
+    app.set_domain(engines.keys().next().cloned());
     let mut last_refresh = Instant::now() - Duration::from_secs(REFRESH_SECS);
     loop {
         if last_refresh.elapsed() >= Duration::from_secs(REFRESH_SECS) {
@@ -103,7 +107,24 @@ async fn event_loop(
                     if app.tab == state::Tab::Query && !app.query_input.is_empty() =>
                 {
                     let input = app.query_input.clone();
-                    let outcome = state::run_search(&engine, &input, 5).await;
+                    // Step14 P4：按当前 domain 取 engine；缺省/未命中 → 第一个
+                    // engine；无 engine → 空结果。
+                    // Step14 P4: take the engine for the current domain; a
+                    // missing/unmatched domain falls back to the first engine;
+                    // no engine → an empty result.
+                    let engine = app
+                        .current_domain
+                        .as_deref()
+                        .and_then(|d| engines.get(d))
+                        .or_else(|| engines.values().next())
+                        .cloned();
+                    let outcome = match engine {
+                        Some(engine) => {
+                            state::run_search(&engine, &input, 5, app.current_domain.as_deref())
+                                .await
+                        }
+                        None => state::SearchOutcome::empty(&input),
+                    };
                     app.apply_search(outcome);
                 }
                 (KeyCode::Char(c), _) => app.push_char(c),
@@ -496,12 +517,16 @@ mod tests {
     #[tokio::test]
     async fn loads_real_empty_kernel_without_panic() {
         let dir = tempfile::tempdir().unwrap();
-        let (kernel, _engine) = state::assemble(&dir.path().join("tui.db")).await.unwrap();
+        let (kernel, engines) = state::assemble(&dir.path().join("tui.db")).await.unwrap();
         let overview = state::load_overview(&kernel).expect("overview loads");
         assert!(overview.rows.iter().any(|(n, _)| n == "pages"));
         assert!(state::load_tasks(&kernel).is_empty());
         assert!(state::load_reviews(&kernel).is_empty());
-        let outcome = state::run_search(&_engine, "anything", 5).await;
-        assert!(outcome.error.is_none());
+        // 空库无 engine；run_search 直接走空结果（Step14 P4 无域占位）。
+        // An empty DB has no engine; run_search returns the no-domain placeholder
+        // (Step14 P4).
+        assert!(engines.is_empty());
+        let outcome = state::SearchOutcome::empty("anything");
+        assert!(outcome.error.is_some());
     }
 }

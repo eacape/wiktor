@@ -192,7 +192,7 @@
   <section class="view" id="view-search">
     <form class="search" id="search-form">
       <input id="q" data-i18n-ph="ph-query" placeholder="search the knowledge plane…" type="text"/>
-      <input id="dom" data-i18n-ph="ph-domain" placeholder="domain (opt.)" type="text"/>
+      <select id="dom" data-i18n-ph="ph-domain" title="domain (opt.)"><option value="">domain (opt.)</option></select>
       <input id="topk" max="50" min="1" type="number" value="5"/>
       <button type="submit" data-i18n="run">Run search</button>
     </form>
@@ -455,6 +455,15 @@ function renderDomains(d) {
     "<tr><td>" + esc(x.domain) + '</td><td class="num">' + x.pages + "</td></tr>").join("");
   $("#domains-empty").textContent = lang === "zh" ? "暂无页面。" : "No pages yet.";
   $("#domains-empty").classList.toggle("hidden", list.length > 0);
+  // Step14 P4: 同步 `/api/search` 的 domain 下拉（保留当前选择）。
+  // Step14 P4: keep the search domain dropdown in sync (preserving the current
+  // selection).
+  const sel = $("#dom");
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">' + (lang === "zh" ? "领域（可选）" : "domain (opt.)") +
+    "</option>" + list.map((x) =>
+      '<option value="' + esc(x.domain) + '">' + esc(x.domain) + "</option>").join("");
+  if (cur) sel.value = cur;
 }
 
 async function refresh() {

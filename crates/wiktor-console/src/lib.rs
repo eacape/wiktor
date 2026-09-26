@@ -35,7 +35,10 @@ pub mod tui;
 #[derive(Clone)]
 pub struct ConsoleState {
     pub kernel: Arc<SqliteKernel>,
-    pub engine: Arc<QueryEngine<MockVectorStore>>,
+    /// Step14 P4 多域：key = domain_name，每域一个只读检索引擎（walk 型）。
+    /// Step14 P4 multi-domain: key = domain_name, one read-only retrieval engine
+    /// per domain.
+    pub engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>>,
     pub static_dir: std::path::PathBuf,
 }
 
@@ -61,23 +64,37 @@ pub async fn serve(
     // Searches persist `query_logs` rows as usual (D3 reuses the existing query
     // path instead of adding a new write path).
     let vector_store = Arc::new(MockVectorStore::new());
-    vector_store
-        .ensure_collection("milk-tea", DIM, DistanceMetric::Cosine)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let embedder = Arc::new(DeterministicEmbedder::new(DIM));
-    let engine = Arc::new(
-        QueryEngine::new(
-            kernel.clone(),
-            vector_store,
-            None,
-            embedder,
-            "milk-tea",
-            5,
-            60,
-        )
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-    );
+    // Step14 P4 多域：从 kernel 发现已编译 domain，每域建一个只读检索引擎。
+    // 无域（空库）→ 空 map，search 返回空命中 + 提示。移除 milk-tea 硬编码。
+    // Step14 P4 multi-domain: discover compiled domains from the kernel and
+    // build one read-only engine per domain. An empty DB → empty map, and
+    // search returns empty hits with a notice. Drops the milk-tea hard-code.
+    let discovered: Vec<String> = kernel
+        .list_domains()
+        .map(|ds| ds.into_iter().map(|d| d.domain).collect())
+        .unwrap_or_default();
+    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>> =
+        std::collections::HashMap::new();
+    for domain_name in discovered {
+        vector_store
+            .ensure_collection(&domain_name, DIM, DistanceMetric::Cosine)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let engine = Arc::new(
+            QueryEngine::new(
+                kernel.clone(),
+                vector_store.clone(),
+                None,
+                embedder.clone(),
+                &domain_name,
+                5,
+                60,
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        );
+        engines.insert(domain_name, engine);
+    }
     let static_dir = static_dir.unwrap_or_else(|| {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -87,7 +104,7 @@ pub async fn serve(
     });
     let state = ConsoleState {
         kernel,
-        engine,
+        engines,
         static_dir,
     };
     let app = router(state);
@@ -264,35 +281,50 @@ async fn search(
         top_k,
         domain,
     };
-    // 检索失败（如 schema 未就绪）返回空命中 + error 字段，不让面板 500。
-    // On search failure (e.g. a not-yet-ready schema) return empty hits plus an
-    // `error` field instead of a 500 for the panel.
-    let payload = match s.engine.search(&query).await {
-        Ok(result) => {
-            let hits: Vec<serde_json::Value> = result
-                .hits
-                .into_iter()
-                .map(|h| {
-                    serde_json::json!({
-                        "page_id": h.page_id,
-                        "entity_id": h.entity_id.to_key(),
-                        "score": h.score,
-                        "title": h.title,
+    // Step14 P4：按请求 domain 分发到多域 engine；缺省或未命中 → 取第一个域
+    // engine（无 engine 时返回空命中 + 提示，不 500）。
+    // Step14 P4: dispatch by the request domain to the multi-domain engine map;
+    // a missing/unmatched domain falls back to the first engine (an empty map
+    // returns empty hits with a notice, never a 500).
+    let engine = query
+        .domain
+        .as_deref()
+        .and_then(|d| s.engines.get(d))
+        .or_else(|| s.engines.values().next())
+        .cloned();
+    let payload = match engine {
+        Some(engine) => match engine.search(&query).await {
+            Ok(result) => {
+                let hits: Vec<serde_json::Value> = result
+                    .hits
+                    .into_iter()
+                    .map(|h| {
+                        serde_json::json!({
+                            "page_id": h.page_id,
+                            "entity_id": h.entity_id.to_key(),
+                            "score": h.score,
+                            "title": h.title,
+                        })
                     })
+                    .collect();
+                let diagnostics = serde_json::to_value(&result.diagnostics).unwrap_or_default();
+                serde_json::json!({
+                    "query": text,
+                    "hits": hits,
+                    "diagnostics": diagnostics,
+                    "latency_ms": result.latency_ms,
                 })
-                .collect();
-            let diagnostics = serde_json::to_value(&result.diagnostics).unwrap_or_default();
-            serde_json::json!({
+            }
+            Err(e) => serde_json::json!({
                 "query": text,
-                "hits": hits,
-                "diagnostics": diagnostics,
-                "latency_ms": result.latency_ms,
-            })
-        }
-        Err(e) => serde_json::json!({
+                "hits": [],
+                "error": e.to_string(),
+            }),
+        },
+        None => serde_json::json!({
             "query": text,
             "hits": [],
-            "error": e.to_string(),
+            "notice": "no compiled domain in this database; probe /api/domains",
         }),
     };
     Json(payload)

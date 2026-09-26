@@ -113,7 +113,20 @@ pub async fn search(
         top_k: params.top_k,
         domain: Some(params.domain),
     };
-    let result = match state.engine.search(&query).await {
+    // Step14 P4：按请求领域从多域引擎表分发；未装配该域 → NOT_FOUND（区别于
+    // 上方认证 403：key 授权通过但该域未 serve）。
+    // Step14 P4: dispatch by the request domain from the multi-domain engine
+    // map; an unwired domain → NOT_FOUND (distinct from the auth 403 above:
+    // key-authorized but the domain is not served).
+    let Some(engine) = state.engine_for(query.domain.as_deref().unwrap_or("")) else {
+        return crate::error_json(
+            axum::http::StatusCode::NOT_FOUND,
+            crate::error::code::NOT_FOUND,
+            "domain not served by this instance",
+        )
+        .into_response();
+    };
+    let result = match engine.search(&query).await {
         Ok(result) => result,
         Err(e) => {
             let (status, code) = crate::error::http_error(&e);

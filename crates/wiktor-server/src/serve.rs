@@ -30,7 +30,14 @@ pub struct ServeOptions {
     pub db: std::path::PathBuf,
     pub listen_http: String,
     pub listen_grpc: String,
-    pub domain_pack: Option<std::path::PathBuf>,
+    /// 多领域包列表（Step14 P4）：每项一个 domain pack → 一个编译 worker +
+    /// 一个检索引擎。空 → 无编译 worker、无检索面（纯状态/监督服务）。兼容
+    /// 单域：单 pack 时等价于旧 `Option` 单值。
+    /// Multi-domain pack list (Step14 P4): each entry is one domain pack → one
+    /// compile worker + one retrieval engine. Empty → no compile worker and no
+    /// retrieval surface (a pure status/supervision service). Backward
+    /// compatible with single-domain: one pack equals the old `Option` value.
+    pub domain_packs: Vec<std::path::PathBuf>,
     pub source_path: Option<String>,
     /// 注入向量后端（Step13 D1）：None → Mock（现状）；qdrant 等具体实现由
     /// CLI 装配者按 env 构建，server 只认 core trait（Step10 插件边界）。
@@ -43,12 +50,12 @@ pub struct ServeOptions {
     /// The injected query embedder: None → the deterministic embedder (the
     /// offline baseline).
     pub embedder: Option<Arc<dyn QueryEmbedder>>,
-    /// 注入持久化 QUG 图（CLI 经 load_active_qug 加载；None → qug 缺席，
-    /// 显式混合 fallback）。
-    /// The injected persistent QUG graph (loaded by the CLI via
-    /// load_active_qug; None → the graph is absent with an explicit hybrid
-    /// fallback).
-    pub qug: Option<Arc<wiktor_core::query_engine::qug::QugGraph>>,
+    /// 注入持久化 QUG 图（CLI 经 load_active_qug 加载；Step14 P4：按域，
+    /// key = domain_name；某域缺席 → 该域 qug=None，显式混合 fallback）。
+    /// The injected persistent QUG graphs (loaded by the CLI via
+    /// load_active_qug; Step14 P4: keyed by domain_name; a domain absent from
+    /// the map → qug=None for it, with an explicit hybrid fallback).
+    pub qugs: std::collections::HashMap<String, Arc<wiktor_core::query_engine::qug::QugGraph>>,
 }
 
 /// 启动双 listener（HTTP + gRPC）并按需启动编译 worker。
@@ -75,25 +82,28 @@ pub async fn run_server(options: ServeOptions) -> Result<(), String> {
         StatusService::new(kernel.clone()),
     );
     let cancel = CancellationToken::new();
-    let worker = if let Some(domain_pack) = options.domain_pack.as_deref() {
-        Some(
-            CompileWorker::from_domain_pack(
-                kernel,
-                &domain_pack.display().to_string(),
-                options.source_path.as_deref(),
-                None,
-                "",
-            )
-            .map_err(|e| format!("assemble compile worker: {e}"))?
-            .spawn(cancel.clone()),
+    // Step14 P4：每域一个编译 worker（各自 domain.yaml 只 admit 自己的源；
+    // claim 按 task_ids 隔离，无 domain 列也安全）。空列表 → 无 worker。
+    // Step14 P4: one compile worker per domain (each admits only its own
+    // domain.yaml source; claim is isolated by task_ids, safe even without a
+    // domain column). An empty list → no worker.
+    let mut workers: Vec<_> = Vec::new();
+    for domain_pack in &options.domain_packs {
+        let worker = CompileWorker::from_domain_pack(
+            kernel.clone(),
+            &domain_pack.display().to_string(),
+            options.source_path.as_deref(),
+            None,
+            "",
         )
-    } else {
-        None
-    };
+        .map_err(|e| format!("assemble compile worker for {}: {e}", domain_pack.display()))?
+        .spawn(cancel.clone());
+        workers.push(worker);
+    }
     let http_listener = TcpListener::bind(&options.listen_http)
         .await
         .map_err(|e| format!("bind HTTP {}: {e}", options.listen_http))?;
-    tracing::info!(http = %options.listen_http, grpc = %options.listen_grpc, "wiktor server listening");
+    tracing::info!(http = %options.listen_http, grpc = %options.listen_grpc, domains = workers.len(), "wiktor server listening");
     let grpc_addr = options.listen_grpc.clone();
     let http_task = tokio::spawn(async move { axum::serve(http_listener, http).await });
     let grpc_task = tokio::spawn(async move {
@@ -109,31 +119,29 @@ pub async fn run_server(options: ServeOptions) -> Result<(), String> {
         result = grpc_task => result.map_err(|e| format!("gRPC task join failed: {e}"))?.map_err(|e| format!("gRPC server error: {e}"))?,
     }
     cancel.cancel();
-    if let Some(handle) = worker {
+    for handle in workers {
         let _ = handle.await;
     }
     Ok(())
 }
 
-/// 装配共享 engine + ServerState + gRPC Search 服务（Step13 D1/D2）。
-/// 注入项缺省回退：Mock 向量库 + 确定性嵌入（离线基线），qug=None。
-/// Assembles the shared engine + ServerState + the gRPC Search service
-/// (Step13 D1/D2). Injection defaults fall back to the Mock vector store + the
-/// deterministic embedder (the offline baseline) with qug=None.
+/// 装配共享多域 engine map + ServerState + gRPC Search 服务（Step13 D1/D2，
+/// Step14 P4 多域化）。注入项缺省回退：Mock 向量库 + 确定性嵌入（离线基线），
+/// qug=None。每个 domain pack 装配一个 engine（自己的域名/candidate_multiplier/
+/// QUG/collection 名）；空列表 → 空 map（无检索面，纯状态服务）。
+/// Assembles the shared multi-domain engine map + ServerState + the gRPC Search
+/// service (Step13 D1/D2, made multi-domain in Step14 P4). Injection defaults
+/// fall back to the Mock vector store + the deterministic embedder (the offline
+/// baseline) with qug=None. Each domain pack gets one engine (its own domain
+/// name / candidate_multiplier / QUG / collection name); an empty list → an
+/// empty map (no retrieval surface; a pure status service).
 async fn assemble_state_and_search(
     kernel: Arc<SqliteKernel>,
     keys: ApiKeys,
     options: &ServeOptions,
 ) -> Result<(Arc<ServerState>, SearchService<dyn VectorStore>), String> {
-    let domain = options
-        .domain_pack
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|yaml| serde_yaml_ng::from_str::<wiktor_core::traits::DomainConfig>(&yaml).ok());
-    let domain_name = domain
-        .as_ref()
-        .map(|config| config.name.clone())
-        .unwrap_or_else(|| "default".to_string());
+    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<dyn VectorStore>>> =
+        std::collections::HashMap::new();
     let store: Arc<dyn VectorStore> = match &options.vector_store {
         Some(store) => store.clone(),
         None => Arc::new(MockVectorStore::new()),
@@ -143,60 +151,69 @@ async fn assemble_state_and_search(
         None => Arc::new(DeterministicEmbedder::new(768)),
     };
     // 维度探测：对探测串嵌入一次取长度（与 cmd_vector_build 同模式；确定性嵌
-    // 入恒 768，HttpEmbedder 按远端模型实测维度）。
+    // 入恒 768，HttpEmbedder 按远端模型实测维度）。空列表时无 engine 也执行，
+    // 保持维度探测不引入未用。
     // Dimension probe: embed the probe string once and take the length (the
     // same pattern as cmd_vector_build; the deterministic embedder is always
     // 768 while HttpEmbedder reflects the remote model's measured dimension).
+    // It runs even with an empty list, so the probe introduces no unused code.
     let probe = embedder
         .embed("wiktor-collection-dimension-probe")
         .await
         .map_err(|e| format!("embed dimension probe: {e}"))?;
     let dim = probe.len();
-    store
-        .ensure_collection(&domain_name, dim, DistanceMetric::Cosine)
-        .await
-        .map_err(|e| format!("ensure vector collection: {e}"))?;
-    // QUG 图注入（CLI 已按 active build 加载，A7 语义由加载方承担）；域配置在
-    // 场时 candidate_multiplier 与 config 同源冻结。
-    // The QUG graph is injected (loaded from the active build by the CLI; the
-    // A7 semantics belong to the loader). With a domain config present, the
-    // candidate_multiplier is frozen from the same config.
-    let candidate_multiplier = domain
-        .as_ref()
-        .map(|config| config.qug.candidate_multiplier)
-        .filter(|_| options.qug.is_some())
-        .unwrap_or(5);
-    // P1 查询热点缓存（MASTER-PLAN §5.4/§5.5 契约 #5）：生产默认开启，容量取
-    // `WIKTOR_QUERY_CACHE_SIZE`（缺省 512）；设 0 显式关闭（诊断/对比用）。键
-    // 带 generation + 实体反向索引，编译发布/实体直写自动失效。
-    // P1 query hot-cache (MASTER-PLAN §5.4/§5.5 #5): on by default in serve,
-    // capacity from `WIKTOR_QUERY_CACHE_SIZE` (default 512); setting it to 0
-    // disables (diagnostics/comparison). The key carries generation + an entity
-    // reverse index, so compile publishes and direct fact writes invalidate
-    // automatically.
+    // P1 查询热点缓存（MASTER-PLAN §5.4/§5.5 契约 #5，见下）在各域 engine 装配
+    // 内统一应用。
     let cache_size: u64 = std::env::var("WIKTOR_QUERY_CACHE_SIZE")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(512);
-    let engine = Arc::new(
-        QueryEngine::new(
-            kernel.clone(),
-            store,
-            options.qug.clone(),
-            embedder,
-            &domain_name,
-            candidate_multiplier,
-            60,
-        )
-        .map(|e| {
-            if cache_size > 0 {
-                e.with_cache(wiktor_core::query_engine::QueryCache::new(cache_size))
-            } else {
-                e
-            }
-        })
-        .map_err(|e| format!("assemble query engine: {e}"))?,
-    );
-    let state = Arc::new(ServerState::new(kernel, keys, engine.clone()));
-    Ok((state, SearchService::new(engine, 16 * 1024)))
+    for path in &options.domain_packs {
+        let domain = std::fs::read_to_string(path).ok().and_then(|yaml| {
+            serde_yaml_ng::from_str::<wiktor_core::traits::DomainConfig>(&yaml).ok()
+        });
+        let domain_name = domain
+            .as_ref()
+            .map(|config| config.name.clone())
+            .unwrap_or_else(|| "default".to_string());
+        store
+            .ensure_collection(&domain_name, dim, DistanceMetric::Cosine)
+            .await
+            .map_err(|e| format!("ensure vector collection: {e}"))?;
+        // QUG 图注入（CLI 已按 active build 加载，A7 语义由加载方承担）；域配置
+        // 在场时 candidate_multiplier 与 config 同源冻结。Step14 P4：每域取自己
+        // 的 QUG 图。
+        // The QUG graph is injected (loaded from the active build by the CLI; the
+        // A7 semantics belong to the loader). With a domain config present, the
+        // candidate_multiplier is frozen from the same config. Step14 P4: each
+        // domain takes its own QUG graph.
+        let domain_qug = options.qugs.get(&domain_name).cloned();
+        let candidate_multiplier = domain
+            .as_ref()
+            .map(|config| config.qug.candidate_multiplier)
+            .filter(|_| domain_qug.is_some())
+            .unwrap_or(5);
+        let engine = Arc::new(
+            QueryEngine::new(
+                kernel.clone(),
+                store.clone(),
+                domain_qug,
+                embedder.clone(),
+                &domain_name,
+                candidate_multiplier,
+                60,
+            )
+            .map(|e| {
+                if cache_size > 0 {
+                    e.with_cache(wiktor_core::query_engine::QueryCache::new(cache_size))
+                } else {
+                    e
+                }
+            })
+            .map_err(|e| format!("assemble query engine for {}: {e}", path.display()))?,
+        );
+        engines.insert(domain_name, engine);
+    }
+    let state = Arc::new(ServerState::new(kernel, keys, engines.clone()));
+    Ok((state, SearchService::new(engines, 16 * 1024)))
 }

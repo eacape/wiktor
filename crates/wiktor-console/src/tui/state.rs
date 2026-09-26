@@ -102,6 +102,24 @@ pub struct SearchOutcome {
     pub error: Option<String>,
 }
 
+impl SearchOutcome {
+    /// 空结果（Step14 P4：无可用 engine 时的占位——无域可检索）。
+    /// An empty result (Step14 P4: the placeholder when no engine is available —
+    /// no domain to search).
+    pub fn empty(query: &str) -> Self {
+        Self {
+            query: query.to_string(),
+            hits: vec![],
+            rewrite_status: "no_engine".to_string(),
+            fts_count: 0,
+            vector_count: 0,
+            rrf_k: 0,
+            latency_ms: 0,
+            error: Some("no compiled domain in this database".to_string()),
+        }
+    }
+}
+
 /// TUI 全量状态（D3：渲染函数只读这里，事件只改这里）。
 /// The full TUI state (D3: render functions only read this; events only write
 /// this).
@@ -113,6 +131,11 @@ pub struct TuiState {
     pub reviews: Vec<ReviewRow>,
     pub query_input: String,
     pub search: Option<SearchOutcome>,
+    /// 当前选中的 domain（Step14 P4 多域；None → 无域可用）。通过 `set_domain`
+    /// 设置。
+    /// The currently selected domain (Step14 P4 multi-domain; None → no domain
+    /// is available). Set via `set_domain`.
+    pub current_domain: Option<String>,
     /// 最近一次数据装载是否失败（true → 标题栏 offline 徽标）。
     /// Whether the latest data load failed (true → the offline badge in the
     /// title bar).
@@ -130,6 +153,13 @@ impl TuiState {
 
     pub fn select_tab(&mut self, tab: Tab) {
         self.tab = tab;
+    }
+
+    /// 设置当前 domain（Step14 P4：检索只作用于该域的 engine）。
+    /// Sets the current domain (Step14 P4: retrieval targets only that domain's
+    /// engine).
+    pub fn set_domain(&mut self, domain: Option<String>) {
+        self.current_domain = domain;
     }
 
     /// 查询 Tab 的文本输入（其余 Tab 忽略）。
@@ -171,27 +201,44 @@ impl TuiState {
 /// Returns (kernel, engine).
 pub async fn assemble(
     db: &std::path::Path,
-) -> anyhow::Result<(Arc<SqliteKernel>, Arc<QueryEngine<MockVectorStore>>)> {
+) -> anyhow::Result<(
+    Arc<SqliteKernel>,
+    std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>>,
+)> {
     let kernel = Arc::new(SqliteKernel::open(db)?);
     let vector_store = Arc::new(MockVectorStore::new());
-    vector_store
-        .ensure_collection("milk-tea", DIM, DistanceMetric::Cosine)
-        .await
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let embedder = Arc::new(DeterministicEmbedder::new(DIM));
-    let engine = Arc::new(
-        QueryEngine::new(
-            kernel.clone(),
-            vector_store,
-            None,
-            embedder,
-            "milk-tea",
-            5,
-            60,
-        )
-        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
-    );
-    Ok((kernel, engine))
+    // Step14 P4：从 kernel 发现已编译 domain，每域建一个只读检索引擎；移除
+    // milk-tea 硬编码。空库 → 空 map。
+    // Step14 P4: discover compiled domains from the kernel and build one
+    // read-only engine per domain; drops the milk-tea hard-code. An empty DB →
+    // an empty map.
+    let discovered: Vec<String> = kernel
+        .list_domains()
+        .map(|ds| ds.into_iter().map(|d| d.domain).collect())
+        .unwrap_or_default();
+    let mut engines: std::collections::HashMap<String, Arc<QueryEngine<MockVectorStore>>> =
+        std::collections::HashMap::new();
+    for domain_name in discovered {
+        vector_store
+            .ensure_collection(&domain_name, DIM, DistanceMetric::Cosine)
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        let engine = Arc::new(
+            QueryEngine::new(
+                kernel.clone(),
+                vector_store.clone(),
+                None,
+                embedder.clone(),
+                &domain_name,
+                5,
+                60,
+            )
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        );
+        engines.insert(domain_name, engine);
+    }
+    Ok((kernel, engines))
 }
 
 /// 仪表盘数据装载：任何读失败都折叠为 offline 而不是让 TUI 崩溃。
@@ -258,12 +305,13 @@ pub async fn run_search(
     engine: &Arc<QueryEngine<MockVectorStore>>,
     text: &str,
     top_k: usize,
+    domain: Option<&str>,
 ) -> SearchOutcome {
     let query = Query {
         text: text.to_string(),
         filters: wiktor_core::types::Filters::default(),
         top_k,
-        domain: None,
+        domain: domain.map(str::to_string),
     };
     match engine.search(&query).await {
         Ok(result) => SearchOutcome {
