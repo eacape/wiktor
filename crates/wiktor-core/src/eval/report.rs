@@ -100,6 +100,10 @@ pub struct TierReport {
 pub struct DecisionReport {
     pub qug_decision: QugDecision,
     pub gain_pp: Option<f64>,
+    /// 相对提升 `(C−B)/B`（次要指标，随 gain_pp 双录；不参与启用判定）。
+    /// Relative gain `(C−B)/B` (secondary, recorded alongside gain_pp; never
+    /// used for the enablement verdict).
+    pub relative_gain: Option<f64>,
     pub reason: String,
     pub recall_regression: bool,
     pub negative_precision_regression: bool,
@@ -181,6 +185,7 @@ impl EvaluationReport {
             decision: DecisionReport {
                 qug_decision: outcome.decision.qug_decision,
                 gain_pp: outcome.decision.gain_pp,
+                relative_gain: outcome.decision.relative_gain,
                 reason: outcome.decision.reason.clone(),
                 recall_regression: outcome.decision.recall_regression,
                 negative_precision_regression: outcome.decision.negative_precision_regression,
@@ -537,6 +542,7 @@ mod tests {
                     QugDecision::Disabled
                 },
                 gain_pp: gain,
+                relative_gain: None,
                 reason: "测试理由 / test reason".into(),
                 recall_regression,
                 negative_precision_regression: np_regression,

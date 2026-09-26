@@ -141,46 +141,104 @@ impl HttpEmbedder {
 #[async_trait]
 impl QueryEmbedder for HttpEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": text,
-        });
-        let response = self
-            .http
-            .post(self.endpoint())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .bearer_auth(&self.api_key)
-            .body(serde_json::to_vec(&body)?)
-            .send()
-            .await
-            .map_err(|e| Error::Internal(format!("embedding request failed: {e}")))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::InvalidConfig(format!(
-                "embedding endpoint returned {status}"
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::Internal(format!("embedding response read failed: {e}")))?;
-        let parsed: EmbeddingResponse = serde_json::from_slice(&bytes)?;
-        let vector = parsed
-            .data
-            .first()
-            .ok_or_else(|| Error::Internal("embedding response has no data".into()))?
-            .embedding
-            .clone();
-        if vector.is_empty() {
-            return Err(Error::Internal("embedding response vector is empty".into()));
-        }
-        let mut dim = self.dim.lock().unwrap();
-        if dim.is_none() {
-            *dim = Some(vector.len());
-        }
-        Ok(vector)
+        Ok(self.post_embeddings(&[text]).await?.remove(0))
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        self.post_embeddings(texts).await
     }
 }
+
+#[cfg(feature = "embedding-http")]
+impl HttpEmbedder {
+    /// 单次 POST `/embeddings`（一次请求多个 input）。
+    /// One POST `/embeddings` (multiple inputs in a single request).
+    async fn post_embeddings(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = serde_json::json!({
+            "model": self.model,
+            "input": texts,
+        });
+        // 重试（P1）：瞬态失败（429/408/5xx 与传输超时/连接失败）至多
+        // EMBED_RETRIES 次，退避 200ms·2^n；幂等（只读 POST）。4xx 永久失败不重试。
+        // Retry (P1): transient failures (429/408/5xx, transport timeout/connect)
+        // retry up to EMBED_RETRIES times with 200ms·2^n backoff; idempotent
+        // (read-only POST). Other 4xx are permanent and never retried.
+        let mut attempt = 0;
+        loop {
+            let resp = match self
+                .http
+                .post(self.endpoint())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .bearer_auth(&self.api_key)
+                .body(serde_json::to_vec(&body)?)
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let retryable = e.is_timeout() || e.is_connect();
+                    if retryable && attempt < EMBED_RETRIES {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                        continue;
+                    }
+                    return Err(Error::Internal(format!("embedding request failed: {e}")));
+                }
+            };
+            let status = resp.status();
+            if !status.is_success() {
+                let retryable =
+                    status.as_u16() == 429 || status.as_u16() == 408 || status.is_server_error();
+                if retryable && attempt < EMBED_RETRIES {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(200 * (1 << attempt))).await;
+                    continue;
+                }
+                return Err(Error::InvalidConfig(format!(
+                    "embedding endpoint returned {status}"
+                )));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| Error::Internal(format!("embedding response read failed: {e}")))?;
+            let parsed: EmbeddingResponse = serde_json::from_slice(&bytes)?;
+            if parsed.data.len() != texts.len() {
+                return Err(Error::Internal(format!(
+                    "embedding batch mismatch: sent {}, got {}",
+                    texts.len(),
+                    parsed.data.len()
+                )));
+            }
+            let mut vectors = Vec::with_capacity(parsed.data.len());
+            let mut dim: Option<usize> = None;
+            for datum in parsed.data {
+                if datum.embedding.is_empty() {
+                    return Err(Error::Internal("embedding response vector is empty".into()));
+                }
+                if dim.is_none() {
+                    dim = Some(datum.embedding.len());
+                }
+                vectors.push(datum.embedding);
+            }
+            // 缓存维度（与 embed 的探测语义一致）。
+            // Cache the dimension (same discovery semantics as embed).
+            let mut self_dim = self.dim.lock().unwrap();
+            if self_dim.is_none() {
+                *self_dim = dim;
+            }
+            return Ok(vectors);
+        }
+    }
+}
+
+/// 瞬态嵌入错误重试上限（P1）。
+/// Transient embedding-error retry cap (P1).
+#[cfg(feature = "embedding-http")]
+const EMBED_RETRIES: usize = 3;
 
 /// `/embeddings` 响应（只取所需字段；未知字段忽略）。
 /// `/embeddings` response (only the fields needed; unknown fields are ignored).

@@ -226,9 +226,15 @@ pub enum QugDecision {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Decision {
     pub qug_decision: QugDecision,
-    /// `gain_pp = (C_recall@10 − B_recall@10) × 100`；无增益路径为 None。
-    /// `gain_pp = (C_recall@10 − B_recall@10) × 100`; None on the no-gain paths.
+    /// `gain_pp = (C_recall@10 − B_recall@10) × 100`（绝对百分点）；无增益路径为 None。
+    /// `gain_pp = (C_recall@10 − B_recall@10) × 100` (absolute percentage points); None on the no-gain paths.
     pub gain_pp: Option<f64>,
+    /// `relative_gain = (C−B)/B`（相对提升，B>0 才有定义）；与 `gain_pp` 双指标并录，
+    /// 供口径统一对比（MASTER-PLAN §5.2 与代码实现 P2 统一：启用判定用绝对 pp）。
+    /// `relative_gain = (C−B)/B` (relative improvement, defined only when B>0);
+    /// recorded alongside `gain_pp` for cross-metric comparison (P2 unifies the
+    /// §5.2 wording with the code: enablement is judged on absolute pp).
+    pub relative_gain: Option<f64>,
     /// 判定原因（中英并列；JSON 与双语报告共用同一字符串）。
     /// Decision reason (Chinese + English; shared by the JSON and both
     /// markdown reports).
@@ -276,6 +282,7 @@ pub fn decide(
         return Decision {
             qug_decision: QugDecision::Disabled,
             gain_pp: None,
+            relative_gain: None,
             reason: "无 active QUG 构建或 C 档有效改写样本不足 1 条，视为无增益，判定关闭 \
                      / no active QUG build or fewer than 1 effective C rewrite sample; \
                      treated as no gain, disabled"
@@ -290,6 +297,7 @@ pub fn decide(
         return Decision {
             qug_decision: QugDecision::Disabled,
             gain_pp: None,
+            relative_gain: None,
             reason: "B 档正例 recall@10 无定义（无正例样本），视为无增益，判定关闭 \
                      / tier-B positive recall@10 undefined (no positive samples); \
                      treated as no gain, disabled"
@@ -304,6 +312,7 @@ pub fn decide(
         return Decision {
             qug_decision: QugDecision::Disabled,
             gain_pp: None,
+            relative_gain: None,
             reason: "C 档正例 recall@10 无定义（无正例样本），视为无增益，判定关闭 \
                      / tier-C positive recall@10 undefined (no positive samples); \
                      treated as no gain, disabled"
@@ -315,6 +324,10 @@ pub fn decide(
         };
     };
     let gain_pp = (cv - bv) * 100.0;
+    // P2：相对增益双指标并录（B>0 才有定义；供口径统一对比，不参与启用判定）。
+    // P2: relative gain recorded alongside absolute pp (defined only when B>0;
+    // for cross-metric comparison; never used for the enablement verdict).
+    let relative_gain = if bv > 0.0 { Some((cv - bv) / bv) } else { None };
     let (qug_decision, reason) = if gain_pp >= QUG_ENABLE_GAIN_PP_THRESHOLD {
         (
             QugDecision::Enabled,
@@ -336,6 +349,7 @@ pub fn decide(
     Decision {
         qug_decision,
         gain_pp: Some(gain_pp),
+        relative_gain,
         reason,
         recall_regression,
         negative_precision_regression,

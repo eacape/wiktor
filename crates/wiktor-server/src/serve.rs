@@ -166,6 +166,18 @@ async fn assemble_state_and_search(
         .map(|config| config.qug.candidate_multiplier)
         .filter(|_| options.qug.is_some())
         .unwrap_or(5);
+    // P1 查询热点缓存（MASTER-PLAN §5.4/§5.5 契约 #5）：生产默认开启，容量取
+    // `WIKTOR_QUERY_CACHE_SIZE`（缺省 512）；设 0 显式关闭（诊断/对比用）。键
+    // 带 generation + 实体反向索引，编译发布/实体直写自动失效。
+    // P1 query hot-cache (MASTER-PLAN §5.4/§5.5 #5): on by default in serve,
+    // capacity from `WIKTOR_QUERY_CACHE_SIZE` (default 512); setting it to 0
+    // disables (diagnostics/comparison). The key carries generation + an entity
+    // reverse index, so compile publishes and direct fact writes invalidate
+    // automatically.
+    let cache_size: u64 = std::env::var("WIKTOR_QUERY_CACHE_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(512);
     let engine = Arc::new(
         QueryEngine::new(
             kernel.clone(),
@@ -176,6 +188,13 @@ async fn assemble_state_and_search(
             candidate_multiplier,
             60,
         )
+        .map(|e| {
+            if cache_size > 0 {
+                e.with_cache(wiktor_core::query_engine::QueryCache::new(cache_size))
+            } else {
+                e
+            }
+        })
         .map_err(|e| format!("assemble query engine: {e}"))?,
     );
     let state = Arc::new(ServerState::new(kernel, keys, engine.clone()));

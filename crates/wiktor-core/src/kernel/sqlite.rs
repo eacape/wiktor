@@ -130,6 +130,14 @@ struct DomainStatRow {
     pages: i64,
 }
 
+/// current_published_generation 的 SQL 行映射。
+/// The SQL row mapping for current_published_generation.
+#[derive(QueryableByName)]
+struct PublishedGenerationRow {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    generation: i64,
+}
+
 /// Step 6 批2：新写入查询日志的 domain 缺省值（spec step6 §6：缺省
 /// `__default__`，不得继续用 0005 列默认 `__legacy__` 写新行；`__legacy__`
 /// 仅保留给 0005 之前的历史行）。
@@ -338,6 +346,32 @@ impl SqliteKernel {
                 pages: r.pages,
             })
             .collect())
+    }
+
+    /// 某 domain 当前已发布的 generation（P1 查询缓存键成分；MASTER-PLAN
+    /// §5.4/5.5：缓存键带索引 generation，编译发布使 generation 递增 →
+    /// 缓存键变化 → 旧条目自然失效）。`generations` 表取该 domain 的
+    /// `status='published'` 最大 generation；无则 `None`（缓存键此时取 0，
+    /// 仅当 future 有已发布代次才可能命中）。
+    /// The currently published generation of a domain (a P1 query-cache key
+    /// component; MASTER-PLAN §5.4/5.5: the cache key carries the index
+    /// generation — a compile publish bumps generation → the key changes → old
+    /// entries naturally go stale). Reads the max `generation` with
+    /// `status='published'` for the domain from `generations`; `None` when none
+    /// (the cache key then uses 0, so a hit requires a future published gen).
+    pub fn current_published_generation(&self, domain: &str) -> Result<Option<i64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let row: PublishedGenerationRow = diesel::sql_query(
+            "SELECT COALESCE(MAX(generation), 0) AS generation \
+             FROM generations WHERE domain_pack = ? AND status = 'published'",
+        )
+        .bind::<diesel::sql_types::Text, _>(domain)
+        .get_result(&mut *conn)?;
+        Ok(if row.generation == 0 {
+            None
+        } else {
+            Some(row.generation)
+        })
     }
 
     /// 写入一条完整查询日志并返回实际 `log_id`（Step 6 批2，spec step6 §6）。

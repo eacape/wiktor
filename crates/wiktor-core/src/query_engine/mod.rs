@@ -15,8 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
+pub mod cache;
 pub mod hybrid;
 pub mod qug;
+pub use cache::{CachedSearch, QueryCache};
 
 /// QUG 改写状态（CLI/诊断展示）。
 /// QUG rewrite status (CLI/diagnostics display).
@@ -213,6 +215,19 @@ struct RelaxState {
 #[async_trait]
 pub trait QueryEmbedder: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// 批量嵌入（P1）：默认逐条调 [`embed`]；`HttpEmbedder` 覆盖为真实批量请求
+    /// （大语料回填显著减少 RTT 与请求数）。顺序与输入一致。
+    /// Batch embed (P1): the default embeds each item individually via [`embed`];
+    /// `HttpEmbedder` overrides it with a real batched request (far fewer RTTs and
+    /// requests on large-corpus backfills). Order matches the input.
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            out.push(self.embed(t).await?);
+        }
+        Ok(out)
+    }
 }
 
 /// 查询引擎：编排 QUG、候选域、FTS、向量、RRF 与日志。
@@ -258,6 +273,15 @@ pub struct QueryEngine<V: VectorStore + ?Sized> {
     /// nothing can trigger); installation is the constructor's decision (CLI
     /// search injects [`DefaultFilterRelaxer`]; the engine never auto-installs).
     pub filter_relaxer: Option<Arc<dyn FilterRelaxer>>,
+    /// P1 查询热点缓存：`Some` 时命中集合（不含 log_id/latency）跨查询复用；
+    /// `None` = 缓存关闭（默认，保持既有行为）。generation 现读键，编译发布
+    /// 自动失效；实体失效经 [`QueryCache::invalidate_entity_ids`]。
+    /// P1 query hot-cache: when `Some`, the hit set (excluding log_id/latency) is
+    /// reused across queries; `None` = caching off (the default, preserving
+    /// existing behavior). The key reads generation live, so compile publishes
+    /// auto-invalidate; entity invalidation goes through
+    /// [`QueryCache::invalidate_entity_ids`].
+    pub cache: Option<QueryCache>,
 }
 
 impl<V: VectorStore + ?Sized> QueryEngine<V> {
@@ -288,7 +312,15 @@ impl<V: VectorStore + ?Sized> QueryEngine<V> {
             rrf_k,
             fts_only: false,
             filter_relaxer: None,
+            cache: None,
         })
+    }
+
+    /// builder 风格：安装查询热点缓存（P1；默认关闭，需显式开启）。
+    /// Builder style: installs the query hot-cache (P1; off by default, opt-in).
+    pub fn with_cache(mut self, cache: QueryCache) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Step 6 批2：安装过滤放宽器（builder 风格，命名对齐
@@ -405,6 +437,56 @@ impl<V: VectorStore + ?Sized> QueryEngine<V> {
         let started = Instant::now();
         self.validate(query)?;
 
+        // —— P1 缓存：命中则复用命中集合（不含 log_id/latency），但仍写本次
+        // query_logs 取新 log_id（反馈闭环依赖真实 log_id）。domain/generation
+        // 现读使缓存键随编译发布递增而自然失效；实体失效经
+        // `invalidate_entity_ids`。无 cache → 原路径。
+        // —— P1 cache: on a hit reuse the hit set (minus log_id/latency) but still
+        // write this query's query_logs for the new log_id (feedback depends on
+        // the real id). Reading domain/generation live makes the key naturally
+        // stale when a compile publish bumps generation; entity invalidation goes
+        // through `invalidate_entity_ids`. No cache → the original path.
+        let cache = self.cache.clone();
+        let domain_key = query.domain.as_deref().unwrap_or(&self.collection);
+        let cache_key = if cache.is_some() {
+            let gen = self.kernel.current_published_generation(domain_key)?;
+            Some(QueryCache::key(
+                &query.text,
+                &query.filters,
+                query.top_k,
+                domain_key,
+                gen,
+            ))
+        } else {
+            None
+        };
+        if let Some(key) = &cache_key {
+            if let Some(cached) = cache.as_ref().unwrap().get(key).await {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let relax = RelaxState {
+                    candidate_empty_initial: cached.candidate_empty_initial,
+                    relaxation_attempted: cached.diagnostics.relaxation_attempted,
+                    relaxation_succeeded: cached.diagnostics.relaxation_succeeded,
+                };
+                let log_id = self.log_query(
+                    query,
+                    cached.rewritten.as_ref(),
+                    cached.rewrite_failure,
+                    &cached.hits,
+                    latency_ms,
+                    &relax,
+                )?;
+                return Ok(QueryResult {
+                    hits: cached.hits.clone(),
+                    rewritten: cached.rewritten.clone(),
+                    rewrite_failure: cached.rewrite_failure,
+                    diagnostics: cached.diagnostics.clone(),
+                    log_id: Some(log_id),
+                    latency_ms,
+                });
+            }
+        }
+
         // QUG 改写（disabled/stale → 显式 fallback；批3：qug=None 且 stale 标记
         // 置位时诊断写 stale，其余 None 写 disabled）
         // QUG rewrite (disabled/stale → explicit fallback; batch 3: qug=None with
@@ -493,20 +575,37 @@ impl<V: VectorStore + ?Sized> QueryEngine<V> {
                     latency_ms,
                     &relax,
                 )?;
+                let diagnostics = QueryDiagnostics {
+                    rewrite_status: status,
+                    applied_filters: applied,
+                    candidate_count,
+                    fts_count: 0,
+                    vector_count: 0,
+                    rrf_k: self.rrf_k,
+                    relaxation_attempted: relax.relaxation_attempted,
+                    relaxation_succeeded: relax.relaxation_succeeded,
+                };
+                // P1：零命中也是合法结果，入缓存（供未来同代查询复用）。
+                // P1: a zero-hit result is valid too — cache it for reuse by a
+                // future same-generation query.
+                if let (Some(c), Some(k)) = (cache.as_ref(), &cache_key) {
+                    c.insert(
+                        *k,
+                        CachedSearch {
+                            hits: Vec::new(),
+                            rewritten: rewritten.clone(),
+                            rewrite_failure,
+                            diagnostics: diagnostics.clone(),
+                            candidate_empty_initial: relax.candidate_empty_initial,
+                        },
+                    )
+                    .await;
+                }
                 return Ok(QueryResult {
                     hits: Vec::new(),
                     rewritten: rewritten.clone(),
                     rewrite_failure,
-                    diagnostics: QueryDiagnostics {
-                        rewrite_status: status,
-                        applied_filters: applied,
-                        candidate_count,
-                        fts_count: 0,
-                        vector_count: 0,
-                        rrf_k: self.rrf_k,
-                        relaxation_attempted: relax.relaxation_attempted,
-                        relaxation_succeeded: relax.relaxation_succeeded,
-                    },
+                    diagnostics,
                     log_id: Some(log_id),
                     latency_ms,
                 });
@@ -587,6 +686,22 @@ impl<V: VectorStore + ?Sized> QueryEngine<V> {
             latency_ms,
             &relax,
         )?;
+        // P1：入缓存供未来同代查询复用（实体失效经反向索引）。
+        // P1: cache for reuse by a future same-generation query (entity
+        // invalidation goes through the reverse index).
+        if let (Some(c), Some(k)) = (cache.as_ref(), &cache_key) {
+            c.insert(
+                *k,
+                CachedSearch {
+                    hits: hits.clone(),
+                    rewritten: rewritten.clone(),
+                    rewrite_failure,
+                    diagnostics: diagnostics.clone(),
+                    candidate_empty_initial: relax.candidate_empty_initial,
+                },
+            )
+            .await;
+        }
         Ok(QueryResult {
             hits: hits.clone(),
             rewritten: rewritten.clone(),

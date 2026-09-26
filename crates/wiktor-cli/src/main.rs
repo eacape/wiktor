@@ -698,33 +698,51 @@ async fn cmd_vector_build(
 
     let mut upserted = 0usize;
     let mut points = Vec::new();
-    for (idx, page) in pages.iter().enumerate() {
-        let text = if idx == 0 {
-            first_text.clone()
-        } else {
-            embed_text(page)
-        };
-        let vector = embedder.embed(&text).await?;
-        // point id 必须是 UUID（Step1 约定：BLAKE3 派生，防 page_id 非 UUID 撞
-        // qdrant 校验）；与向量重建/幂等覆盖同源同式。
-        // The point id must be a UUID (the Step1 convention: BLAKE3-derived, so
-        // non-UUID page_ids never trip qdrant validation); the same source and
-        // shape as vector rebuild/idempotent overwrite.
-        let entity = wiktor_core::types::EntityId::from_key(&page.entity_id)?;
-        let point_id =
-            wiktor_vector_qdrant::QdrantVectorStore::point_id(&entity, "summary", page.generation);
-        points.push(wiktor_core::traits::VectorPoint {
-            id: point_id,
-            vector,
-            metadata: wiktor_core::traits::VectorMetadata {
-                entity_id: page.entity_id.clone(),
-                page_id: page.page_id.clone(),
-                chunk_type: wiktor_core::traits::ChunkType::Summary,
-                content_hash: page.content_hash.clone(),
-                generation: page.generation,
-            },
-        });
-        upserted += 1;
+    // P1：批量嵌入（HttpEmbedder 真实 batch，大语料显著减少 RTT；确定性/Mock
+    // 走 trait 默认逐条路径）。分批 EMBED_BATCH_SIZE 防单请求过大。
+    // P1: batch embedding (HttpEmbedder does a real batch — far fewer RTTs on a
+    // large corpus; the deterministic/Mock embedder uses the trait's per-item
+    // default). Chunked by EMBED_BATCH_SIZE to keep requests bounded.
+    const EMBED_BATCH_SIZE: usize = 64;
+    for chunk in pages.chunks(EMBED_BATCH_SIZE) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if i == 0 && upserted == 0 {
+                    first_text.clone()
+                } else {
+                    embed_text(p)
+                }
+            })
+            .collect();
+        let texts_ref: Vec<&str> = texts.iter().map(String::as_str).collect();
+        let vectors = embedder.embed_batch(&texts_ref).await?;
+        for (page, vector) in chunk.iter().zip(vectors) {
+            // point id 必须是 UUID（Step1 约定：BLAKE3 派生，防 page_id 非 UUID 撞
+            // qdrant 校验）；与向量重建/幂等覆盖同源同式。
+            // The point id must be a UUID (the Step1 convention: BLAKE3-derived, so
+            // non-UUID page_ids never trip qdrant validation); the same source and
+            // shape as vector rebuild/idempotent overwrite.
+            let entity = wiktor_core::types::EntityId::from_key(&page.entity_id)?;
+            let point_id = wiktor_vector_qdrant::QdrantVectorStore::point_id(
+                &entity,
+                "summary",
+                page.generation,
+            );
+            points.push(wiktor_core::traits::VectorPoint {
+                id: point_id,
+                vector,
+                metadata: wiktor_core::traits::VectorMetadata {
+                    entity_id: page.entity_id.clone(),
+                    page_id: page.page_id.clone(),
+                    chunk_type: wiktor_core::traits::ChunkType::Summary,
+                    content_hash: page.content_hash.clone(),
+                    generation: page.generation,
+                },
+            });
+            upserted += 1;
+        }
     }
     store
         .upsert(&collection, &points)

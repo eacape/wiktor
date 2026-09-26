@@ -22,6 +22,7 @@ tokio-util = { workspace = true }
 uuid = { workspace = true }
 async-trait = "0.1"
 petgraph = { workspace = true }
+moka = { workspace = true }
 tracing = { workspace = true }
 async-openai = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }

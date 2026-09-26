@@ -60,6 +60,13 @@ anyhow = "1.0"
 # Graph (petgraph DiGraph for the QUG query-understanding graph; no hand-rolled adjacency lists)
 petgraph = "0.6"
 
+# 查询热点缓存（MASTER-PLAN §5.4/5.5：generation-aware + 按实体 ID 失效；命中
+# 集合而非整条 QueryResult——log_id/diagnostics 属每次查询、不入缓存）。
+# Query hot-cache (MASTER-PLAN §5.4/5.5: generation-aware, invalidated by entity
+# ID; caches the hit set, not the whole QueryResult — log_id/diagnostics are
+# per-query and never cached).
+moka = { version = "0.12", features = ["future"] }
+
 # 日志（QueryEngine 统一写查询日志，日志写入失败用 tracing 报告）
 # Logging (QueryEngine writes query logs centrally; tracing reports log-write failures)
 tracing = "0.1"
