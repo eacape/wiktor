@@ -16,19 +16,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use wiktor_core::compile::config::{Clock, SystemClock};
+use wiktor_core::compile::config::{Clock, CompilePolicy, SystemClock};
 use wiktor_core::compile::contract::DefaultSourceRefValidator;
 use wiktor_core::compile::executor::{LeaseOutcome, PipelineExecutor};
 use wiktor_core::compile::mock::MockCompiler;
 use wiktor_core::compile::quality::RuleBasedScorer;
 use wiktor_core::kernel::SqliteKernel;
-use wiktor_core::traits::EntitySchema;
+use wiktor_core::traits::{Compiler, EntitySchema};
 
 use crate::services::compile::{assemble_source, AssembledSource};
 
 /// 默认轮询间隔（无到期任务时睡眠，不忙等）。
 /// Default poll interval (sleep when nothing is due — never busy-wait).
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// serve 真实 LLM 编译缺省模型（Step0b；被 `WIKTOR_LLM_MODEL` 覆盖）。
+/// Default model for serve real-LLM compile (Step0b; overridden by
+/// `WIKTOR_LLM_MODEL`).
+const DEFAULT_LLM_MODEL: &str = "qwen3.8-max";
 /// worker 每次最多 claim 的任务数上限（WIKTOR_COMPILE_WORKERS 1..=8）。
 /// Max tasks a worker may claim per pass (WIKTOR_COMPILE_WORKERS is 1..=8).
 pub const MAX_WORKERS: usize = 8;
@@ -100,13 +104,81 @@ impl CompileWorker {
         )?;
         let executor = Arc::new(PipelineExecutor::new(
             kernel.clone(),
-            Arc::new(MockCompiler::new(policy.clone())),
+            Self::build_server_compiler(policy.clone())?,
             Arc::new(RuleBasedScorer::new()),
             Arc::new(DefaultSourceRefValidator::new()),
             Arc::new(SystemClock),
             policy,
         ));
         Ok(Self::new(kernel, executor, schema))
+    }
+
+    /// 按 env 装配常驻 worker 的编译器（Step0b）：设了非空
+    /// `WIKTOR_LLM_BASE_URL` 时组装 OpenAI 兼容 `LlmCompiler`（模型取
+    /// `WIKTOR_LLM_MODEL`，缺省 [`DEFAULT_LLM_MODEL`]；key 只从
+    /// `WIKTOR_OPENAI_API_KEY` 读取——缺 key 是配置错误，**不降级 Mock**，D7）。
+    /// env 未设 → 回退 `MockCompiler`（离线基线）。gRPC `CompileService` 的
+    /// Mock 不受影响（不在本函数范围）。
+    /// Assembles the resident worker's compiler per env (Step0b): with a non-empty
+    /// `WIKTOR_LLM_BASE_URL` it wires an OpenAI-compatible `LlmCompiler` (model
+    /// from `WIKTOR_LLM_MODEL`, defaulting to [`DEFAULT_LLM_MODEL`]; the key comes
+    /// only from `WIKTOR_OPENAI_API_KEY` — a missing key is a config error and
+    /// **never degrades to Mock**, D7). With the env unset it falls back to
+    /// `MockCompiler` (the offline baseline). The gRPC `CompileService`'s Mock is
+    /// unaffected (out of scope here).
+    fn build_server_compiler(policy: CompilePolicy) -> Result<Arc<dyn Compiler>, String> {
+        Self::assemble_server_compiler(
+            policy,
+            std::env::var("WIKTOR_LLM_BASE_URL").ok(),
+            std::env::var("WIKTOR_LLM_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            std::env::var("WIKTOR_OPENAI_API_KEY")
+                .ok()
+                .filter(|k| !k.trim().is_empty()),
+        )
+    }
+
+    /// `build_server_compiler` 的纯函数内核（参数显式传入，便于离线单测）：
+    /// `llm_base_url` 非空 → LlmCompiler（`llm_api_key` 缺失则报错）；否则 Mock。
+    /// The pure core of `build_server_compiler` (params passed explicitly for
+    /// offline unit tests): a non-empty `llm_base_url` → `LlmCompiler` (an
+    /// `llm_api_key` missing is a hard error); otherwise `MockCompiler`.
+    fn assemble_server_compiler(
+        policy: CompilePolicy,
+        llm_base_url: Option<String>,
+        llm_model: Option<String>,
+        llm_api_key: Option<String>,
+    ) -> Result<Arc<dyn Compiler>, String> {
+        match llm_base_url {
+            Some(url) if !url.trim().is_empty() => {
+                #[cfg(feature = "llm-openai")]
+                {
+                    use wiktor_core::compile::llm::{LlmCompiler, OpenAiLlmClient, API_KEY_ENV};
+                    match llm_api_key {
+                        None => Err(format!(
+                            "serve real-LLM compile requires {API_KEY_ENV} (set WIKTOR_LLM_BASE_URL to opt in)"
+                        )),
+                        Some(key) => {
+                            let model = llm_model.unwrap_or_else(|| DEFAULT_LLM_MODEL.to_string());
+                            let client = OpenAiLlmClient::new(model, Some(url), Some(key), false)
+                                .map_err(|e| e.to_string())?;
+                            Ok(Arc::new(LlmCompiler {
+                                client: Arc::new(client),
+                                policy,
+                            }))
+                        }
+                    }
+                }
+                #[cfg(not(feature = "llm-openai"))]
+                {
+                    Err("serve real-LLM compile requires the `llm-openai` feature \
+                         (rebuild with default features)"
+                        .to_string())
+                }
+            }
+            _ => Ok(Arc::new(MockCompiler::new(policy))),
+        }
     }
 
     /// 启动 worker 任务（启动时回收一次 + spawn 周期 LeaseReaper → 常驻消费
@@ -227,5 +299,51 @@ impl CompileWorker {
                 Err(e) => tracing::warn!(error = %e, "worker task processing failed"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 未设 LLM base_url → Mock 回退（不报错，离线）。
+    /// No LLM base_url → Mock fallback (no error, offline).
+    #[test]
+    fn no_llm_base_url_falls_back_to_mock() {
+        let c = CompileWorker::assemble_server_compiler(CompilePolicy::default(), None, None, None)
+            .expect("mock fallback must succeed");
+        let _ = c; // Arc<dyn Compiler>；路径本身即验收（不降级到 Err）。
+    }
+
+    /// 空（空白）base_url → Mock 回退。
+    /// A blank base_url → Mock fallback.
+    #[test]
+    fn blank_llm_base_url_falls_back_to_mock() {
+        CompileWorker::assemble_server_compiler(
+            CompilePolicy::default(),
+            Some("   ".to_string()),
+            None,
+            None,
+        )
+        .expect("blank base_url must fall back to mock");
+    }
+
+    /// 设了 base_url 但缺 key → 配置错误（D7，绝不降级 Mock）。
+    /// A base_url set but no key → config error (D7, never a Mock downgrade).
+    #[test]
+    fn llm_base_url_without_key_errors() {
+        let err = match CompileWorker::assemble_server_compiler(
+            CompilePolicy::default(),
+            Some("http://llm.example/v1".to_string()),
+            None,
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("missing key must be a hard error, got a compiler"),
+        };
+        assert!(
+            err.contains("WIKTOR_OPENAI_API_KEY"),
+            "error should name the missing key env, got: {err}"
+        );
     }
 }

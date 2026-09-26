@@ -75,6 +75,12 @@ enum Command {
         /// domain.yaml 路径（构建 QUG 需要；不传则 QUG 关闭）
         #[arg(long)]
         domain: Option<PathBuf>,
+        /// Vector collection name (default: the --domain's config.name; legacy
+        /// default milk-tea). Aligned with serve / vector build.
+        /// 向量 collection 名（默认 --domain 的 config.name；旧默认 milk-tea）。
+        /// 与 serve / vector build 对齐。
+        #[arg(long)]
+        collection: Option<String>,
         /// Comma-separated filters, e.g. "price<=20,sugar_level>=50,size=中杯";
         /// `in=`/`not_in=` lists use '|', e.g. "ingredient_ids in=pearl|taro".
         /// 逗号分隔过滤条件，如 "price<=20,sugar_level>=50,size=中杯"；
@@ -285,6 +291,7 @@ async fn main() -> Result<()> {
             text,
             db,
             domain,
+            collection,
             filter,
             top_k,
             json,
@@ -294,6 +301,7 @@ async fn main() -> Result<()> {
                 &db,
                 &text,
                 domain.as_deref(),
+                collection.as_deref(),
                 filter.as_deref(),
                 top_k,
                 json,
@@ -803,16 +811,30 @@ fn embed_text(page: &wiktor_core::kernel::AcceptedPageVector) -> String {
 /// Search through the QueryEngine: QUG rewrite (optional) → filter pushdown →
 /// FTS5 + vector → RRF fusion.
 /// 经 QueryEngine 检索：QUG 改写（可选）→ 过滤下推 → FTS5 + 向量 → RRF 融合。
+#[allow(clippy::too_many_arguments)] // 调试子命令的扁平参数面（8 个），不引入结构体。
 async fn cmd_search(
     db: &Path,
     text: &str,
     domain_yaml: Option<&Path>,
+    collection: Option<&str>,
     filter_spec: Option<&str>,
     top_k: usize,
     json: bool,
     _no_vector: bool,
 ) -> Result<()> {
     let kernel = Arc::new(SqliteKernel::open(db)?);
+    // collection/域名（Step0c）：--collection 优先，否则 --domain 的
+    // config.name，再否则兼容旧默认 milk-tea——与 serve / vector build 对齐。
+    // Collection/domain name (Step0c): --collection first, else the --domain's
+    // config.name, else the legacy milk-tea default — aligned with serve and
+    // vector build.
+    let domain_name: String = match collection {
+        Some(c) => c.to_string(),
+        None => match domain_yaml {
+            Some(path) => load_domain_config(path)?.name.clone(),
+            None => "milk-tea".to_string(),
+        },
+    };
     let filters = match filter_spec {
         Some(spec) => filter::parse_filter(spec)?,
         None => Filters::empty(),
@@ -825,7 +847,7 @@ async fn cmd_search(
     // so the Mock never errors on a missing collection.
     let vector_store = Arc::new(MockVectorStore::new());
     vector_store
-        .ensure_collection("milk-tea", embed::DIM, DistanceMetric::Cosine)
+        .ensure_collection(&domain_name, embed::DIM, DistanceMetric::Cosine)
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let embedder = Arc::new(embed::DeterministicEmbedder::new(embed::DIM));
@@ -860,7 +882,7 @@ async fn cmd_search(
                 &config,
                 &intents_bytes,
                 embedder,
-                "milk-tea",
+                &domain_name,
                 60,
             )
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
@@ -872,7 +894,7 @@ async fn cmd_search(
                 vector_store.clone(),
                 None,
                 embedder,
-                "milk-tea",
+                &domain_name,
                 5,
                 60,
             )

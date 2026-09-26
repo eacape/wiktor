@@ -952,8 +952,8 @@ pub fn system_prompt() -> String {
 抽取式规则（必须全部满足）：
 1. 每条断言 assertion 的 text 必须逐字等于其 ref_ids 顺序对应的 quote 以单个空格连接的结果；禁止改写、推断或补充快照之外的知识。
 2. 每个引用 ref 的 id 形如 r1、r2（递增，全页唯一），entity_id 与 source_revision 必须等于知识快照的值——绝不能省略前缀或截断，例如快照中的 entity_id 是 "milk-tea:product:sku_0001"，refs 里的 entity_id 必须原样写 "milk-tea:product:sku_0001"，禁止写成 "sku_0001"；pointer 是 RFC6901 指针，只能指向 /fields/<字段> 下的字符串（数组字段必须带下标，如 /fields/ingredients/0）；value 必须等于指针解出的原值；quote 必须是该原值的连续精确子串。
-3. wiki.markdown 必须严格按以下格式渲染：每节为 "## {heading}\n\n"，每条断言一行 "- {text}" 并按 ref_ids 顺序追加 "[[ref:rN]]"，行尾换行，节间一个空行；不得有其它散文、代码块或 HTML。
-4. title、aliases、tags 必须逐字出现在某条合法 quote 之内；title 为纯文本，无换行。
+3. wiki.markdown 必须严格按以下格式渲染：每节为 "## {heading}\n\n"，每条断言一行 "- {text}"，随后按 ref_ids 顺序**紧贴**其末尾追加 "[[ref:rN]]"（text 与 marker 之间不得插入任何空格或字符），行尾换行，节间一个空行；不得有其它散文、代码块或 HTML。示例：text="珍珠"、ref_ids=["r1"] 时该行必须为 `- 珍珠[[ref:r1]]`（"珍珠" 与 "[[ref:r1]]" 之间无空格）。
+4. 必须为 title 字段创建一条 ref（pointer="/fields/title"、value=title 原值、quote=title 整值的连续子串），并在至少一条断言中引用该 ref，使 title 出现在合法 quote 之内；aliases、tags 亦必须逐字出现在某条合法 quote 之内；title 为纯文本，无换行。示例：若快照 fields.title="语义化版本规范（howto）"，则须有 ref{id:"r1",pointer:"/fields/title",quote:"语义化版本规范（howto）"}。
 5. heading 必须使用给定领域标题（如「概述」）。
 6. 若快照信息不足（例如字段全为空），输出 status="error" 且 code="MISSING_SOURCE_REFS"，列出缺失指针。
 "###

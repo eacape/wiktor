@@ -43,6 +43,17 @@ tonic-prost = { workspace = true }
 prost = { workspace = true }
 tokio-util = { workspace = true }
 
+[features]
+# serve 常驻编译 worker 的真实 LLM 装配（Step0b）：打开 core 的 llm-openai，让
+# worker 按 env（WIKTOR_LLM_BASE_URL/WIKTOR_LLM_MODEL/WIKTOR_OPENAI_API_KEY）在
+# from_domain_pack 里用 LlmCompiler 代替 MockCompiler。env 未设时仍回退 Mock。
+# Real-LLM assembly for the resident compile worker (Step0b): enable core's
+# llm-openai so the worker can swap in LlmCompiler for MockCompiler per env
+# (WIKTOR_LLM_BASE_URL / WIKTOR_LLM_MODEL / WIKTOR_OPENAI_API_KEY). Falls back to
+# Mock when the env is unset.
+default = ["llm-openai"]
+llm-openai = ["wiktor-core/llm-openai"]
+
 [build-dependencies]
 tonic-prost-build = { workspace = true }
 
